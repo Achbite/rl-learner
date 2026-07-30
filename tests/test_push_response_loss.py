@@ -55,7 +55,6 @@ class PushResponseLossTest(unittest.TestCase):
             backend_port = available_port()
             backend_target = f"127.0.0.1:{backend_port}"
             environment = os.environ.copy()
-            environment["MAZE_RUN_ID"] = "response-loss-run"
             environment["MAZE_SAMPLE_DISTRIBUTOR_PORT"] = str(backend_port)
             process = subprocess.Popen(
                 [executable, config],
@@ -90,8 +89,7 @@ class PushResponseLossTest(unittest.TestCase):
             )
 
             batch = maze_pb2.SampleBatch(
-                protocol_version=2,
-                run_id="response-loss-run",
+                protocol_version=3,
                 aiserver_id="aiserver-0",
                 env_id="env-0",
                 session_id=0,
@@ -127,9 +125,7 @@ class PushResponseLossTest(unittest.TestCase):
             retry = proxy.PushSamples(batch, timeout=2.0)
             self.assertEqual(retry.result, maze_pb2.PUSH_RESULT_DUPLICATE)
             status = proxy.GetStatus(
-                maze_pb2.DistributorStatusReq(
-                    run_id="response-loss-run"
-                ),
+                maze_pb2.DistributorStatusReq(),
                 timeout=2.0,
             )
             self.assertEqual(status.accepted_unique_samples, 8)

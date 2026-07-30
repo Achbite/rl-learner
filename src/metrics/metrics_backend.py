@@ -51,7 +51,7 @@ class JsonlBackend(MetricsBackend):
     支持增量读取（尾部追加写入 + 文件偏移缓存），适合长时间训练监控。
     """
 
-    def __init__(self, metrics_dir: str, run_id: str = ""):
+    def __init__(self, metrics_dir: str):
         """
         Args:
             metrics_dir: 指标数据目录（自动创建）
@@ -61,12 +61,8 @@ class JsonlBackend(MetricsBackend):
 
         # 当前写入文件
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        safe_run_id = "".join(
-            ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id
-        ).strip("._")
-        run_part = f"{safe_run_id}_" if safe_run_id else ""
         self._filepath = os.path.join(
-            self._metrics_dir, f"metrics_{run_part}{timestamp}.jsonl"
+            self._metrics_dir, f"metrics_{timestamp}.jsonl"
         )
         self._file = open(self._filepath, "a", encoding="utf-8")
         self._lock = threading.Lock()
@@ -144,7 +140,7 @@ class JsonlBackend(MetricsBackend):
             return len(self._records)
 
 
-def create_backend(backend_type: str, metrics_dir: str, run_id: str = "") -> MetricsBackend:
+def create_backend(backend_type: str, metrics_dir: str) -> MetricsBackend:
     """
     工厂函数：根据配置创建存储后端
 
@@ -155,6 +151,6 @@ def create_backend(backend_type: str, metrics_dir: str, run_id: str = "") -> Met
         MetricsBackend 实例
     """
     if backend_type == "jsonl":
-        return JsonlBackend(metrics_dir, run_id=run_id)
+        return JsonlBackend(metrics_dir)
     else:
         raise ValueError(f"不支持的存储后端类型: {backend_type}，当前仅支持 'jsonl'")

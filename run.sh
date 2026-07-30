@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 workload="${1:-training}"
 if [ "$#" -gt 0 ]; then
     shift
@@ -13,12 +13,22 @@ if [ "${workload}" != "training" ]; then
 fi
 
 config="${MAZE_LEARNER_CONFIG:-${repo_dir}/configs/learner_config.yaml}"
-model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-/opt/rl/learner/model-distributor/bin/maze_model_distributor}"
-model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-/opt/rl/learner/model-distributor/config/model_distributor_config.yaml}"
-model_root="${MAZE_MODEL_ARTIFACT_ROOT:-${repo_dir}/models/published}"
-checkpoint_root="${MAZE_CHECKPOINT_ROOT:-${repo_dir}/models/checkpoints}"
-update_root="${MAZE_UPDATE_RECEIPT_ROOT:-${repo_dir}/models/updates}"
-run_id="${MAZE_RUN_ID:-local-run}"
+repository_distributor_dir="${repo_dir}/model-distributor"
+runtime_distributor_dir="/opt/rl/learner/model-distributor"
+if [ -x "${repository_distributor_dir}/bin/maze_model_distributor" ] &&
+   [ -f "${repository_distributor_dir}/config/model_distributor_config.yaml" ]; then
+    default_distributor_dir="${repository_distributor_dir}"
+elif [ -x "${runtime_distributor_dir}/bin/maze_model_distributor" ] &&
+     [ -f "${runtime_distributor_dir}/config/model_distributor_config.yaml" ]; then
+    default_distributor_dir="${runtime_distributor_dir}"
+else
+    default_distributor_dir="${repository_distributor_dir}"
+fi
+model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
+model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
+local_train_root="${MAZE_LOCAL_TRAIN_ROOT:-${repo_dir}/models/local-train}"
+initial_checkpoint="${MAZE_INITIAL_CHECKPOINT:-}"
+archive_interval="${MAZE_ARCHIVE_INTERVAL_UPDATES:-}"
 metrics_port="${MAZE_DASHBOARD_PORT:-9005}"
 
 while [ "$#" -gt 0 ]; do
@@ -27,20 +37,8 @@ while [ "$#" -gt 0 ]; do
             config="${2:?--config requires a value}"
             shift 2
             ;;
-        --run-id)
-            run_id="${2:?--run-id requires a value}"
-            shift 2
-            ;;
-        --model-root)
-            model_root="${2:?--model-root requires a value}"
-            shift 2
-            ;;
-        --checkpoint-root)
-            checkpoint_root="${2:?--checkpoint-root requires a value}"
-            shift 2
-            ;;
-        --update-root)
-            update_root="${2:?--update-root requires a value}"
+        --initial-checkpoint)
+            initial_checkpoint="${2:?--initial-checkpoint requires a value}"
             shift 2
             ;;
         --model-distributor)
@@ -65,6 +63,10 @@ while [ "$#" -gt 0 ]; do
             metrics_port="${2:?--metrics-port requires a value}"
             shift 2
             ;;
+        --archive-interval-updates)
+            archive_interval="${2:?--archive-interval-updates requires a value}"
+            shift 2
+            ;;
         *)
             echo "unknown argument: $1" >&2
             exit 2
@@ -74,19 +76,80 @@ done
 
 if [ ! -x "${model_distributor_bin}" ]; then
     echo "ModelDistributor executable is missing: ${model_distributor_bin}" >&2
+    echo "Build rl-model-distributor and stage its artifact in model-distributor/" >&2
     exit 1
 fi
 if [ ! -f "${model_distributor_config}" ]; then
     echo "ModelDistributor config is missing: ${model_distributor_config}" >&2
+    echo "Build rl-model-distributor and stage its artifact in model-distributor/" >&2
     exit 1
 fi
 
+if [ "$(basename "${local_train_root}")" != "local-train" ]; then
+    echo "Learner local-train path must end with /local-train" >&2
+    exit 1
+fi
+if [ -L "${local_train_root}" ]; then
+    echo "Learner local-train path must not be a symbolic link" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "${local_train_root}")"
+local_train_parent="$(
+    cd "$(dirname "${local_train_root}")" && pwd -P
+)"
+local_train_root="${local_train_parent}/local-train"
+expected_local_train_root="${repo_dir}/models/local-train"
+if [ "${local_train_root}" != "${expected_local_train_root}" ]; then
+    echo "Unsafe Learner local-train path: ${local_train_root}" >&2
+    exit 1
+fi
+if [ -n "${initial_checkpoint}" ]; then
+    if [ ! -f "${initial_checkpoint}" ]; then
+        echo "Initial checkpoint does not exist: ${initial_checkpoint}" >&2
+        exit 1
+    fi
+    checkpoint_parent="$(
+        cd "$(dirname "${initial_checkpoint}")" && pwd -P
+    )"
+    initial_checkpoint="${checkpoint_parent}/$(basename "${initial_checkpoint}")"
+    case "${initial_checkpoint}" in
+        "${local_train_root}"|"${local_train_root}"/*)
+            echo "Initial checkpoint must be outside local-train" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+training_lock="${MAZE_TRAIN_LOCK_DIR:-${local_train_parent}/.learner-local-train.lock}"
+if ! mkdir "${training_lock}" 2>/dev/null; then
+    echo "Learner training is already active or its lock remains: ${training_lock}" >&2
+    exit 1
+fi
+printf '%s\n' "$$" > "${training_lock}/pid"
+
+if [ -d "${local_train_root}" ]; then
+    find "${local_train_root}" -mindepth 1 -maxdepth 1 \
+        -exec rm -rf -- {} +
+else
+    mkdir -p "${local_train_root}"
+fi
+mkdir -p \
+    "${local_train_root}/runtime/serving" \
+    "${local_train_root}/runtime/checkpoints" \
+    "${local_train_root}/runtime/receipts" \
+    "${local_train_root}/archive" \
+    "${local_train_root}/metrics"
+
 export PYTHONUNBUFFERED=1
-export MAZE_RUN_ID="${run_id}"
-export MAZE_MODEL_ARTIFACT_ROOT="${model_root}"
-export MAZE_CHECKPOINT_ROOT="${checkpoint_root}"
-export MAZE_UPDATE_RECEIPT_ROOT="${update_root}"
+export MAZE_LOCAL_TRAIN_ROOT="${local_train_root}"
+export MAZE_MODEL_ARTIFACT_ROOT="${local_train_root}"
 export MAZE_MODEL_DISTRIBUTOR_PORT="${MAZE_MODEL_DISTRIBUTOR_PORT:-9200}"
+if [ -n "${initial_checkpoint}" ]; then
+    export MAZE_INITIAL_CHECKPOINT="${initial_checkpoint}"
+fi
+if [ -n "${archive_interval}" ]; then
+    export MAZE_ARCHIVE_INTERVAL_UPDATES="${archive_interval}"
+fi
 
 metrics_pid=""
 training_pid=""
@@ -126,6 +189,7 @@ shutdown() {
     metrics_pid=""
     terminate_process "${model_distributor_pid}" 3
     model_distributor_pid=""
+    rm -rf -- "${training_lock}"
 }
 
 quiesce() {
@@ -166,13 +230,15 @@ if [ "${ready}" -ne 1 ]; then
 fi
 
 python3 tools/metrics_server.py \
-    --dir logs/metrics \
+    --dir "${local_train_root}/metrics" \
     --port "${metrics_port}" &
 metrics_pid=$!
 
-python3 -m main.training_runtime \
-    --config "${config}" \
-    --run-id "${run_id}" &
+training_args=(--config "${config}")
+if [ -n "${initial_checkpoint}" ]; then
+    training_args+=(--initial-checkpoint "${initial_checkpoint}")
+fi
+python3 -m main.training_runtime "${training_args[@]}" &
 training_pid=$!
 
 while [ "${stopping}" -eq 0 ]; do

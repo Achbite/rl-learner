@@ -29,7 +29,6 @@ def register(manifest_path: str, address: str, timeout: float) -> dict:
                 ):
                     return {
                         "result": maze_pb2.ModelRegisterResult.Name(response.result),
-                        "run_id": response.manifest.run_id,
                         "model_version": response.manifest.model_version,
                         "sha256": response.manifest.sha256,
                         "distributor_instance_id": response.distributor_instance_id,

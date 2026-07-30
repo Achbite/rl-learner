@@ -39,6 +39,8 @@ ensure_container() {
             --name "${container_name}" \
             --network "${network_name}" \
             --network-alias "${container_name}" \
+            --network-alias "maze-learner" \
+            --publish "127.0.0.1:9005:9005" \
             --volume "${repo_dir}:/workspace/rl-learner" \
             --volume "${contract_dir}/python/maze_pb2.py:/workspace/rl-learner/proto/maze_pb2.py:ro" \
             --volume "${contract_dir}/python/maze_pb2_grpc.py:/workspace/rl-learner/proto/maze_pb2_grpc.py:ro" \

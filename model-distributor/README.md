@@ -7,7 +7,7 @@ selected for the Learner image. The artifact is copied here explicitly after
 For the versions in `../artifact_versions.env`, run from `rl-learner`:
 
 ```bash
-cp -R ../.workspace/artifacts/rl-model-distributor/0.2.0/linux-arm64/. \
+cp -R ../.workspace/artifacts/rl-model-distributor/0.4.0/linux-arm64/. \
     model-distributor/
 ```
 

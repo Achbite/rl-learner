@@ -161,8 +161,7 @@ class FragmentIdentityTest(unittest.TestCase):
     @staticmethod
     def batch(checksum: str):
         batch = maze_pb2.SampleBatch(
-            protocol_version=2,
-            run_id="run-fragment",
+            protocol_version=3,
             batch_id="batch-0",
             behavior_model_version=0,
             behavior_model_checksum=checksum,
@@ -185,7 +184,6 @@ class FragmentIdentityTest(unittest.TestCase):
 
     def test_fragment_checksum_must_match_published_behavior_model(self):
         runtime = TrainingRuntime.__new__(TrainingRuntime)
-        runtime.run_id = "run-fragment"
         runtime.trainer = PPOTrainer(trainer_config())
         runtime._behavior_checksums = {0: "a" * 64}
 

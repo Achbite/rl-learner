@@ -42,7 +42,7 @@ def atomic_write_json(path: str, document: dict):
 
 
 def export_initial_model(
-    config: dict, logger, run_id: str, output_root: str | None = None
+    config: dict, logger, output_root: str | None = None
 ) -> dict:
     model_config = config.get("model", {})
     seed = int(
@@ -57,19 +57,16 @@ def export_initial_model(
     p2p_root = (
         output_root
         or os.environ.get("MAZE_MODEL_ARTIFACT_ROOT")
-        or model_config.get(
-            "distribution_dir", model_config.get("p2p_dir", "models/published")
-        )
+        or model_config.get("local_train_dir", "models/local-train")
     )
-    run_dir = os.path.join(p2p_root, run_id)
     model_file = f"model_v{model_version:06d}.onnx"
-    model_path = os.path.join(run_dir, model_file)
-    manifest_path = os.path.join(run_dir, "manifest.json")
+    model_path = os.path.join(p2p_root, model_file)
+    manifest_path = os.path.join(p2p_root, "manifest.json")
     temporary_model = f"{model_path}.tmp.{os.getpid()}"
 
     np.random.seed(seed)
     torch.manual_seed(seed)
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(p2p_root, exist_ok=True)
 
     trainer = PPOTrainer(config)
     trainer.export_onnx(temporary_model)
@@ -79,8 +76,7 @@ def export_initial_model(
 
     manifest = {
         "schema_version": 1,
-        "contract_version": "0.3.0",
-        "run_id": run_id,
+        "contract_version": "0.5.0",
         "model_version": model_version,
         "artifact_uri": Path(model_path).resolve().as_uri(),
         "model_file": model_file,
@@ -95,8 +91,7 @@ def export_initial_model(
     }
     atomic_write_json(manifest_path, manifest)
     logger.info(
-        "初始模型已发布: run=%s version=%d sha256=%s",
-        run_id,
+        "初始模型已发布: version=%d sha256=%s",
         model_version,
         manifest["sha256"],
     )
@@ -108,7 +103,6 @@ def main():
         description="Publish the initial AIServer ONNX model"
     )
     parser.add_argument("--config", default="configs/learner_config.yaml")
-    parser.add_argument("--run-id", default=os.environ.get("MAZE_RUN_ID", "local-run"))
     parser.add_argument("--output-root")
     args = parser.parse_args()
 
@@ -120,7 +114,7 @@ def main():
         file_level=log_config.get("file_level", "DEBUG"),
         log_dir=log_config.get("log_dir", "logs"),
     )
-    export_initial_model(config, logger, args.run_id, args.output_root)
+    export_initial_model(config, logger, args.output_root)
 
 
 if __name__ == "__main__":

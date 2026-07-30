@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,16 +16,17 @@ from proto import maze_pb2
 from src.training.ppo_trainer import PPOTrainer
 
 
-def config(root: Path) -> dict:
+def config(root: Path, archive_interval: int = 2) -> dict:
     return {
         "model": {
             "obs_dim": 3,
             "action_dim": 2,
             "hidden_dim": 8,
             "bootstrap_seed": 7,
-            "distribution_dir": str(root / "published"),
-            "checkpoint_dir": str(root / "checkpoints"),
-            "update_dir": str(root / "updates"),
+            "local_train_dir": str(root / "models" / "local-train"),
+            "archive_interval_updates": archive_interval,
+            "archive_on_graceful_shutdown": True,
+            "serving_retention_versions": 2,
         },
         "training": {
             "device": "cpu",
@@ -62,13 +64,58 @@ def samples() -> list[dict]:
     ]
 
 
+def publish_update(
+    trainer: PPOTrainer,
+    publisher: ModelPublisher,
+    update_number: int,
+) -> tuple[dict, dict]:
+    stats = trainer.train_on_batch(samples())
+    version = trainer.model_version
+    update_id = f"update-v{version}"
+    publisher.commit_optimizer_checkpoint(
+        trainer,
+        train_update_id=update_id,
+        behavior_model_version=version - 1,
+        batch_ids=[f"batch-{update_number}"],
+        stats=stats,
+        sample_count=2,
+        train_updates=version,
+        trained_samples=version * 2,
+    )
+    manifest = publisher.publish_runtime(
+        trainer,
+        train_update_id=update_id,
+        behavior_model_version=version - 1,
+        batch_ids=[f"batch-{update_number}"],
+        stats=stats,
+        sample_count=2,
+        train_updates=version,
+        trained_samples=version * 2,
+        checkpoint_precommitted=True,
+    )
+    return manifest, stats
+
+
 class ModelCommitContractTest(unittest.TestCase):
-    def test_manifest_is_the_complete_version_marker(self):
+    def test_prepare_rejects_unclean_local_train_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = ModelPublisher(config(root))
+            first.prepare()
+            (first.metrics_dir / "existing.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            second = ModelPublisher(config(root))
+            with self.assertRaisesRegex(RuntimeError, "was not cleaned"):
+                second.prepare()
+
+    def test_manifest_is_the_complete_runtime_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             trainer = PPOTrainer(config(root))
-            publisher = ModelPublisher(config(root), "run-commit")
-            publisher.publish(
+            publisher = ModelPublisher(config(root))
+            publisher.prepare()
+            publisher.publish_runtime(
                 trainer,
                 train_update_id="bootstrap-v0",
                 behavior_model_version=None,
@@ -76,26 +123,9 @@ class ModelCommitContractTest(unittest.TestCase):
             )
             self.assertIsNotNone(publisher.complete_manifest(0))
 
-            stats = trainer.train_on_batch(samples())
-            trainer.export_onnx(str(publisher.model_path(1)))
-            trainer.save_checkpoint(
-                str(publisher.checkpoint_path(1)),
-                metadata={"train_update_id": "update-v1"},
-            )
-            self.assertIsNone(publisher.complete_manifest(1))
-            self.assertEqual(
-                publisher.latest_complete_checkpoint(),
-                publisher.checkpoint_path(0),
-            )
-
-            publisher.publish(
-                trainer,
-                train_update_id="update-v1",
-                behavior_model_version=0,
-                batch_ids=["batch-0"],
-                stats=stats,
-                sample_count=2,
-            )
+            manifest, _ = publish_update(trainer, publisher, 1)
+            self.assertEqual(manifest["contract_version"], "0.5.0")
+            self.assertNotIn("run_id", manifest)
             self.assertIsNotNone(
                 publisher.complete_manifest(1, "update-v1")
             )
@@ -104,12 +134,167 @@ class ModelCommitContractTest(unittest.TestCase):
                 stream.write(b"corrupt")
             self.assertIsNone(publisher.complete_manifest(1))
 
+    def test_archive_retention_and_explicit_checkpoint_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            trainer = PPOTrainer(config(source_root))
+            publisher = ModelPublisher(config(source_root))
+            publisher.prepare()
+            publisher.publish_runtime(
+                trainer,
+                train_update_id="bootstrap-v0",
+                behavior_model_version=None,
+                batch_ids=[],
+            )
+            publisher.archive_version(0, "bootstrap")
+            publish_update(trainer, publisher, 1)
+            self.assertFalse(
+                (publisher.archive_dir / "v000001").exists()
+            )
+            publish_update(trainer, publisher, 2)
+            publisher.archive_version(2, "interval")
+            publisher.prune_runtime(2)
+
+            self.assertTrue(
+                (
+                    publisher.archive_dir
+                    / "v000000"
+                    / "manifest_v000000.json"
+                ).is_file()
+            )
+            savepoint = publisher.archive_dir / "v000002"
+            self.assertTrue(
+                (savepoint / "manifest_v000002.json").is_file()
+            )
+            self.assertFalse(publisher.model_path(0).exists())
+            self.assertTrue(publisher.model_path(1).exists())
+            self.assertTrue(publisher.model_path(2).exists())
+
+            external_checkpoint = root / "savepoints" / "checkpoint.pt"
+            external_checkpoint.parent.mkdir()
+            shutil.copyfile(
+                savepoint / "checkpoint_v000002.pt",
+                external_checkpoint,
+            )
+
+            child_root = root / "child"
+            resumed = PPOTrainer(config(child_root))
+            child = ModelPublisher(config(child_root))
+            child.prepare()
+            restored = child.load_initial_checkpoint(
+                resumed, str(external_checkpoint)
+            )
+            self.assertEqual(resumed.model_version, 2)
+            self.assertEqual(restored["train_updates"], 2)
+            self.assertEqual(restored["trained_samples"], 4)
+            self.assertEqual(restored["initial_model_version"], 2)
+            self.assertTrue(restored["initial_checkpoint_sha256"])
+            runtime = TrainingRuntime.__new__(TrainingRuntime)
+            runtime.trainer = resumed
+            runtime.publisher = child
+            runtime._startup_mode = "initial-checkpoint"
+            runtime.train_updates = 2
+            runtime.trained_samples = 4
+            runtime._last_archive_version = None
+            runtime._behavior_checksums = {}
+            runtime.logger = mock.Mock()
+            runtime._register = mock.Mock()
+            runtime._initialize_models()
+
+            child_manifest = child.complete_manifest(
+                2, "initial-checkpoint"
+            )
+            self.assertIsNotNone(child_manifest)
+            self.assertEqual(
+                child_manifest["initial_model_version"], 2
+            )
+            self.assertEqual(
+                child_manifest["initial_checkpoint_sha256"],
+                restored["initial_checkpoint_sha256"],
+            )
+            self.assertNotIn("run_id", child_manifest)
+            initial_archive = read_json(
+                child.archive_dir
+                / "v000002"
+                / "manifest_v000002.json"
+            )
+            self.assertEqual(
+                initial_archive["archive_reason"], "initial-checkpoint"
+            )
+            self.assertEqual(runtime._last_archive_version, 2)
+
+    def test_production_archive_interval_and_graceful_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trainer = PPOTrainer(config(root, archive_interval=200))
+            publisher = ModelPublisher(config(root, archive_interval=200))
+            publisher.prepare()
+            publisher.publish_runtime(
+                trainer,
+                train_update_id="bootstrap-v0",
+                behavior_model_version=None,
+                batch_ids=[],
+            )
+            publisher.archive_version(0, "bootstrap")
+            self.assertFalse(publisher.should_archive(199))
+            self.assertTrue(publisher.should_archive(200))
+            self.assertFalse(publisher.should_archive(201))
+
+            trainer._model_version = 200
+            publisher.publish_runtime(
+                trainer,
+                train_update_id="update-v200",
+                behavior_model_version=199,
+                batch_ids=["batch-200"],
+                train_updates=200,
+                trained_samples=102400,
+            )
+            publisher.archive_version(200, "interval")
+            trainer._model_version = 201
+            publisher.publish_runtime(
+                trainer,
+                train_update_id="update-v201",
+                behavior_model_version=200,
+                batch_ids=["batch-201"],
+                train_updates=201,
+                trained_samples=102912,
+            )
+            publisher.archive_version(201, "graceful-shutdown")
+
+            self.assertTrue(
+                (
+                    publisher.archive_dir
+                    / "v000000"
+                    / "manifest_v000000.json"
+                ).is_file()
+            )
+            self.assertFalse(
+                (publisher.archive_dir / "v000199").exists()
+            )
+            self.assertTrue(
+                (
+                    publisher.archive_dir
+                    / "v000200"
+                    / "manifest_v000200.json"
+                ).is_file()
+            )
+            final_manifest = read_json(
+                publisher.archive_dir
+                / "v000201"
+                / "manifest_v000201.json"
+            )
+            self.assertEqual(
+                final_manifest["archive_reason"], "graceful-shutdown"
+            )
+
     def test_checkpoint_restores_rng_for_deterministic_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = PPOTrainer(config(root))
-            publisher = ModelPublisher(config(root), "run-retry")
-            publisher.publish(
+            publisher = ModelPublisher(config(root))
+            publisher.prepare()
+            publisher.publish_runtime(
                 first,
                 train_update_id="bootstrap-v0",
                 behavior_model_version=None,
@@ -133,7 +318,7 @@ class ModelCommitContractTest(unittest.TestCase):
                     key,
                 )
 
-    def test_receipt_reconciliation_closes_each_commit_fault_window(self):
+    def test_receipt_reconciliation_closes_commit_fault_windows(self):
         class AlreadyAppliedSamplePool:
             def __init__(self):
                 self.requests = []
@@ -151,25 +336,19 @@ class ModelCommitContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             trainer = PPOTrainer(config(root))
-            publisher = ModelPublisher(config(root), "run-reconcile")
-            publisher.publish(
+            publisher = ModelPublisher(config(root))
+            publisher.prepare()
+            publisher.publish_runtime(
                 trainer,
                 train_update_id="bootstrap-v0",
                 behavior_model_version=None,
                 batch_ids=[],
             )
-            stats = trainer.train_on_batch(samples())
-            manifest = publisher.publish(
-                trainer,
-                train_update_id="update-v1",
-                behavior_model_version=0,
-                batch_ids=["batch-0"],
-                stats=stats,
-                sample_count=2,
-            )
+            manifest, stats = publish_update(trainer, publisher, 1)
 
             for initial_state in (
                 "LEASED",
+                "RUNTIME_COMMITTED",
                 "MODEL_COMMITTED",
                 "REGISTERED",
             ):
@@ -179,26 +358,28 @@ class ModelCommitContractTest(unittest.TestCase):
                         receipt_path,
                         {
                             "schema_version": 1,
-                            "run_id": "run-reconcile",
                             "train_update_id": "update-v1",
                             "behavior_model_version": 0,
-                            "batch_ids": ["batch-0"],
+                            "batch_ids": ["batch-1"],
                             "target_model_version": 1,
                             "delivery_id": "delivery-0",
                             "state": initial_state,
                             "manifest": manifest,
                             "stats": stats,
                             "sample_count": 2,
+                            "train_updates": 1,
+                            "trained_samples": 2,
                         },
                     )
                     sample_pool = AlreadyAppliedSamplePool()
                     runtime = TrainingRuntime.__new__(TrainingRuntime)
-                    runtime.run_id = "run-reconcile"
                     runtime.consumer_id = "learner-restarted"
                     runtime.publisher = publisher
                     runtime.sample_stub = sample_pool
                     runtime._acked_update_ids = set()
+                    runtime._accounted_update_ids = set()
                     runtime._recorded_update_ids = set()
+                    runtime._last_archive_version = None
                     runtime.train_updates = 0
                     runtime.trained_samples = 0
                     runtime.last_stats = {}

@@ -16,10 +16,9 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def make_batch(run_id, batch_id, sample_count, sequence):
+def make_batch(batch_id, sample_count, sequence):
     batch = maze_pb2.SampleBatch(
-        protocol_version=2,
-        run_id=run_id,
+        protocol_version=3,
         aiserver_id="aiserver-0",
         env_id="env-0",
         session_id=0,
@@ -48,10 +47,9 @@ def make_batch(run_id, batch_id, sample_count, sequence):
     return batch
 
 
-def get_batch(stub, run_id, consumer_id, lease_timeout_ms):
+def get_batch(stub, consumer_id, lease_timeout_ms):
     return stub.GetBatch(
         maze_pb2.GetBatchReq(
-            run_id=run_id,
             consumer_instance_id=consumer_id,
             batch_size=8,
             timeout_ms=100,
@@ -68,7 +66,6 @@ def get_batch(stub, run_id, consumer_id, lease_timeout_ms):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
-    parser.add_argument("--run-id", default="live-fault-run")
     args = parser.parse_args()
 
     channel = grpc.insecure_channel(args.target)
@@ -76,15 +73,15 @@ def main():
     stub = maze_pb2_grpc.SampleDistributorServiceStub(channel)
 
     accepted = stub.PushSamples(
-        make_batch(args.run_id, "fault-batch-0", 8, 1),
+        make_batch("fault-batch-0", 8, 1),
         timeout=2.0,
     )
     duplicate = stub.PushSamples(
-        make_batch(args.run_id, "fault-batch-0", 8, 1),
+        make_batch("fault-batch-0", 8, 1),
         timeout=2.0,
     )
     capacity = stub.PushSamples(
-        make_batch(args.run_id, "fault-batch-1", 1, 2),
+        make_batch("fault-batch-1", 1, 2),
         timeout=2.0,
     )
     require(
@@ -100,7 +97,7 @@ def main():
         "full pool did not reject a unique batch",
     )
 
-    first = get_batch(stub, args.run_id, "consumer-exits", 300)
+    first = get_batch(stub, "consumer-exits", 300)
     require(
         first.result == maze_pb2.GET_BATCH_RESULT_LEASED,
         "first consumer did not obtain a lease",
@@ -112,7 +109,7 @@ def main():
     recovery_channel = grpc.insecure_channel(args.target)
     grpc.channel_ready_future(recovery_channel).result(timeout=5.0)
     recovery = maze_pb2_grpc.SampleDistributorServiceStub(recovery_channel)
-    second = get_batch(recovery, args.run_id, "consumer-recovery", 1000)
+    second = get_batch(recovery, "consumer-recovery", 1000)
     require(
         second.result == maze_pb2.GET_BATCH_RESULT_LEASED,
         "expired lease was not redelivered",
@@ -128,7 +125,6 @@ def main():
 
     ack = recovery.AckBatch(
         maze_pb2.AckBatchReq(
-            run_id=args.run_id,
             consumer_instance_id="consumer-recovery",
             delivery_id=second.delivery_id,
             disposition=maze_pb2.ACK_DISPOSITION_TRAINED,
@@ -138,7 +134,6 @@ def main():
     )
     duplicate_ack = recovery.AckBatch(
         maze_pb2.AckBatchReq(
-            run_id=args.run_id,
             consumer_instance_id="consumer-recovery",
             delivery_id=second.delivery_id,
             disposition=maze_pb2.ACK_DISPOSITION_TRAINED,
@@ -154,9 +149,22 @@ def main():
         duplicate_ack.result == maze_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
         "Ack retry was not idempotent",
     )
+    old_instance_ack = recovery.AckBatch(
+        maze_pb2.AckBatchReq(
+            consumer_instance_id="consumer-recovery",
+            delivery_id="old-distributor-delivery-1",
+            disposition=maze_pb2.ACK_DISPOSITION_TRAINED,
+            train_update_id="old-instance-update",
+        ),
+        timeout=2.0,
+    )
+    require(
+        old_instance_ack.result == maze_pb2.DELIVERY_RESULT_REJECTED,
+        "delivery from another Distributor instance was not rejected",
+    )
 
     status = recovery.GetStatus(
-        maze_pb2.DistributorStatusReq(run_id=args.run_id),
+        maze_pb2.DistributorStatusReq(),
         timeout=2.0,
     )
     require(status.accepted_unique_samples == 8, "accepted count drifted")
@@ -178,7 +186,6 @@ def main():
         json.dumps(
             {
                 "schema_version": 1,
-                "run_id": args.run_id,
                 "ok": True,
                 "accepted_result": maze_pb2.PushResult.Name(
                     accepted.result
@@ -202,6 +209,9 @@ def main():
                 ),
                 "ack_retry_result": maze_pb2.DeliveryResult.Name(
                     duplicate_ack.result
+                ),
+                "old_instance_ack_result": maze_pb2.DeliveryResult.Name(
+                    old_instance_ack.result
                 ),
             },
             indent=2,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the run-aware training metrics API."""
+"""Serve metrics for the currently active Learner training process."""
 
 import argparse
 import glob
@@ -16,7 +16,7 @@ class MetricsFileReader:
     def __init__(self, metrics_dir: str):
         self._metrics_dir = os.path.abspath(metrics_dir)
         self._lock = threading.Lock()
-        self._records_by_run = {}
+        self._records = []
         self._files = {}
         self._corrupt_lines = 0
         self._last_scan_time = 0.0
@@ -55,88 +55,49 @@ class MetricsFileReader:
                 if not raw_line.strip():
                     continue
                 try:
-                    record = json.loads(raw_line.decode("utf-8"))
-                    run_id = str(record.get("run_id", "legacy"))
-                    self._records_by_run.setdefault(run_id, []).append(record)
+                    self._records.append(
+                        json.loads(raw_line.decode("utf-8"))
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
                     state["corrupt"] += 1
                     self._corrupt_lines += 1
         except OSError as exc:
             state["error"] = str(exc)
 
-    def _selected_run(self, requested: str = "") -> str:
-        if requested:
-            return requested
-        latest_run = ""
-        latest_timestamp = -1.0
-        for run_id, records in self._records_by_run.items():
-            if records:
-                timestamp = float(records[-1].get("timestamp", 0.0))
-                if timestamp > latest_timestamp:
-                    latest_timestamp = timestamp
-                    latest_run = run_id
-        return latest_run
-
-    def query(self, run_id: str = "", after_sequence: int = 0, limit: int = 0):
+    def query(self, after_sequence: int = 0, limit: int = 0):
         self.refresh()
         with self._lock:
-            selected = self._selected_run(run_id)
             records = [
                 record
-                for record in self._records_by_run.get(selected, [])
+                for record in self._records
                 if int(record.get("sequence", record.get("train_step", 0)))
                 > after_sequence
             ]
             if limit > 0:
                 records = records[:limit]
-            return selected, records
+            return records
 
-    def latest(self, run_id: str = ""):
+    def latest(self):
         self.refresh()
         with self._lock:
-            selected = self._selected_run(run_id)
-            records = self._records_by_run.get(selected, [])
-            return selected, records[-1] if records else {}
+            return self._records[-1] if self._records else {}
 
-    def runs(self):
-        self.refresh()
+    def status(self):
+        latest = self.latest()
         with self._lock:
-            result = []
-            for run_id, records in self._records_by_run.items():
-                latest = records[-1] if records else {}
-                result.append(
-                    {
-                        "run_id": run_id,
-                        "mode": latest.get("mode", "unknown"),
-                        "record_count": len(records),
-                        "latest_sequence": latest.get(
-                            "sequence", latest.get("train_step", 0)
-                        ),
-                        "latest_timestamp": latest.get("timestamp", 0),
-                    }
-                )
-            return sorted(
-                result, key=lambda item: item["latest_timestamp"], reverse=True
-            )
-
-    def status(self, run_id: str = ""):
-        self.refresh()
-        with self._lock:
-            selected = self._selected_run(run_id)
-            records = self._records_by_run.get(selected, [])
-            latest = records[-1] if records else {}
             timestamp = float(latest.get("timestamp", 0.0))
             interval_seconds = max(
                 float(latest.get("interval_ms", 0.0)) / 1000.0, 0.0
             )
             stale_after = max(5.0, 3.0 * interval_seconds)
-            age_seconds = max(0.0, time.time() - timestamp) if timestamp else None
+            age_seconds = (
+                max(0.0, time.time() - timestamp) if timestamp else None
+            )
             return {
                 "schema_version": 1,
                 "metrics_dir": self._metrics_dir,
-                "run_id": selected,
                 "mode": latest.get("mode", ""),
-                "record_count": len(records),
+                "record_count": len(self._records),
                 "latest_sequence": latest.get(
                     "sequence", latest.get("train_step", 0)
                 ),
@@ -152,16 +113,18 @@ class MetricsFileReader:
                 },
             }
 
-    def summary(self, run_id: str = ""):
-        selected, latest = self.latest(run_id)
+    def summary(self):
+        latest = self.latest()
+        distributor = latest.get("distributor", {})
+        rates = latest.get("rates", {})
+        chain = latest.get("chain", {})
         return {
-            "run_id": selected,
             "mode": latest.get("mode", ""),
             "sequence": latest.get("sequence", 0),
-            "consumed": latest.get("total_consumed", 0),
-            "consumer_sps": latest.get("consumer_sps", 0.0),
-            "queue_size": latest.get("distributor_queue_size", 0),
-            "chain_ready": latest.get("chain_ready", False),
+            "consumed": distributor.get("acked", 0),
+            "consumer_sps": rates.get("trained_sps", 0.0),
+            "queue_size": distributor.get("ready_samples", 0),
+            "chain_ready": chain.get("ready", False),
         }
 
 
@@ -173,18 +136,17 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
-        run_id = params.get("run_id", [""])[0]
 
         if path == "/":
             self._json_response(
                 {
                     "schema_version": 1,
                     "service": "learner-metrics",
+                    "stream": "current",
                     "endpoints": [
                         "/api/metrics",
                         "/api/metrics/latest",
                         "/api/metrics/summary",
-                        "/api/runs",
                         "/api/status",
                     ],
                 }
@@ -205,30 +167,27 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                     status=400,
                 )
                 return
-            selected, records = metrics_reader.query(
-                run_id, after_sequence, limit
-            )
+            records = metrics_reader.query(after_sequence, limit)
             self._json_response(
                 {
                     "schema_version": 1,
-                    "run_id": selected,
+                    "stream": "current",
                     "records": records,
                     "total": len(records),
                 }
             )
         elif path == "/api/metrics/latest":
-            selected, record = metrics_reader.latest(run_id)
             self._json_response(
-                {"schema_version": 1, "run_id": selected, "record": record}
+                {
+                    "schema_version": 1,
+                    "stream": "current",
+                    "record": metrics_reader.latest(),
+                }
             )
         elif path == "/api/metrics/summary":
-            self._json_response(metrics_reader.summary(run_id))
-        elif path == "/api/runs":
-            self._json_response(
-                {"schema_version": 1, "runs": metrics_reader.runs()}
-            )
+            self._json_response(metrics_reader.summary())
         elif path == "/api/status":
-            self._json_response(metrics_reader.status(run_id))
+            self._json_response(metrics_reader.status())
         else:
             self.send_error(404, "Not Found")
 
@@ -263,8 +222,10 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
 
 def main():
     global metrics_reader
-    parser = argparse.ArgumentParser(description="Serve the training metrics API")
-    parser.add_argument("--dir", "-d", default="logs/metrics")
+    parser = argparse.ArgumentParser(
+        description="Serve the current training metrics API"
+    )
+    parser.add_argument("--dir", "-d", default="models/local-train/metrics")
     parser.add_argument("--port", "-p", type=int, default=9005)
     args = parser.parse_args()
     metrics_reader = MetricsFileReader(args.dir)

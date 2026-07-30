@@ -29,18 +29,14 @@ training:
   n_epochs: 4                     # 每批数据训练轮数
   mini_batch_size: 64             # mini-batch 大小（每个 epoch 内的切分粒度）
   normalize_advantage: true       # 是否标准化 advantage（推荐开启）
-  pass_reward_threshold: 10.0     # 通关奖励阈值（trajectory 最后一帧 reward >= 此值视为通关）
 
-# --- 模型导出参数 ---
+# --- 模型生命周期参数 ---
 model:
-  save_dir: "models/save"         # 历史模型保存目录（checkpoint 断点续训，持久化到宿主机）
-  distribution_dir: "models/published"
-  checkpoint_dir: "models/checkpoints"
-  update_dir: "models/updates"
-  save_name: "SaveModel"          # 模型文件名（不含扩展名，checkpoint 和 ONNX 共用）
-  export_interval: 10             # 每训练 N 步导出一次 ONNX 模型到 P2P 目录
-  save_interval: 10               # 每训练 N 步保存一次 checkpoint 到 save 目录（断点续训）
-  checkpoint_enabled: false        # 是否启用 checkpoint 加载（开启后自动从 save 目录加载历史保存点续训，默认关闭使用随机初始化）
+  local_train_dir: "models/local-train"
+  initial_checkpoint: ""
+  archive_interval_updates: 200
+  archive_on_graceful_shutdown: true
+  serving_retention_versions: 2
   obs_dim: 13                     # 观测向量维度（5 导航特征 + 8 方向射线障碍物检测）
   action_dim: 9                   # 动作空间维度
   hidden_dim: 64                  # 隐藏层维度
@@ -49,8 +45,8 @@ model:
 model_distributor:
   host: "127.0.0.1"
   port: 9200
-  artifact_root: "models/published"
-  config_path: "/opt/rl/learner/model-distributor/config/model_distributor_config.yaml"
+  artifact_root: "models/local-train"
+  config_path: "model-distributor/config/model_distributor_config.yaml"
   startup_timeout_sec: 30
 
 # --- 日志参数 ---
@@ -63,8 +59,7 @@ log:
 dashboard:
   enabled: true                   # 是否启用指标记录和面板服务
   server_port: 9005               # 指标面板 HTTP 端口
-  metrics_dir: "logs/metrics"     # 指标数据目录（相对于 RL-Learner 根目录）
-  window_size: 100                # Episode 指标滑动窗口大小（计算平均奖励/通关率的窗口）
+  metrics_dir: "models/local-train/metrics"
   backend: "jsonl"                # 指标存储后端
 
 # --- 训练样本租约参数 ---

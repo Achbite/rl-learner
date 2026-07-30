@@ -88,14 +88,16 @@ trap 'rm -rf "${temp_dir}"' EXIT
 
 docker run --rm \
     --entrypoint python3 \
+    --env PYTHONPATH=/workspace/rl-learner \
+    --workdir /tmp \
+    --volume "${repo_dir}:/workspace/rl-learner:ro" \
     --volume "${temp_dir}:/output" \
     "${image_ref}" \
     -m main.model_bootstrap \
-    --config configs/learner_config.yaml \
-    --run-id inference-smoke-fixture \
+    --config /workspace/rl-learner/configs/learner_config.yaml \
     --output-root /output
 
-generated="${temp_dir}/inference-smoke-fixture"
+generated="${temp_dir}"
 python3 - \
     "${generated}/manifest.json" \
     "${version}" \
@@ -130,5 +132,4 @@ PY
 mkdir -p "$(dirname "${output_dir}")"
 mv "${generated}" "${output_dir}"
 trap - EXIT
-rmdir "${temp_dir}"
 printf '%s\n' "${output_dir}"
