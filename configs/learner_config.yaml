@@ -1,0 +1,78 @@
+# ============================================================================
+# RL-Learner 配置文件 - 迷宫训练框架
+# 说明：Learner 训练服务的运行参数集中管理
+#       修改后重启 Learner 即可生效
+# ============================================================================
+
+# --- gRPC 服务参数 ---
+server:
+  listen_port: 9003               # gRPC 监听端口，AIServer 通过此端口发送样本
+  max_workers: 4                  # gRPC 线程池大小
+
+# --- 样本缓存参数 ---
+buffer:
+  warn_threshold: 8192            # 拥塞告警水位线，缓冲区样本数超过此值时打印告警（无界队列，不丢弃）
+  consume_batch_size: 512         # 每次训练消费的样本数量
+  consume_timeout: 1.0            # 消费等待超时（秒），无数据时阻塞等待的上限
+
+# --- PPO 训练参数 ---
+training:
+  device: "cpu"
+  seed: 0
+  learning_rate: 0.0003           # Adam 学习率
+  gamma: 0.99                     # 折扣因子
+  gae_lambda: 0.95                # GAE lambda
+  clip_epsilon: 0.2               # PPO 裁剪系数
+  entropy_coef: 0.01              # 熵正则化系数
+  value_coef: 0.5                 # 价值损失系数
+  max_grad_norm: 0.5              # 梯度裁剪
+  n_epochs: 4                     # 每批数据训练轮数
+  mini_batch_size: 64             # mini-batch 大小（每个 epoch 内的切分粒度）
+  normalize_advantage: true       # 是否标准化 advantage（推荐开启）
+  pass_reward_threshold: 10.0     # 通关奖励阈值（trajectory 最后一帧 reward >= 此值视为通关）
+
+# --- 模型导出参数 ---
+model:
+  save_dir: "models/save"         # 历史模型保存目录（checkpoint 断点续训，持久化到宿主机）
+  distribution_dir: "models/published"
+  checkpoint_dir: "models/checkpoints"
+  update_dir: "models/updates"
+  save_name: "SaveModel"          # 模型文件名（不含扩展名，checkpoint 和 ONNX 共用）
+  export_interval: 10             # 每训练 N 步导出一次 ONNX 模型到 P2P 目录
+  save_interval: 10               # 每训练 N 步保存一次 checkpoint 到 save 目录（断点续训）
+  checkpoint_enabled: false        # 是否启用 checkpoint 加载（开启后自动从 save 目录加载历史保存点续训，默认关闭使用随机初始化）
+  obs_dim: 13                     # 观测向量维度（5 导航特征 + 8 方向射线障碍物检测）
+  action_dim: 9                   # 动作空间维度
+  hidden_dim: 64                  # 隐藏层维度
+  bootstrap_seed: 0
+
+model_distributor:
+  host: "127.0.0.1"
+  port: 9200
+  artifact_root: "models/published"
+  config_path: "/opt/rl/learner/model-distributor/config/model_distributor_config.yaml"
+  startup_timeout_sec: 30
+
+# --- 日志参数 ---
+log:
+  console_level: "INFO"           # 控制台日志级别（DEBUG / INFO / WARN / ERROR）
+  file_level: "DEBUG"             # 文件日志级别
+  log_dir: "logs"                 # 日志文件目录（相对于 RL-Learner 根目录）
+
+# --- 训练指标面板参数 ---
+dashboard:
+  enabled: true                   # 是否启用指标记录和面板服务
+  server_port: 9005               # 指标面板 HTTP 端口
+  metrics_dir: "logs/metrics"     # 指标数据目录（相对于 RL-Learner 根目录）
+  window_size: 100                # Episode 指标滑动窗口大小（计算平均奖励/通关率的窗口）
+  backend: "jsonl"                # 指标存储后端
+
+# --- 训练样本租约参数 ---
+sample_distributor:
+  host: "maze-aiserver"
+  port: 9100
+  train_batch_size: 512
+  current_version_wait_ms: 10000
+  get_timeout_ms: 1000
+  lease_timeout_ms: 30000
+  shutdown_drain_timeout_ms: 20000

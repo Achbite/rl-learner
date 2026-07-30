@@ -1,0 +1,8 @@
+build/
+logs/
+models/
+.DS_Store
+*.pyc
+__pycache__/
+proto/maze_pb2.py
+proto/maze_pb2_grpc.py
