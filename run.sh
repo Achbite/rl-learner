@@ -13,8 +13,19 @@ if [ "${workload}" != "training" ]; then
 fi
 
 config="${MAZE_LEARNER_CONFIG:-${repo_dir}/configs/learner_config.yaml}"
+repository_sample_pool_dir="${repo_dir}/sample-pool"
+runtime_sample_pool_dir="/opt/rl/learner/sample-pool"
 repository_distributor_dir="${repo_dir}/model-distributor"
 runtime_distributor_dir="/opt/rl/learner/model-distributor"
+if [ -x "${repository_sample_pool_dir}/bin/maze_sample_distributor" ] &&
+   [ -f "${repository_sample_pool_dir}/config/distributor_config.yaml" ]; then
+    default_sample_pool_dir="${repository_sample_pool_dir}"
+elif [ -x "${runtime_sample_pool_dir}/bin/maze_sample_distributor" ] &&
+     [ -f "${runtime_sample_pool_dir}/config/distributor_config.yaml" ]; then
+    default_sample_pool_dir="${runtime_sample_pool_dir}"
+else
+    default_sample_pool_dir="${repository_sample_pool_dir}"
+fi
 if [ -x "${repository_distributor_dir}/bin/maze_model_distributor" ] &&
    [ -f "${repository_distributor_dir}/config/model_distributor_config.yaml" ]; then
     default_distributor_dir="${repository_distributor_dir}"
@@ -24,6 +35,8 @@ elif [ -x "${runtime_distributor_dir}/bin/maze_model_distributor" ] &&
 else
     default_distributor_dir="${repository_distributor_dir}"
 fi
+sample_pool_bin="${SAMPLE_DISTRIBUTOR_BIN:-${default_sample_pool_dir}/bin/maze_sample_distributor}"
+sample_pool_config="${SAMPLE_DISTRIBUTOR_CONFIG:-${default_sample_pool_dir}/config/distributor_config.yaml}"
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
 model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
 local_train_root="${MAZE_LOCAL_TRAIN_ROOT:-${repo_dir}/models/local-train}"
@@ -47,12 +60,6 @@ while [ "$#" -gt 0 ]; do
             export MAZE_MODEL_DISTRIBUTOR_PORT="${address##*:}"
             shift 2
             ;;
-        --sample-distributor)
-            address="${2:?--sample-distributor requires host:port}"
-            export MAZE_SAMPLE_DISTRIBUTOR_HOST="${address%:*}"
-            export MAZE_SAMPLE_DISTRIBUTOR_PORT="${address##*:}"
-            shift 2
-            ;;
         --aiserver)
             address="${2:?--aiserver requires host:port}"
             export MAZE_AISERVER_HOST="${address%:*}"
@@ -74,6 +81,16 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ ! -x "${sample_pool_bin}" ]; then
+    echo "LocalSampleService executable is missing: ${sample_pool_bin}" >&2
+    echo "Build rl-sample-pool and stage its artifact in sample-pool/" >&2
+    exit 1
+fi
+if [ ! -f "${sample_pool_config}" ]; then
+    echo "LocalSampleService config is missing: ${sample_pool_config}" >&2
+    echo "Build rl-sample-pool and stage its artifact in sample-pool/" >&2
+    exit 1
+fi
 if [ ! -x "${model_distributor_bin}" ]; then
     echo "ModelDistributor executable is missing: ${model_distributor_bin}" >&2
     echo "Build rl-model-distributor and stage its artifact in model-distributor/" >&2
@@ -143,6 +160,8 @@ mkdir -p \
 export PYTHONUNBUFFERED=1
 export MAZE_LOCAL_TRAIN_ROOT="${local_train_root}"
 export MAZE_MODEL_ARTIFACT_ROOT="${local_train_root}"
+export MAZE_SAMPLE_DISTRIBUTOR_HOST="127.0.0.1"
+export MAZE_SAMPLE_DISTRIBUTOR_PORT="${MAZE_SAMPLE_DISTRIBUTOR_PORT:-9100}"
 export MAZE_MODEL_DISTRIBUTOR_PORT="${MAZE_MODEL_DISTRIBUTOR_PORT:-9200}"
 if [ -n "${initial_checkpoint}" ]; then
     export MAZE_INITIAL_CHECKPOINT="${initial_checkpoint}"
@@ -154,6 +173,7 @@ fi
 metrics_pid=""
 training_pid=""
 model_distributor_pid=""
+sample_pool_pid=""
 stopping=0
 quiesced=0
 quiesce_marker="${MAZE_QUIESCE_MARKER:-/tmp/rl-training-quiesced}"
@@ -189,6 +209,8 @@ shutdown() {
     metrics_pid=""
     terminate_process "${model_distributor_pid}" 3
     model_distributor_pid=""
+    terminate_process "${sample_pool_pid}" 10
+    sample_pool_pid=""
     rm -rf -- "${training_lock}"
 }
 
@@ -206,6 +228,29 @@ trap quiesce USR1
 trap shutdown EXIT TERM INT
 
 cd "${repo_dir}"
+"${sample_pool_bin}" "${sample_pool_config}" &
+sample_pool_pid=$!
+
+ready=0
+for _ in $(seq 1 300); do
+    if ! kill -0 "${sample_pool_pid}" 2>/dev/null; then
+        wait "${sample_pool_pid}"
+        exit $?
+    fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/${MAZE_SAMPLE_DISTRIBUTOR_PORT}") \
+        2>/dev/null; then
+        exec 3>&-
+        exec 3<&-
+        ready=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "${ready}" -ne 1 ]; then
+    echo "LocalSampleService readiness timeout" >&2
+    exit 1
+fi
+
 "${model_distributor_bin}" "${model_distributor_config}" &
 model_distributor_pid=$!
 
@@ -243,6 +288,7 @@ training_pid=$!
 
 while [ "${stopping}" -eq 0 ]; do
     for process in \
+        "${sample_pool_pid}" \
         "${model_distributor_pid}" \
         "${metrics_pid}" \
         "${training_pid}"; do

@@ -81,12 +81,17 @@ class RuntimeConnectionLoggingTest(unittest.TestCase):
             [
                 call
                 for call in runtime.logger.info.call_args_list
-                if call.args[0] == "等待 SampleDistributor: %s"
+                if call.args[0] == "等待 LocalSampleService: %s"
             ],
-            [mock.call("等待 SampleDistributor: %s", "connection refused")],
+            [
+                mock.call(
+                    "等待 LocalSampleService: %s",
+                    "connection refused",
+                )
+            ],
         )
         runtime.logger.info.assert_any_call(
-            "SampleDistributor 连接%s", "已建立"
+            "LocalSampleService 连接%s", "已建立"
         )
         runtime.logger.warning.assert_not_called()
         self.assertEqual(stop_event.wait_count, 2)
@@ -127,12 +132,13 @@ class RuntimeConnectionLoggingTest(unittest.TestCase):
             runtime.logger.warning.call_args_list,
             [
                 mock.call(
-                    "等待 SampleDistributor: %s", "connection refused"
+                    "等待 LocalSampleService: %s",
+                    "connection refused",
                 )
             ],
         )
         runtime.logger.info.assert_any_call(
-            "SampleDistributor 连接%s", "已恢复"
+            "LocalSampleService 连接%s", "已恢复"
         )
         self.assertEqual(stop_event.wait_count, 2)
         runtime._drain_shutdown.assert_called_once()

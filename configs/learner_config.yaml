@@ -64,7 +64,7 @@ dashboard:
 
 # --- 训练样本租约参数 ---
 sample_distributor:
-  host: "maze-aiserver"
+  host: "127.0.0.1"
   port: 9100
   train_batch_size: 512
   current_version_wait_ms: 10000

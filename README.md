@@ -2,16 +2,19 @@
 
 简体中文 | [English](README.en.md)
 
-本地 PPO 训练服务，负责消费样本、更新模型、启动 ModelDistributor，并在 `9005` 提供训练指标 API。
+本地 PPO 训练服务，负责监管 LocalSampleService、ModelDistributor、训练进程和指标 API。LocalSampleService 在 `9100` 接收样本，ModelDistributor 在 `9200` 发布模型，指标 API 使用 `9005`。
 
 ## 快速开始
 
-先构建 Contracts 和 ModelDistributor，并装配二进制：
+先构建 Contracts、LocalSampleService 和 ModelDistributor，再显式装配两个运行制品：
 
 ```bash
 (cd ../rl-contracts && bash build_artifact.sh)
+(cd ../rl-sample-pool && bash build_artifact.sh)
 (cd ../rl-model-distributor && bash build_artifact.sh)
-cp -R ../.workspace/artifacts/rl-model-distributor/0.4.0/linux-arm64/. \
+cp -R ../.workspace/artifacts/rl-sample-pool/0.6.0/linux-arm64/. \
+  sample-pool/
+cp -R ../.workspace/artifacts/rl-model-distributor/0.5.0/linux-arm64/. \
   model-distributor/
 ```
 
@@ -32,7 +35,16 @@ bash ./run.sh training
 
 ```bash
 bash ./run.sh training \
-  --initial-checkpoint /absolute/path/to/checkpoint_v000200.pt
+  --initial-checkpoint /absolute/path/to/archive/000200/checkpoint.pt
+```
+
+长期保存点使用固定布局：
+
+```text
+models/local-train/archive/000200/
+  SaveModel.onnx
+  checkpoint.pt
+  manifest.json
 ```
 
 完整三容器训练建议从 `rl-framework` 启动：

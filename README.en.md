@@ -2,16 +2,19 @@
 
 English | [简体中文](README.md)
 
-Local PPO training service. It consumes samples, updates models, starts ModelDistributor, and exposes the training metrics API on `9005`.
+Local PPO training service. It supervises LocalSampleService, ModelDistributor, the training runtime, and the metrics API. LocalSampleService accepts samples on `9100`, ModelDistributor publishes models on `9200`, and the metrics API uses `9005`.
 
 ## Quick Start
 
-Build Contracts and ModelDistributor, then stage the binary:
+Build Contracts, LocalSampleService, and ModelDistributor, then explicitly stage both runtime artifacts:
 
 ```bash
 (cd ../rl-contracts && bash build_artifact.sh)
+(cd ../rl-sample-pool && bash build_artifact.sh)
 (cd ../rl-model-distributor && bash build_artifact.sh)
-cp -R ../.workspace/artifacts/rl-model-distributor/0.4.0/linux-arm64/. \
+cp -R ../.workspace/artifacts/rl-sample-pool/0.6.0/linux-arm64/. \
+  sample-pool/
+cp -R ../.workspace/artifacts/rl-model-distributor/0.5.0/linux-arm64/. \
   model-distributor/
 ```
 
@@ -32,7 +35,16 @@ This clears the Learner-owned `models/local-train` directory and starts from zer
 
 ```bash
 bash ./run.sh training \
-  --initial-checkpoint /absolute/path/to/checkpoint_v000200.pt
+  --initial-checkpoint /absolute/path/to/archive/000200/checkpoint.pt
+```
+
+Long-term savepoints use a fixed layout:
+
+```text
+models/local-train/archive/000200/
+  SaveModel.onnx
+  checkpoint.pt
+  manifest.json
 ```
 
 Use `rl-framework` to start the complete three-container training workflow:

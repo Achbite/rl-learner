@@ -124,7 +124,7 @@ class ModelCommitContractTest(unittest.TestCase):
             self.assertIsNotNone(publisher.complete_manifest(0))
 
             manifest, _ = publish_update(trainer, publisher, 1)
-            self.assertEqual(manifest["contract_version"], "0.5.0")
+            self.assertEqual(manifest["contract_version"], "0.6.0")
             self.assertNotIn("run_id", manifest)
             self.assertIsNotNone(
                 publisher.complete_manifest(1, "update-v1")
@@ -150,7 +150,7 @@ class ModelCommitContractTest(unittest.TestCase):
             publisher.archive_version(0, "bootstrap")
             publish_update(trainer, publisher, 1)
             self.assertFalse(
-                (publisher.archive_dir / "v000001").exists()
+                (publisher.archive_dir / "000001").exists()
             )
             publish_update(trainer, publisher, 2)
             publisher.archive_version(2, "interval")
@@ -159,13 +159,24 @@ class ModelCommitContractTest(unittest.TestCase):
             self.assertTrue(
                 (
                     publisher.archive_dir
-                    / "v000000"
-                    / "manifest_v000000.json"
+                    / "000000"
+                    / "manifest.json"
                 ).is_file()
             )
-            savepoint = publisher.archive_dir / "v000002"
+            savepoint = publisher.archive_dir / "000002"
             self.assertTrue(
-                (savepoint / "manifest_v000002.json").is_file()
+                (savepoint / "manifest.json").is_file()
+            )
+            self.assertTrue((savepoint / "SaveModel.onnx").is_file())
+            self.assertTrue((savepoint / "checkpoint.pt").is_file())
+            self.assertEqual(
+                {path.name for path in savepoint.iterdir()},
+                {"SaveModel.onnx", "checkpoint.pt", "manifest.json"},
+            )
+            archive_manifest = read_json(savepoint / "manifest.json")
+            self.assertEqual(
+                archive_manifest["artifact_uri"],
+                (savepoint / "SaveModel.onnx").as_uri(),
             )
             self.assertFalse(publisher.model_path(0).exists())
             self.assertTrue(publisher.model_path(1).exists())
@@ -174,7 +185,7 @@ class ModelCommitContractTest(unittest.TestCase):
             external_checkpoint = root / "savepoints" / "checkpoint.pt"
             external_checkpoint.parent.mkdir()
             shutil.copyfile(
-                savepoint / "checkpoint_v000002.pt",
+                savepoint / "checkpoint.pt",
                 external_checkpoint,
             )
 
@@ -216,8 +227,8 @@ class ModelCommitContractTest(unittest.TestCase):
             self.assertNotIn("run_id", child_manifest)
             initial_archive = read_json(
                 child.archive_dir
-                / "v000002"
-                / "manifest_v000002.json"
+                / "000002"
+                / "manifest.json"
             )
             self.assertEqual(
                 initial_archive["archive_reason"], "initial-checkpoint"
@@ -265,24 +276,24 @@ class ModelCommitContractTest(unittest.TestCase):
             self.assertTrue(
                 (
                     publisher.archive_dir
-                    / "v000000"
-                    / "manifest_v000000.json"
+                    / "000000"
+                    / "manifest.json"
                 ).is_file()
             )
             self.assertFalse(
-                (publisher.archive_dir / "v000199").exists()
+                (publisher.archive_dir / "000199").exists()
             )
             self.assertTrue(
                 (
                     publisher.archive_dir
-                    / "v000200"
-                    / "manifest_v000200.json"
+                    / "000200"
+                    / "manifest.json"
                 ).is_file()
             )
             final_manifest = read_json(
                 publisher.archive_dir
-                / "v000201"
-                / "manifest_v000201.json"
+                / "000201"
+                / "manifest.json"
             )
             self.assertEqual(
                 final_manifest["archive_reason"], "graceful-shutdown"

@@ -76,7 +76,7 @@ def export_initial_model(
 
     manifest = {
         "schema_version": 1,
-        "contract_version": "0.5.0",
+        "contract_version": "0.6.0",
         "model_version": model_version,
         "artifact_uri": Path(model_path).resolve().as_uri(),
         "model_file": model_file,

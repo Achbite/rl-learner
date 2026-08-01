@@ -22,6 +22,7 @@ excluded = {
     "build",
     "logs",
     "models",
+    "sample-pool",
     "model-distributor",
     "__pycache__",
     "_deps",

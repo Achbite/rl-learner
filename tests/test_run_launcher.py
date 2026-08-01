@@ -29,6 +29,16 @@ class RunLauncherTest(unittest.TestCase):
         (root / "configs/learner_config.yaml").write_text(
             "{}\n", encoding="utf-8"
         )
+        sample_pool_root = root / "sample-pool"
+        (sample_pool_root / "bin").mkdir(parents=True)
+        (sample_pool_root / "config").mkdir()
+        (sample_pool_root / "config" / "distributor_config.yaml").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        write_executable(
+            sample_pool_root / "bin" / "maze_sample_distributor",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
         distributor_root = root / "model-distributor"
         (distributor_root / "bin").mkdir(parents=True)
         (distributor_root / "config").mkdir()
@@ -41,7 +51,7 @@ class RunLauncherTest(unittest.TestCase):
         )
         return distributor_root
 
-    def test_repository_local_model_distributor_is_the_default(self):
+    def test_repository_local_services_are_started_before_training(self):
         source = Path(__file__).resolve().parents[1] / "run.sh"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -50,6 +60,14 @@ class RunLauncherTest(unittest.TestCase):
             (root / "configs/learner_config.yaml").write_text(
                 "{}\n", encoding="utf-8"
             )
+
+            sample_pool_root = root / "sample-pool"
+            (sample_pool_root / "bin").mkdir(parents=True)
+            (sample_pool_root / "config").mkdir()
+            sample_pool_config = (
+                sample_pool_root / "config" / "distributor_config.yaml"
+            )
+            sample_pool_config.write_text("{}\n", encoding="utf-8")
 
             distributor_root = root / "model-distributor"
             (distributor_root / "bin").mkdir(parents=True)
@@ -68,6 +86,7 @@ class RunLauncherTest(unittest.TestCase):
                         "import os",
                         "import signal",
                         "import socket",
+                        "import sys",
                         "",
                         "running = True",
                         "",
@@ -78,7 +97,7 @@ class RunLauncherTest(unittest.TestCase):
                         "signal.signal(signal.SIGTERM, stop)",
                         "listener = socket.socket()",
                         "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
-                        "listener.bind(('127.0.0.1', int(os.environ['MAZE_MODEL_DISTRIBUTOR_PORT'])))",
+                        "listener.bind(('127.0.0.1', int(sys.argv[1])))",
                         "listener.listen()",
                         "listener.settimeout(0.1)",
                         "while running:",
@@ -94,6 +113,22 @@ class RunLauncherTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            startup_order = root / "startup-order.txt"
+            sample_pool_marker = root / "sample-pool-argument.txt"
+            write_executable(
+                sample_pool_root / "bin" / "maze_sample_distributor",
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        'printf "%s\\n" "$1" > "${SAMPLE_POOL_ARGUMENT_MARKER}"',
+                        'printf "sample-pool\\n" >> "${STARTUP_ORDER_MARKER}"',
+                        'exec "${REAL_PYTHON}" "${FAKE_DISTRIBUTOR_SERVER}" "${MAZE_SAMPLE_DISTRIBUTOR_PORT}"',
+                    ]
+                )
+                + "\n",
+            )
+
             distributor_marker = root / "distributor-argument.txt"
             write_executable(
                 distributor_root / "bin" / "maze_model_distributor",
@@ -102,7 +137,8 @@ class RunLauncherTest(unittest.TestCase):
                         "#!/usr/bin/env bash",
                         "set -euo pipefail",
                         'printf "%s\\n" "$1" > "${DISTRIBUTOR_ARGUMENT_MARKER}"',
-                        'exec "${REAL_PYTHON}" "${FAKE_DISTRIBUTOR_SERVER}"',
+                        'printf "model-distributor\\n" >> "${STARTUP_ORDER_MARKER}"',
+                        'exec "${REAL_PYTHON}" "${FAKE_DISTRIBUTOR_SERVER}" "${MAZE_MODEL_DISTRIBUTOR_PORT}"',
                     ]
                 )
                 + "\n",
@@ -136,13 +172,18 @@ class RunLauncherTest(unittest.TestCase):
             environment = os.environ.copy()
             environment.pop("MODEL_DISTRIBUTOR_BIN", None)
             environment.pop("MODEL_DISTRIBUTOR_CONFIG", None)
+            environment.pop("SAMPLE_DISTRIBUTOR_BIN", None)
+            environment.pop("SAMPLE_DISTRIBUTOR_CONFIG", None)
             environment.update(
                 {
                     "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
                     "REAL_PYTHON": sys.executable,
                     "FAKE_DISTRIBUTOR_SERVER": str(server_script),
+                    "SAMPLE_POOL_ARGUMENT_MARKER": str(sample_pool_marker),
                     "DISTRIBUTOR_ARGUMENT_MARKER": str(distributor_marker),
+                    "STARTUP_ORDER_MARKER": str(startup_order),
                     "PYTHON_CALLS_MARKER": str(python_calls),
+                    "MAZE_SAMPLE_DISTRIBUTOR_PORT": str(available_port()),
                     "MAZE_MODEL_DISTRIBUTOR_PORT": str(available_port()),
                     "MAZE_QUIESCE_MARKER": str(root / "quiesced"),
                     "MAZE_LOCAL_TRAIN_ROOT": str(local_train),
@@ -167,8 +208,16 @@ class RunLauncherTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(
+                Path(sample_pool_marker.read_text(encoding="utf-8").strip()),
+                sample_pool_config.resolve(),
+            )
+            self.assertEqual(
                 Path(distributor_marker.read_text(encoding="utf-8").strip()),
                 distributor_config.resolve(),
+            )
+            self.assertEqual(
+                startup_order.read_text(encoding="utf-8").splitlines(),
+                ["sample-pool", "model-distributor"],
             )
             calls = python_calls.read_text(encoding="utf-8")
             self.assertIn("tools/metrics_server.py", calls)

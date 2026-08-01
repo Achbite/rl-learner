@@ -83,6 +83,10 @@ def manifest_message(document: dict):
 
 
 class ModelPublisher:
+    ARCHIVE_MODEL_FILE = "SaveModel.onnx"
+    ARCHIVE_CHECKPOINT_FILE = "checkpoint.pt"
+    ARCHIVE_MANIFEST_FILE = "manifest.json"
+
     def __init__(self, config: dict):
         model = config.get("model", {})
         self.seed = int(model.get("bootstrap_seed", 0))
@@ -204,6 +208,12 @@ class ModelPublisher:
     def checkpoint_path(self, version: int) -> Path:
         return self.checkpoint_dir / f"checkpoint_v{version:06d}.pt"
 
+    def archive_path(self, version: int) -> Path:
+        return self.archive_dir / f"{version:06d}"
+
+    def archive_manifest_path(self, version: int) -> Path:
+        return self.archive_path(version) / self.ARCHIVE_MANIFEST_FILE
+
     def receipt_path(self, train_update_id: str) -> Path:
         return self.update_dir / f"{train_update_id}.json"
 
@@ -280,7 +290,7 @@ class ModelPublisher:
 
         manifest = {
             "schema_version": 1,
-            "contract_version": "0.5.0",
+            "contract_version": "0.6.0",
             "model_version": version,
             "artifact_uri": model_path.as_uri(),
             "model_file": model_path.name,
@@ -394,7 +404,7 @@ class ModelPublisher:
         metadata = checkpoint.get("metadata", {})
         if (
             manifest.get("schema_version") != 1
-            or manifest.get("contract_version") != "0.5.0"
+            or manifest.get("contract_version") != "0.6.0"
             or manifest.get("model_version") != version
             or manifest.get("model_file") != model_path.name
             or not manifest.get("ready")
@@ -440,16 +450,24 @@ class ModelPublisher:
         manifest = self.complete_manifest(version)
         if manifest is None:
             raise RuntimeError(f"cannot archive incomplete model v{version}")
-        target = self.archive_dir / f"v{version:06d}"
+        target = self.archive_path(version)
         if target.exists():
-            archive_manifest = target / f"manifest_v{version:06d}.json"
+            archive_manifest = self.archive_manifest_path(version)
             if not archive_manifest.is_file():
                 raise RuntimeError(f"archive is incomplete: {target}")
             existing = read_json(archive_manifest)
             archived_model = target / str(existing.get("model_file", ""))
+            archived_checkpoint = target / str(
+                existing.get("checkpoint_file", "")
+            )
             if (
-                existing.get("sha256") != manifest["sha256"]
+                existing.get("model_version") != version
+                or existing.get("sha256") != manifest["sha256"]
+                or existing.get("model_file") != self.ARCHIVE_MODEL_FILE
+                or existing.get("checkpoint_file")
+                != self.ARCHIVE_CHECKPOINT_FILE
                 or not archived_model.is_file()
+                or not archived_checkpoint.is_file()
                 or sha256_file(archived_model) != manifest["sha256"]
             ):
                 raise RuntimeError(f"archive identity conflicts: {target}")
@@ -458,24 +476,24 @@ class ModelPublisher:
         temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
         temporary.mkdir(parents=False, exist_ok=False)
         try:
-            archived_model = temporary / self.model_path(version).name
-            archived_checkpoint = (
-                temporary / self.checkpoint_path(version).name
-            )
+            archived_model = temporary / self.ARCHIVE_MODEL_FILE
+            archived_checkpoint = temporary / self.ARCHIVE_CHECKPOINT_FILE
             shutil.copyfile(self.model_path(version), archived_model)
             shutil.copyfile(
                 self.checkpoint_path(version), archived_checkpoint
             )
             archive_manifest = {
                 **manifest,
-                "artifact_uri": archived_model.as_uri(),
+                "artifact_uri": (
+                    target / self.ARCHIVE_MODEL_FILE
+                ).as_uri(),
                 "model_file": archived_model.name,
                 "checkpoint_file": archived_checkpoint.name,
                 "archive_reason": reason,
                 "archived_ts_ms": int(time.time() * 1000),
             }
             atomic_write_json(
-                temporary / f"manifest_v{version:06d}.json",
+                temporary / self.ARCHIVE_MANIFEST_FILE,
                 archive_manifest,
             )
             os.replace(temporary, target)
@@ -1115,9 +1133,7 @@ class TrainingRuntime:
             receipt["state"],
             archive_committed=True,
             archive_manifest=str(
-                self.publisher.archive_dir
-                / f"v{version:06d}"
-                / f"manifest_v{version:06d}.json"
+                self.publisher.archive_manifest_path(version)
             ),
             archive_checksum=archive["sha256"],
         )
@@ -1443,7 +1459,22 @@ class TrainingRuntime:
             try:
                 distributor_status = self._sample_status()
                 distributor = {
+                    "service_name": "LocalSampleService",
                     "ready": distributor_status.ready,
+                    "ingress_ready": distributor_status.ingress_ready,
+                    "pool_ready": distributor_status.pool_ready,
+                    "backend_type": maze_pb2.SampleBackendType.Name(
+                        distributor_status.backend_type
+                    ),
+                    "max_concurrent_consumers": (
+                        distributor_status.max_concurrent_consumers
+                    ),
+                    "active_consumer_count": (
+                        distributor_status.active_consumer_count
+                    ),
+                    "consumer_busy_count": (
+                        distributor_status.consumer_busy_count
+                    ),
                     "instance_id": (
                         distributor_status.distributor_instance_id
                     ),
@@ -1839,7 +1870,7 @@ class TrainingRuntime:
                             else self.logger.info
                         )
                         log_wait(
-                            "等待 SampleDistributor: %s",
+                            "等待 LocalSampleService: %s",
                             exc.details() or str(exc),
                         )
                         sample_distributor_waiting = True
@@ -1847,7 +1878,7 @@ class TrainingRuntime:
                     continue
                 if sample_distributor_waiting:
                     self.logger.info(
-                        "SampleDistributor 连接%s",
+                        "LocalSampleService 连接%s",
                         "已恢复"
                         if sample_distributor_connected
                         else "已建立",
