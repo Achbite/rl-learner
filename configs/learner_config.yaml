@@ -1,73 +1,96 @@
-# ============================================================================
-# RL-Learner 配置文件 - 迷宫训练框架
-# 说明：Learner 训练服务的运行参数集中管理
-#       修改后重启 Learner 即可生效
-# ============================================================================
+# Learner owns only task-neutral training, model, transport and monitor settings.
+# Maze environment, map, curriculum and Reward values are intentionally absent.
 
-# --- gRPC 服务参数 ---
-server:
-  listen_port: 9003               # gRPC 监听端口，AIServer 通过此端口发送样本
-  max_workers: 4                  # gRPC 线程池大小
+contract:
+  package_name: rl-contracts
+  package_version: 0.8.0
+  source_digest: 157fba14177a0727abf663c442003e2a5f5c1e297f4af97ea22b45d74cdb32b5
+  artifact_digest: 71a0f13363d62b5d076c02b00e5b4b269a3e91253b190432f2e83c43cdcf7d3a
+  platform: linux/arm64
+  generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
-# --- 样本缓存参数 ---
-buffer:
-  warn_threshold: 8192            # 拥塞告警水位线，缓冲区样本数超过此值时打印告警（无界队列，不丢弃）
-  consume_batch_size: 512         # 每次训练消费的样本数量
-  consume_timeout: 1.0            # 消费等待超时（秒），无数据时阻塞等待的上限
+training_semantics:
+  training_contract_id: maze.training.v3
+  observation_schema:
+    schema_id: maze.observation.v3
+    schema_version: 1
+    canonical_digest: 7cee41136020f3ffc8c6ae799f630d55d0588c6a99ab7f717eac3b3d08aa18b4
+  action_schema:
+    schema_id: maze.action.v1
+    schema_version: 1
+    canonical_digest: ce84c564e128f98adcc48fd420ac0df5acea61774a25de8705b602464009cfd8
+  reward_schema:
+    schema_id: maze.reward.v3
+    schema_version: 1
+    canonical_digest: b55437290fc9183f6197de5b4fdb493f162e08d61dde73b3415ddc9315d3c604
+  policy_distribution_schema_id: categorical.logits.v1
+  model_architecture_id: maze.mlp-17x64x64.v1
+  semantics_digest: bde46f61bd04857f3fb2e79a5533f866856bb832c7ae2fb50ab65c67949ca62d
 
-# --- PPO 训练参数 ---
+policy:
+  distribution_schema_id: categorical.logits.v1
+  training_sampling: stochastic
+  training_temperature: 1.0        # unitless; fixed for behavior log-prob identity
+  evaluation_sampling: argmax
+  policy_spec_digest: e1efb81040681fd13fdae439caab09778c8e0b0f6bba16b7808c30fbbb632617
+
+identity:
+  model_lineage_id: maze-fixed-map-seed-0
+  training_config_digest: dae748332cac644c6a25ce139f1e2701df59ec0c3df5740c59706b25871668c0
+
 training:
-  device: "cpu"
-  seed: 0
-  learning_rate: 0.0003           # Adam 学习率
-  gamma: 0.99                     # 折扣因子
-  gae_lambda: 0.95                # GAE lambda
-  clip_epsilon: 0.2               # PPO 裁剪系数
-  entropy_coef: 0.01              # 熵正则化系数
-  value_coef: 0.5                 # 价值损失系数
-  max_grad_norm: 0.5              # 梯度裁剪
-  n_epochs: 4                     # 每批数据训练轮数
-  mini_batch_size: 64             # mini-batch 大小（每个 epoch 内的切分粒度）
-  normalize_advantage: true       # 是否标准化 advantage（推荐开启）
+  device: cpu
+  seed: 0                         # integer RNG seed, >=0
+  learning_rate: 0.0003           # Adam step size, (0,1]
+  gamma: 0.99                     # reward discount, [0,1]
+  gae_lambda: 0.95                # GAE trace decay, [0,1]
+  clip_epsilon: 0.2               # PPO policy ratio clip, (0,1]
+  value_clip_epsilon: 0.2         # value clip around behavior prediction, (0,1]
+  entropy_coef: 0.01              # entropy regularization weight, [0,10]
+  value_coef: 0.5                 # value-loss weight, [0,10]
+  max_grad_norm: 0.5              # L2 gradient clip, (0,100]
+  n_epochs: 4                     # optimizer passes per leased batch, >0
+  mini_batch_size: 64             # samples per optimizer mini-batch, >0
+  normalize_advantage: true
+  max_policy_lag: 1               # accepted behavior-model lag, versions, >=0
 
-# --- 模型生命周期参数 ---
 model:
-  local_train_dir: "models/local-train"
+  local_train_dir: models/local-train
   initial_checkpoint: ""
   archive_interval_updates: 200
   archive_on_graceful_shutdown: true
   serving_retention_versions: 2
-  obs_dim: 13                     # 观测向量维度（5 导航特征 + 8 方向射线障碍物检测）
-  action_dim: 9                   # 动作空间维度
-  hidden_dim: 64                  # 隐藏层维度
+  obs_dim: 17
+  action_dim: 9
+  hidden_dim: 64
   bootstrap_seed: 0
+  tensor_dtype: float32
 
-model_distributor:
-  host: "127.0.0.1"
-  port: 9200
-  artifact_root: "models/local-train"
-  config_path: "model-distributor/config/model_distributor_config.yaml"
-  startup_timeout_sec: 30
-
-# --- 日志参数 ---
-log:
-  console_level: "INFO"           # 控制台日志级别（DEBUG / INFO / WARN / ERROR）
-  file_level: "DEBUG"             # 文件日志级别
-  log_dir: "logs"                 # 日志文件目录（相对于 RL-Learner 根目录）
-
-# --- 训练指标面板参数 ---
-dashboard:
-  enabled: true                   # 是否启用指标记录和面板服务
-  server_port: 9005               # 指标面板 HTTP 端口
-  metrics_dir: "models/local-train/metrics"
-  backend: "jsonl"                # 指标存储后端
-
-# --- 训练样本租约参数 ---
 sample_distributor:
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 9100
   train_batch_size: 512
   current_version_wait_ms: 10000
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
   shutdown_drain_timeout_ms: 20000
+
+model_distributor:
+  host: 127.0.0.1
+  port: 9200
+  startup_timeout_sec: 30
+
+aiserver_status:
+  host: aiserver-dev
+  port: 9002
+
+dashboard:
+  enabled: true
+  server_port: 9005
+  metrics_dir: models/local-train/metrics
+  backend: jsonl
+
+log:
+  console_level: INFO
+  file_level: DEBUG
+  log_dir: logs

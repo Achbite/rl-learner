@@ -4,41 +4,43 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
-image_ref="${LEARNER_IMAGE_REF:-rl-training/learner:${LEARNER_IMAGE_TAG:-test-001}}"
+image_ref="${RL_LEARNER_IMAGE_REF:-rl-training/learner:${RL_LEARNER_IMAGE_TAG:-test-001}}"
 artifact_root="${workspace_root}/.workspace/artifacts/rl-smoke-model"
 source "${repo_dir}/artifact_versions.env"
 version="${RL_SMOKE_MODEL_VERSION}"
 source_commit="$(git -C "${repo_dir}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unborn')"
 source_sha256="$(
-    python3 - "${repo_dir}" <<'PY'
+    python3 - "${repo_dir}" \
+        artifact_versions.env \
+        build_smoke_model_artifact.sh \
+        Dockerfile \
+        requirements.txt \
+        configs/learner_config.yaml \
+        main/model_bootstrap.py \
+        main/training_runtime.py \
+        proto/common_pb2.py \
+        proto/training_pb2.py \
+        src/contracts/identity.py \
+        src/log/logger.py \
+        src/training/ppo_trainer.py <<'PY'
 import hashlib
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 digest = hashlib.sha256()
-excluded = {
-    ".git",
-    "build",
-    "logs",
-    "models",
-    "sample-pool",
-    "model-distributor",
-    "__pycache__",
-    "_deps",
-}
-for path in sorted(root.rglob("*")):
-    if not path.is_file() or excluded.intersection(path.parts):
-        continue
-    digest.update(str(path.relative_to(root)).encode())
+for relative in sorted(sys.argv[2:]):
+    path = root / relative
+    if not path.is_file():
+        raise SystemExit(f"smoke-model source input is missing: {path}")
+    digest.update(relative.encode())
     digest.update(path.read_bytes())
 print(digest.hexdigest())
 PY
 )"
-source_id="${source_commit}"
-if test -n "$(git -C "${repo_dir}" status --porcelain=v1)"; then
-    source_id="${source_commit}-dirty-${source_sha256:0:12}"
-fi
+# The smoke model is owned by the model-definition inputs above. Unrelated
+# monitor, documentation, or launcher edits must not invalidate its identity.
+source_id="model-source-${source_sha256:0:16}"
 output_dir="${artifact_root}/${version}/any"
 if test -d "${output_dir}"; then
     if PACKAGE_VERSION="${version}" \
@@ -71,7 +73,8 @@ if not model_path.is_file():
 payload = model_path.read_bytes()
 if len(payload) != manifest.get("size_bytes"):
     raise SystemExit(1)
-if hashlib.sha256(payload).hexdigest() != manifest.get("sha256"):
+identity = manifest.get("identity", {})
+if hashlib.sha256(payload).hexdigest() != identity.get("artifact_digest"):
     raise SystemExit(1)
 PY
     then
@@ -96,7 +99,8 @@ docker run --rm \
     "${image_ref}" \
     -m main.model_bootstrap \
     --config /workspace/rl-learner/configs/learner_config.yaml \
-    --output-root /output
+    --output-root /output \
+    --artifact-uri-prefix file:///opt/rl/aiserver/models/smoke
 
 generated="${temp_dir}"
 python3 - \
@@ -120,9 +124,6 @@ document.update(
         "source_sha256": sys.argv[5],
         "platform": "any",
     }
-)
-document["artifact_uri"] = (
-    "file:///opt/rl/aiserver/models/smoke/" + document["model_file"]
 )
 path.write_text(
     json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",

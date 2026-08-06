@@ -10,7 +10,7 @@ source "${repo_dir}/artifact_versions.env"
 platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
 platform_dir="${platform//\//-}"
 artifact_dir="${artifact_root}/${RL_CONTRACTS_VERSION}/${platform_dir}"
-if ! test -f "${artifact_dir}/python/maze_pb2.py"; then
+if ! test -f "${artifact_dir}/python/training_pb2.py"; then
     echo "rl-contracts artifact is missing" >&2
     exit 1
 fi

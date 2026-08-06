@@ -12,7 +12,7 @@ if [ "${workload}" != "training" ]; then
     exit 2
 fi
 
-config="${MAZE_LEARNER_CONFIG:-${repo_dir}/configs/learner_config.yaml}"
+config="${RL_LEARNER_CONFIG:-${repo_dir}/configs/learner_config.yaml}"
 repository_sample_pool_dir="${repo_dir}/sample-pool"
 runtime_sample_pool_dir="/opt/rl/learner/sample-pool"
 repository_distributor_dir="${repo_dir}/model-distributor"
@@ -39,10 +39,14 @@ sample_pool_bin="${SAMPLE_DISTRIBUTOR_BIN:-${default_sample_pool_dir}/bin/maze_s
 sample_pool_config="${SAMPLE_DISTRIBUTOR_CONFIG:-${default_sample_pool_dir}/config/distributor_config.yaml}"
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
 model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
-local_train_root="${MAZE_LOCAL_TRAIN_ROOT:-${repo_dir}/models/local-train}"
-initial_checkpoint="${MAZE_INITIAL_CHECKPOINT:-}"
-archive_interval="${MAZE_ARCHIVE_INTERVAL_UPDATES:-}"
-metrics_port="${MAZE_DASHBOARD_PORT:-9005}"
+local_train_root="${RL_LOCAL_TRAIN_ROOT:-${repo_dir}/models/local-train}"
+initial_checkpoint="${RL_INITIAL_CHECKPOINT:-}"
+metrics_port="${RL_METRICS_PORT:-9005}"
+metrics_source_id="${RL_METRICS_SOURCE_ID:-}"
+if [ -z "${metrics_source_id}" ]; then
+    metrics_source_id="$(python3 -c 'import uuid; print("local-training-" + uuid.uuid4().hex)')"
+fi
+export RL_METRICS_SOURCE_ID="${metrics_source_id}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -56,22 +60,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --model-distributor)
             address="${2:?--model-distributor requires host:port}"
-            export MAZE_MODEL_DISTRIBUTOR_HOST="${address%:*}"
-            export MAZE_MODEL_DISTRIBUTOR_PORT="${address##*:}"
+            export RL_MODEL_DISTRIBUTOR_HOST="${address%:*}"
+            export RL_MODEL_DISTRIBUTOR_PORT="${address##*:}"
             shift 2
             ;;
         --aiserver)
             address="${2:?--aiserver requires host:port}"
-            export MAZE_AISERVER_HOST="${address%:*}"
-            export MAZE_AISERVER_PORT="${address##*:}"
+            export RL_AISERVER_HOST="${address%:*}"
+            export RL_AISERVER_PORT="${address##*:}"
             shift 2
             ;;
         --metrics-port)
             metrics_port="${2:?--metrics-port requires a value}"
-            shift 2
-            ;;
-        --archive-interval-updates)
-            archive_interval="${2:?--archive-interval-updates requires a value}"
             shift 2
             ;;
         *)
@@ -82,22 +82,22 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ ! -x "${sample_pool_bin}" ]; then
-    echo "LocalSampleService executable is missing: ${sample_pool_bin}" >&2
+    echo "Sample Pool executable is missing: ${sample_pool_bin}" >&2
     echo "Build rl-sample-pool and stage its artifact in sample-pool/" >&2
     exit 1
 fi
 if [ ! -f "${sample_pool_config}" ]; then
-    echo "LocalSampleService config is missing: ${sample_pool_config}" >&2
+    echo "Sample Pool config is missing: ${sample_pool_config}" >&2
     echo "Build rl-sample-pool and stage its artifact in sample-pool/" >&2
     exit 1
 fi
 if [ ! -x "${model_distributor_bin}" ]; then
-    echo "ModelDistributor executable is missing: ${model_distributor_bin}" >&2
+    echo "Model Distributor executable is missing: ${model_distributor_bin}" >&2
     echo "Build rl-model-distributor and stage its artifact in model-distributor/" >&2
     exit 1
 fi
 if [ ! -f "${model_distributor_config}" ]; then
-    echo "ModelDistributor config is missing: ${model_distributor_config}" >&2
+    echo "Model Distributor config is missing: ${model_distributor_config}" >&2
     echo "Build rl-model-distributor and stage its artifact in model-distributor/" >&2
     exit 1
 fi
@@ -137,7 +137,7 @@ if [ -n "${initial_checkpoint}" ]; then
     esac
 fi
 
-training_lock="${MAZE_TRAIN_LOCK_DIR:-${local_train_parent}/.learner-local-train.lock}"
+training_lock="${RL_TRAIN_LOCK_DIR:-${local_train_parent}/.learner-local-train.lock}"
 if ! mkdir "${training_lock}" 2>/dev/null; then
     echo "Learner training is already active or its lock remains: ${training_lock}" >&2
     exit 1
@@ -158,16 +158,12 @@ mkdir -p \
     "${local_train_root}/metrics"
 
 export PYTHONUNBUFFERED=1
-export MAZE_LOCAL_TRAIN_ROOT="${local_train_root}"
-export MAZE_MODEL_ARTIFACT_ROOT="${local_train_root}"
-export MAZE_SAMPLE_DISTRIBUTOR_HOST="127.0.0.1"
-export MAZE_SAMPLE_DISTRIBUTOR_PORT="${MAZE_SAMPLE_DISTRIBUTOR_PORT:-9100}"
-export MAZE_MODEL_DISTRIBUTOR_PORT="${MAZE_MODEL_DISTRIBUTOR_PORT:-9200}"
+export RL_LOCAL_TRAIN_ROOT="${local_train_root}"
+export RL_SAMPLE_POOL_HOST="127.0.0.1"
+export RL_SAMPLE_POOL_PORT="${RL_SAMPLE_POOL_PORT:-9100}"
+export RL_MODEL_DISTRIBUTOR_PORT="${RL_MODEL_DISTRIBUTOR_PORT:-9200}"
 if [ -n "${initial_checkpoint}" ]; then
-    export MAZE_INITIAL_CHECKPOINT="${initial_checkpoint}"
-fi
-if [ -n "${archive_interval}" ]; then
-    export MAZE_ARCHIVE_INTERVAL_UPDATES="${archive_interval}"
+    export RL_INITIAL_CHECKPOINT="${initial_checkpoint}"
 fi
 
 metrics_pid=""
@@ -176,7 +172,7 @@ model_distributor_pid=""
 sample_pool_pid=""
 stopping=0
 quiesced=0
-quiesce_marker="${MAZE_QUIESCE_MARKER:-/tmp/rl-training-quiesced}"
+quiesce_marker="${RL_QUIESCE_MARKER:-/tmp/rl-training-quiesced}"
 rm -f "${quiesce_marker}"
 
 terminate_process() {
@@ -237,7 +233,7 @@ for _ in $(seq 1 300); do
         wait "${sample_pool_pid}"
         exit $?
     fi
-    if (exec 3<>"/dev/tcp/127.0.0.1/${MAZE_SAMPLE_DISTRIBUTOR_PORT}") \
+    if (exec 3<>"/dev/tcp/127.0.0.1/${RL_SAMPLE_POOL_PORT}") \
         2>/dev/null; then
         exec 3>&-
         exec 3<&-
@@ -247,7 +243,7 @@ for _ in $(seq 1 300); do
     sleep 0.1
 done
 if [ "${ready}" -ne 1 ]; then
-    echo "LocalSampleService readiness timeout" >&2
+    echo "Sample Pool readiness timeout" >&2
     exit 1
 fi
 
@@ -260,7 +256,7 @@ for _ in $(seq 1 300); do
         wait "${model_distributor_pid}"
         exit $?
     fi
-    if (exec 3<>"/dev/tcp/127.0.0.1/${MAZE_MODEL_DISTRIBUTOR_PORT}") \
+    if (exec 3<>"/dev/tcp/127.0.0.1/${RL_MODEL_DISTRIBUTOR_PORT}") \
         2>/dev/null; then
         exec 3>&-
         exec 3<&-
@@ -270,13 +266,14 @@ for _ in $(seq 1 300); do
     sleep 0.1
 done
 if [ "${ready}" -ne 1 ]; then
-    echo "ModelDistributor readiness timeout" >&2
+    echo "Model Distributor readiness timeout" >&2
     exit 1
 fi
 
 python3 tools/metrics_server.py \
     --dir "${local_train_root}/metrics" \
-    --port "${metrics_port}" &
+    --port "${metrics_port}" \
+    --source-id "${metrics_source_id}" &
 metrics_pid=$!
 
 training_args=(--config "${config}")

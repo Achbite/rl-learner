@@ -7,7 +7,10 @@ selected for the Learner image. The artifact is copied here explicitly after
 For the versions in `../artifact_versions.env`, run from `rl-learner`:
 
 ```bash
-cp -R ../.workspace/artifacts/rl-model-distributor/0.5.0/linux-arm64/. \
+source artifact_versions.env
+platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+platform_dir="${platform//\//-}"
+cp -R "../.workspace/artifacts/rl-model-distributor/${RL_MODEL_DISTRIBUTOR_VERSION}/${platform_dir}/." \
     model-distributor/
 ```
 

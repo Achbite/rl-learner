@@ -6,13 +6,13 @@ PPO 训练器
          Learner 负责 GAE 计算 + PPO 训练 + ONNX 导出。
 """
 
+import copy
 import os
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from src.log.logger import setup_logger
@@ -23,7 +23,7 @@ class ActorCritic(nn.Module):
     """
     Actor-Critic 独立编码器架构
 
-    Policy 分支: obs_dim → hidden → hidden → action_dim (Softmax)
+    Policy 分支: obs_dim → hidden → hidden → action_dim (logits)
     Value 分支:  obs_dim → hidden → hidden → 1
     两个分支使用完全独立的编码器，不共享权重。
     """
@@ -58,16 +58,16 @@ class ActorCritic(nn.Module):
         Args:
             obs: 观测向量 [batch, obs_dim]
         Returns:
-            action_probs: 动作概率 [batch, action_dim]
+            action_logits: 动作 logits [batch, action_dim]
             value: 状态价值 [batch, 1]
         """
         p = self.policy_encoder(obs)
-        action_probs = torch.softmax(self.policy_head(p), dim=-1)
+        action_logits = self.policy_head(p)
 
         v = self.value_encoder(obs)
         value = self.value_head(v)
 
-        return action_probs, value
+        return action_logits, value
 
     def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -115,29 +115,35 @@ class PPOTrainer:
         self._logger = setup_logger("PPOTrainer")
 
         # ---- 读取模型参数 ----
-        model_cfg = config.get("model", {})
-        self._obs_dim = model_cfg.get("obs_dim", 5)
-        self._action_dim = model_cfg.get("action_dim", 9)
-        self._hidden_dim = model_cfg.get("hidden_dim", 64)
+        model_cfg = config["model"]
+        self._obs_dim = int(model_cfg["obs_dim"])
+        self._action_dim = int(model_cfg["action_dim"])
+        self._hidden_dim = int(model_cfg["hidden_dim"])
 
         # ---- 读取训练超参 ----
-        train_cfg = config.get("training", {})
-        self._lr = train_cfg.get("learning_rate", 3e-4)
-        self._gamma = train_cfg.get("gamma", 0.99)
-        self._gae_lambda = train_cfg.get("gae_lambda", 0.95)
-        self._clip_epsilon = train_cfg.get("clip_epsilon", 0.2)
-        self._entropy_coef = train_cfg.get("entropy_coef", 0.01)
-        self._value_coef = train_cfg.get("value_coef", 0.5)
-        self._max_grad_norm = train_cfg.get("max_grad_norm", 0.5)
-        self._n_epochs = train_cfg.get("n_epochs", 4)
-        self._mini_batch_size = train_cfg.get("mini_batch_size", 64)
-        self._normalize_advantage = train_cfg.get("normalize_advantage", True)
-        self._seed = int(train_cfg.get("seed", 0))
+        train_cfg = config["training"]
+        self._lr = float(train_cfg["learning_rate"])
+        self._gamma = float(train_cfg["gamma"])
+        self._gae_lambda = float(train_cfg["gae_lambda"])
+        self._clip_epsilon = float(train_cfg["clip_epsilon"])
+        self._value_clip_epsilon = float(train_cfg["value_clip_epsilon"])
+        self._entropy_coef = float(train_cfg["entropy_coef"])
+        self._value_coef = float(train_cfg["value_coef"])
+        self._max_grad_norm = float(train_cfg["max_grad_norm"])
+        self._n_epochs = int(train_cfg["n_epochs"])
+        self._mini_batch_size = int(train_cfg["mini_batch_size"])
+        self._normalize_advantage = bool(train_cfg["normalize_advantage"])
+        self._max_policy_lag = int(train_cfg["max_policy_lag"])
+        self._seed = int(train_cfg["seed"])
+        if self._value_clip_epsilon <= 0.0:
+            raise ValueError("value_clip_epsilon must be positive")
+        if self._max_policy_lag < 0:
+            raise ValueError("max_policy_lag must be non-negative")
 
         # ---- 构建网络 + 优化器 ----
         torch.manual_seed(self._seed)
         np.random.seed(self._seed)
-        self._device = torch.device(train_cfg.get("device", "cpu"))
+        self._device = torch.device(train_cfg["device"])
         self._model = ActorCritic(self._obs_dim, self._action_dim, self._hidden_dim).to(self._device)
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=self._lr)
 
@@ -173,15 +179,29 @@ class PPOTrainer:
         """
         if not trajectory:
             return trajectory
-        if not bootstrap_valid or not np.isfinite(bootstrap_value):
-            raise ValueError("fragment bootstrap is missing or non-finite")
+        for index, sample in enumerate(trajectory):
+            terminated = bool(sample.get("terminated", False))
+            truncated = bool(sample.get("truncated", False))
+            if terminated and truncated:
+                raise ValueError("transition cannot be terminated and truncated")
+            if index != len(trajectory) - 1 and (terminated or truncated):
+                raise ValueError("trajectory continues after an end transition")
+
+        terminal_end = bool(trajectory[-1].get("terminated", False))
+        if terminal_end:
+            if bootstrap_valid or float(bootstrap_value) != 0.0:
+                raise ValueError("terminated fragment must not bootstrap")
+        elif not bootstrap_valid or not np.isfinite(bootstrap_value):
+            raise ValueError("continuing or truncated fragment requires bootstrap")
 
         values = np.asarray(
-            [sample["old_vpred"] for sample in trajectory],
+            [sample["old_value_prediction"] for sample in trajectory],
             dtype=np.float32,
         )
         if not np.all(np.isfinite(values)):
-            raise ValueError("fragment old_vpred contains non-finite values")
+            raise ValueError(
+                "fragment old_value_prediction contains non-finite values"
+            )
 
         # ---- 1. 逆序计算 GAE ----
         rewards = np.array([s["reward"] for s in trajectory], dtype=np.float32)
@@ -194,7 +214,7 @@ class PPOTrainer:
 
         for t in reversed(range(T)):
             if t == T - 1:
-                next_val = float(bootstrap_value)
+                next_val = 0.0 if terminal_end else float(bootstrap_value)
             else:
                 next_val = values[t + 1]
 
@@ -222,7 +242,11 @@ class PPOTrainer:
         return trajectory
 
     # ---- PPO 训练 ----
-    def train_on_batch(self, samples: List[dict]) -> Dict[str, float]:
+    def train_on_batch(
+        self,
+        samples: List[dict],
+        behavior_model_version: int | None = None,
+    ) -> Dict[str, float]:
         """
         对一批已计算好 GAE 的样本执行 PPO 训练
 
@@ -231,15 +255,40 @@ class PPOTrainer:
         Returns:
             训练统计字典
         """
+        behavior_version = (
+            self._model_version
+            if behavior_model_version is None
+            else int(behavior_model_version)
+        )
+        policy_lag = self._model_version - behavior_version
+        if policy_lag < 0:
+            raise ValueError("behavior model version is from the future")
+        if policy_lag > self._max_policy_lag:
+            raise ValueError(
+                "behavior model version exceeds max_policy_lag: "
+                f"current={self._model_version} behavior={behavior_version} "
+                f"max={self._max_policy_lag}"
+            )
         if not samples:
-            return self._empty_stats()
+            return self._empty_stats(policy_lag)
 
         # ---- 1. 转换为 Tensor ----
-        obs = torch.tensor([s["obs"] for s in samples], dtype=torch.float32, device=self._device)
+        obs = torch.tensor([s["observation"] for s in samples], dtype=torch.float32, device=self._device)
         actions = torch.tensor([s["action"] for s in samples], dtype=torch.long, device=self._device)
-        old_log_probs = torch.tensor([s["old_log_prob"] for s in samples], dtype=torch.float32, device=self._device)
+        old_log_probs = torch.tensor([s["old_log_probability"] for s in samples], dtype=torch.float32, device=self._device)
+        old_values = torch.tensor([s["old_value_prediction"] for s in samples], dtype=torch.float32, device=self._device)
         advantages = torch.tensor([s["advantage"] for s in samples], dtype=torch.float32, device=self._device)
         td_returns = torch.tensor([s["td_return"] for s in samples], dtype=torch.float32, device=self._device)
+        if (
+            not torch.isfinite(obs).all()
+            or not torch.isfinite(old_log_probs).all()
+            or not torch.isfinite(old_values).all()
+            or not torch.isfinite(advantages).all()
+            or not torch.isfinite(td_returns).all()
+            or (actions < 0).any()
+            or (actions >= self._action_dim).any()
+        ):
+            raise ValueError("PPO batch contains invalid tensors")
 
         # ---- 2. Advantage 标准化 ----
         if self._normalize_advantage and len(advantages) > 1:
@@ -256,69 +305,152 @@ class PPOTrainer:
         total_approx_kl = 0.0
         total_gradient_norm = 0.0
         total_combined_loss = 0.0
+        maximum_importance_ratio = 0.0
         total_updates = 0
+        value_pred_mean = 0.0
+        return_target_mean = 0.0
+        explained_variance = 0.0
 
         self._model.train()
+        model_snapshot = copy.deepcopy(self._model.state_dict())
+        optimizer_snapshot = copy.deepcopy(self._optimizer.state_dict())
+        torch_rng_snapshot = torch.get_rng_state().clone()
+        numpy_rng_snapshot = np.random.get_state()
+        cuda_rng_snapshot = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        )
+        try:
+            for epoch in range(self._n_epochs):
+                # 随机打乱索引
+                indices = torch.randperm(n_samples, device=self._device)
 
-        for epoch in range(self._n_epochs):
-            # 随机打乱索引
-            indices = torch.randperm(n_samples, device=self._device)
+                # 切分 mini-batch
+                for start in range(0, n_samples, self._mini_batch_size):
+                    end = min(start + self._mini_batch_size, n_samples)
+                    mb_indices = indices[start:end]
 
-            # 切分 mini-batch
-            for start in range(0, n_samples, self._mini_batch_size):
-                end = min(start + self._mini_batch_size, n_samples)
-                mb_indices = indices[start:end]
+                    mb_obs = obs[mb_indices]
+                    mb_actions = actions[mb_indices]
+                    mb_old_log_probs = old_log_probs[mb_indices]
+                    mb_old_values = old_values[mb_indices]
+                    mb_advantages = advantages[mb_indices]
+                    mb_td_returns = td_returns[mb_indices]
 
-                mb_obs = obs[mb_indices]
-                mb_actions = actions[mb_indices]
-                mb_old_log_probs = old_log_probs[mb_indices]
-                mb_advantages = advantages[mb_indices]
-                mb_td_returns = td_returns[mb_indices]
+                    # 前向传播：获取新策略下的 log_prob、value、entropy
+                    new_log_probs, new_values, entropy = self._model.evaluate_actions(mb_obs, mb_actions)
 
-                # 前向传播：获取新策略下的 log_prob、value、entropy
-                new_log_probs, new_values, entropy = self._model.evaluate_actions(mb_obs, mb_actions)
+                    # ---- Policy Loss（PPO-Clip）----
+                    ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                    surr1 = ratio * mb_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self._clip_epsilon, 1.0 + self._clip_epsilon) * mb_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                # ---- Policy Loss（PPO-Clip）----
-                ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self._clip_epsilon, 1.0 + self._clip_epsilon) * mb_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                    # ---- Value Loss（以行为策略 V(s) 为裁剪基准）----
+                    clipped_values = mb_old_values + torch.clamp(
+                        new_values - mb_old_values,
+                        -self._value_clip_epsilon,
+                        self._value_clip_epsilon,
+                    )
+                    value_loss = torch.maximum(
+                        (new_values - mb_td_returns).pow(2),
+                        (clipped_values - mb_td_returns).pow(2),
+                    ).mean()
 
-                # ---- Value Loss ----
-                value_loss = F.mse_loss(new_values, mb_td_returns)
+                    # ---- Entropy Loss ----
+                    entropy_loss = -entropy.mean()
 
-                # ---- Entropy Loss ----
-                entropy_loss = -entropy.mean()
+                    # ---- Total Loss ----
+                    total_loss = policy_loss + self._value_coef * value_loss + self._entropy_coef * entropy_loss
+                    if not torch.isfinite(total_loss):
+                        raise FloatingPointError("PPO loss is non-finite")
 
-                # ---- Total Loss ----
-                total_loss = policy_loss + self._value_coef * value_loss + self._entropy_coef * entropy_loss
+                    # ---- 反向传播 + 梯度裁剪 + 优化器更新 ----
+                    self._optimizer.zero_grad()
+                    total_loss.backward()
+                    if any(
+                        parameter.grad is not None
+                        and not torch.isfinite(parameter.grad).all()
+                        for parameter in self._model.parameters()
+                    ):
+                        raise FloatingPointError("PPO gradient is non-finite")
+                    gradient_norm = nn.utils.clip_grad_norm_(
+                        self._model.parameters(), self._max_grad_norm
+                    )
+                    if not torch.isfinite(gradient_norm):
+                        raise FloatingPointError(
+                            "PPO gradient norm is non-finite"
+                        )
+                    self._optimizer.step()
+                    if any(
+                        not torch.isfinite(parameter).all()
+                        for parameter in self._model.parameters()
+                    ):
+                        raise FloatingPointError(
+                            "PPO parameter update is non-finite"
+                        )
 
-                # ---- 反向传播 + 梯度裁剪 + 优化器更新 ----
-                self._optimizer.zero_grad()
-                total_loss.backward()
-                gradient_norm = nn.utils.clip_grad_norm_(
-                    self._model.parameters(), self._max_grad_norm
-                )
-                self._optimizer.step()
+                    # ---- 统计 ----
+                    with torch.no_grad():
+                        clip_fraction = ((ratio - 1.0).abs() > self._clip_epsilon).float().mean().item()
+                        log_ratio = new_log_probs - mb_old_log_probs
+                        approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                        maximum_importance_ratio = max(
+                            maximum_importance_ratio, ratio.max().item()
+                        )
 
-                # ---- 统计 ----
-                with torch.no_grad():
-                    clip_fraction = ((ratio - 1.0).abs() > self._clip_epsilon).float().mean().item()
-                    log_ratio = new_log_probs - mb_old_log_probs
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                    total_policy_loss += policy_loss.item()
+                    total_value_loss += value_loss.item()
+                    total_entropy += entropy.mean().item()
+                    total_clip_fraction += clip_fraction
+                    total_approx_kl += approx_kl
+                    total_gradient_norm += float(gradient_norm)
+                    total_combined_loss += total_loss.item()
+                    total_updates += 1
 
-                total_policy_loss += policy_loss.item()
-                total_value_loss += value_loss.item()
-                total_entropy += entropy.mean().item()
-                total_clip_fraction += clip_fraction
-                total_approx_kl += approx_kl
-                total_gradient_norm += float(gradient_norm)
-                total_combined_loss += total_loss.item()
-                total_updates += 1
+            # Use the committed model state for value diagnostics. These
+            # metrics describe target fitting; the sign of V(s) alone does not.
+            with torch.no_grad():
+                _, committed_values = self._model(obs)
+                committed_values = committed_values.squeeze(-1)
+                if not torch.isfinite(committed_values).all():
+                    raise FloatingPointError(
+                        "PPO committed value prediction is non-finite"
+                    )
+                value_pred_mean = committed_values.mean().item()
+                return_target_mean = td_returns.mean().item()
+                target_variance = td_returns.var(unbiased=False)
+                if target_variance.item() > 1e-12:
+                    residual_variance = (
+                        td_returns - committed_values
+                    ).var(unbiased=False)
+                    explained_variance = (
+                        1.0 - residual_variance / target_variance
+                    ).item()
+                else:
+                    explained_variance = 0.0
+                if not all(
+                    np.isfinite(value)
+                    for value in (
+                        value_pred_mean,
+                        return_target_mean,
+                        explained_variance,
+                    )
+                ):
+                    raise FloatingPointError(
+                        "PPO value diagnostics are non-finite"
+                    )
+        except Exception:
+            self._model.load_state_dict(model_snapshot)
+            self._optimizer.load_state_dict(optimizer_snapshot)
+            torch.set_rng_state(torch_rng_snapshot)
+            np.random.set_state(numpy_rng_snapshot)
+            if cuda_rng_snapshot:
+                torch.cuda.set_rng_state_all(cuda_rng_snapshot)
+            raise
 
         # ---- 4. 汇总统计 ----
         if total_updates == 0:
-            return self._empty_stats()
+            return self._empty_stats(policy_lag)
 
         self._model_version += 1
 
@@ -332,8 +464,14 @@ class PPOTrainer:
             "gradient_norm": round(
                 total_gradient_norm / total_updates, 6
             ),
+            "max_importance_ratio": round(maximum_importance_ratio, 6),
             "mean_advantage": round(advantages.mean().item(), 6),
+            "value_pred_mean": round(value_pred_mean, 6),
+            "return_target_mean": round(return_target_mean, 6),
+            "explained_variance": round(explained_variance, 6),
             "learning_rate": self._lr,
+            "policy_lag": policy_lag,
+            "max_policy_lag": self._max_policy_lag,
             "model_version": self._model_version,
         }
 
@@ -359,11 +497,11 @@ class PPOTrainer:
         dummy_input = torch.zeros(1, self._obs_dim, device=self._device)
 
         export_kwargs = dict(
-            input_names=["obs"],
-            output_names=["action_probs", "value"],
+            input_names=["observation"],
+            output_names=["action_logits", "value"],
             dynamic_axes={
-                "obs": {0: "batch"},
-                "action_probs": {0: "batch"},
+                "observation": {0: "batch"},
+                "action_logits": {0: "batch"},
                 "value": {0: "batch"},
             },
             opset_version=11,
@@ -432,8 +570,12 @@ class PPOTrainer:
     def action_dim(self) -> int:
         return self._action_dim
 
+    @property
+    def max_policy_lag(self) -> int:
+        return self._max_policy_lag
+
     # ---- 内部工具 ----
-    def _empty_stats(self) -> Dict[str, float]:
+    def _empty_stats(self, policy_lag: int = 0) -> Dict[str, float]:
         """返回空训练统计（无样本时使用）"""
         return {
             "policy_loss": 0.0,
@@ -443,7 +585,13 @@ class PPOTrainer:
             "clip_fraction": 0.0,
             "approx_kl": 0.0,
             "gradient_norm": 0.0,
+            "max_importance_ratio": 0.0,
             "mean_advantage": 0.0,
+            "value_pred_mean": 0.0,
+            "return_target_mean": 0.0,
+            "explained_variance": 0.0,
             "learning_rate": self._lr,
+            "policy_lag": policy_lag,
+            "max_policy_lag": self._max_policy_lag,
             "model_version": self._model_version,
         }

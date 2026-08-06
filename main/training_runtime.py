@@ -1,8 +1,9 @@
-"""Run the leased-fragment PPO training and model publication loop."""
+"""Task-neutral leased-sample PPO runtime for rl-contracts 0.8.0."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -22,7 +23,21 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proto import maze_pb2, maze_pb2_grpc
+from proto import common_pb2, training_pb2, training_pb2_grpc
+from src.contracts.identity import (
+    contract_document,
+    contract_identity,
+    finalize_manifest_digest,
+    manifest_message,
+    model_identity_document,
+    policy_spec_digest,
+    schema_document,
+    semantics_document,
+    service_identity,
+    training_config_digest,
+    training_semantics,
+    validate_config,
+)
 from src.log.logger import setup_logger
 from src.metrics.metrics_backend import create_backend
 from src.training.ppo_trainer import PPOTrainer
@@ -31,13 +46,21 @@ from src.training.ppo_trainer import PPOTrainer
 _stop_requested = threading.Event()
 
 
-def _handle_signal(_signal, _frame):
+def _handle_signal(_signal, _frame) -> None:
     _stop_requested.set()
+
+
+def _same_message(left, right) -> bool:
+    return left.SerializeToString(deterministic=True) == right.SerializeToString(
+        deterministic=True
+    )
 
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as stream:
-        return yaml.safe_load(stream)
+        config = yaml.safe_load(stream) or {}
+    validate_config(config)
+    return config
 
 
 def sha256_file(path: Path) -> str:
@@ -63,23 +86,77 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def manifest_message(document: dict):
-    message = maze_pb2.ModelArtifactManifest(
-        schema_version=document["schema_version"],
-        contract_version=document["contract_version"],
-        model_version=document["model_version"],
-        artifact_uri=document["artifact_uri"],
-        model_file=document["model_file"],
-        size_bytes=document["size_bytes"],
-        sha256=document["sha256"],
-        seed=document["seed"],
-        ready=document["ready"],
-        published_ts_ms=document["published_ts_ms"],
-    )
-    message.input_shape.extend(document["input_shape"])
-    message.action_shape.extend(document["action_shape"])
-    message.value_shape.extend(document["value_shape"])
-    return message
+def _identity_dict(document: dict | None) -> dict:
+    if not document:
+        return {}
+    identity = document.get("identity", document)
+    return {
+        "model_lineage_id": str(identity.get("model_lineage_id", "")),
+        "model_version": int(identity.get("model_version", -1)),
+        "artifact_digest": str(identity.get("artifact_digest", "")),
+        "manifest_digest": str(identity.get("manifest_digest", "")),
+    }
+
+
+def _identity_equal(left: dict | None, right: dict | None) -> bool:
+    return bool(left and right) and _identity_dict(left) == _identity_dict(right)
+
+
+def training_chain_status(
+    actor: dict,
+    distributor: dict,
+    learner: dict,
+    model: dict,
+    error: str = "",
+) -> dict:
+    """Return task-neutral readiness from exact service/model identities."""
+    reasons: list[str] = []
+    if error:
+        reasons.append("learner_update_error")
+    for name, document in (
+        ("actor", actor),
+        ("sample_pool", distributor),
+        ("model_distributor", model),
+    ):
+        if document.get("error"):
+            reasons.append(f"{name}_status_error")
+        if not document.get("ready"):
+            reasons.append(f"{name}_not_ready")
+        if not document.get("instance_id"):
+            reasons.append(f"{name}_instance_missing")
+    for field in ("ingress_ready", "pool_ready"):
+        if not distributor.get(field):
+            reasons.append(f"sample_pool_{field}_false")
+
+    learner_model = learner.get("model_identity", {})
+    actor_model = actor.get("model_identity", {})
+    published_model = model.get("latest_model_identity", {})
+    acknowledged_model = model.get("latest_ack_model_identity", {})
+    if not _identity_equal(learner_model, published_model):
+        reasons.append("published_model_identity_mismatch")
+    if not _identity_equal(actor_model, acknowledged_model):
+        reasons.append("actor_model_ack_mismatch")
+    if model.get("latest_ack_status") != "MODEL_LOAD_STATUS_LOADED":
+        reasons.append("actor_model_ack_not_loaded")
+
+    learner_version = int(_identity_dict(learner_model).get("model_version", -1))
+    actor_version = int(_identity_dict(actor_model).get("model_version", -1))
+    model_lag = learner_version - actor_version
+    if learner_version < 0 or actor_version < 0 or not 0 <= model_lag <= 1:
+        reasons.append("actor_model_lag_invalid")
+    actual_batch_size = int(learner.get("actual_batch_size", 0) or 0)
+    if actual_batch_size:
+        policy_lag = int(learner.get("policy_lag", -1))
+        maximum = int(learner.get("max_policy_lag", -1))
+        if policy_lag < 0 or maximum < 0 or policy_lag > maximum:
+            reasons.append("training_policy_lag_invalid")
+    return {
+        "ready": not reasons,
+        "state": "ready" if not reasons else "degraded",
+        "reasons": reasons,
+        "model_lag": model_lag,
+        "error": error,
+    }
 
 
 class ModelPublisher:
@@ -88,15 +165,20 @@ class ModelPublisher:
     ARCHIVE_MANIFEST_FILE = "manifest.json"
 
     def __init__(self, config: dict):
-        model = config.get("model", {})
-        self.seed = int(model.get("bootstrap_seed", 0))
-        self.obs_dim = int(model.get("obs_dim", 13))
-        self.action_dim = int(model.get("action_dim", 9))
+        validate_config(config)
+        model = config["model"]
+        self.config = config
+        self.seed = int(model["bootstrap_seed"])
+        self.obs_dim = int(model["obs_dim"])
+        self.action_dim = int(model["action_dim"])
+        self.tensor_dtype = str(model["tensor_dtype"])
+        self.contract = contract_identity(config)
+        self.semantics = training_semantics(config)
+        self.training_digest = training_config_digest(config)
+        self.lineage_id = str(config["identity"]["model_lineage_id"])
+        configured_root = str(model["local_train_dir"])
         self.local_train_root = Path(
-            os.environ.get(
-                "MAZE_LOCAL_TRAIN_ROOT",
-                model.get("local_train_dir", "models/local-train"),
-            )
+            os.environ.get("RL_LOCAL_TRAIN_ROOT", configured_root)
         ).resolve()
         self.runtime_dir = self.local_train_root / "runtime"
         self.published_dir = self.runtime_dir / "serving"
@@ -105,23 +187,12 @@ class ModelPublisher:
         self.state_path = self.runtime_dir / "state.json"
         self.archive_dir = self.local_train_root / "archive"
         self.metrics_dir = self.local_train_root / "metrics"
-        self.archive_interval_updates = int(
-            os.environ.get(
-                "MAZE_ARCHIVE_INTERVAL_UPDATES",
-                model.get("archive_interval_updates", 200),
-            )
+        self.archive_interval_updates = int(model["archive_interval_updates"])
+        self.archive_on_graceful_shutdown = bool(
+            model["archive_on_graceful_shutdown"]
         )
-        self.archive_on_graceful_shutdown = str(
-            os.environ.get(
-                "MAZE_ARCHIVE_ON_GRACEFUL_SHUTDOWN",
-                model.get("archive_on_graceful_shutdown", True),
-            )
-        ).lower() not in ("0", "false", "no")
         self.serving_retention_versions = int(
-            os.environ.get(
-                "MAZE_SERVING_RETENTION_VERSIONS",
-                model.get("serving_retention_versions", 2),
-            )
+            model["serving_retention_versions"]
         )
         if self.archive_interval_updates <= 0:
             raise ValueError("archive_interval_updates must be positive")
@@ -129,6 +200,7 @@ class ModelPublisher:
             raise ValueError("serving_retention_versions must be at least 2")
         self.initial_checkpoint_identity: dict = {}
         self._prepared = False
+
     def prepare(self) -> None:
         for directory in (
             self.published_dir,
@@ -157,48 +229,6 @@ class ModelPublisher:
             )
         self._prepared = True
 
-    def load_initial_checkpoint(
-        self, trainer: PPOTrainer, checkpoint_value: str
-    ) -> dict:
-        checkpoint_path = Path(checkpoint_value).resolve()
-        if not checkpoint_path.is_file():
-            raise RuntimeError(
-                f"initial checkpoint does not exist: {checkpoint_path}"
-            )
-        if checkpoint_path == self.local_train_root or (
-            self.local_train_root in checkpoint_path.parents
-        ):
-            raise RuntimeError(
-                "initial checkpoint must be outside local-train"
-            )
-        checkpoint = self._load_checkpoint(checkpoint_path)
-        required = (
-            "model_state_dict",
-            "optimizer_state_dict",
-            "model_version",
-            "torch_rng_state",
-            "numpy_rng_state",
-        )
-        if any(key not in checkpoint for key in required):
-            raise RuntimeError("initial checkpoint is incomplete")
-        if not trainer.load_checkpoint(str(checkpoint_path)):
-            raise RuntimeError(
-                f"cannot load initial checkpoint: {checkpoint_path}"
-            )
-        metadata = checkpoint.get("metadata", {})
-        self.initial_checkpoint_identity = {
-            "initial_checkpoint": str(checkpoint_path),
-            "initial_checkpoint_sha256": sha256_file(checkpoint_path),
-            "initial_model_version": int(checkpoint["model_version"]),
-        }
-        return {
-            "train_updates": int(
-                metadata.get("train_updates", checkpoint["model_version"])
-            ),
-            "trained_samples": int(metadata.get("trained_samples", 0)),
-            **self.initial_checkpoint_identity,
-        }
-
     def model_path(self, version: int) -> Path:
         return self.published_dir / f"model_v{version:06d}.onnx"
 
@@ -217,12 +247,132 @@ class ModelPublisher:
     def receipt_path(self, train_update_id: str) -> Path:
         return self.update_dir / f"{train_update_id}.json"
 
+    @staticmethod
+    def _load_checkpoint(path: Path) -> dict:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    def load_initial_checkpoint(
+        self, trainer: PPOTrainer, checkpoint_value: str
+    ) -> dict:
+        checkpoint_path = Path(checkpoint_value).resolve()
+        if not checkpoint_path.is_file():
+            raise RuntimeError(
+                f"initial checkpoint does not exist: {checkpoint_path}"
+            )
+        if checkpoint_path == self.local_train_root or (
+            self.local_train_root in checkpoint_path.parents
+        ):
+            raise RuntimeError("initial checkpoint must be outside local-train")
+        checkpoint = self._load_checkpoint(checkpoint_path)
+        required = {
+            "model_state_dict",
+            "optimizer_state_dict",
+            "model_version",
+            "torch_rng_state",
+            "numpy_rng_state",
+            "metadata",
+        }
+        if not required.issubset(checkpoint):
+            raise RuntimeError("initial checkpoint is incomplete")
+        metadata = checkpoint["metadata"]
+        if (
+            metadata.get("model_lineage_id") != self.lineage_id
+            or metadata.get("observation_schema")
+            != schema_document(self.semantics.observation_schema)
+            or metadata.get("training_config_digest")
+            != self.training_digest.hex
+        ):
+            raise RuntimeError("initial checkpoint identity is incompatible")
+        if not trainer.load_checkpoint(str(checkpoint_path)):
+            raise RuntimeError("initial checkpoint could not be loaded")
+        self.initial_checkpoint_identity = {
+            "initial_checkpoint": str(checkpoint_path),
+            "initial_checkpoint_digest": sha256_file(checkpoint_path),
+            "initial_model_version": int(checkpoint["model_version"]),
+        }
+        return {
+            "train_updates": int(metadata["train_updates"]),
+            "trained_samples": int(metadata["trained_samples"]),
+            **self.initial_checkpoint_identity,
+        }
+
+    def _checkpoint_metadata(
+        self,
+        *,
+        train_update_id: str,
+        behavior_model: dict | None,
+        batch_ids: list[str],
+        stats: dict,
+        sample_count: int,
+        train_updates: int,
+        trained_samples: int,
+    ) -> dict:
+        return {
+            "train_update_id": train_update_id,
+            "behavior_model": behavior_model or {},
+            "batch_ids": list(batch_ids),
+            "stats": dict(stats),
+            "sample_count": int(sample_count),
+            "train_updates": int(train_updates),
+            "trained_samples": int(trained_samples),
+            "model_lineage_id": self.lineage_id,
+            "observation_schema": schema_document(
+                self.semantics.observation_schema
+            ),
+            "action_schema": schema_document(self.semantics.action_schema),
+            "training_config_digest": self.training_digest.hex,
+            **self.initial_checkpoint_identity,
+        }
+
+    def commit_optimizer_checkpoint(
+        self,
+        trainer: PPOTrainer,
+        *,
+        train_update_id: str,
+        behavior_model: dict,
+        batch_ids: list[str],
+        stats: dict,
+        sample_count: int,
+        train_updates: int,
+        trained_samples: int,
+    ) -> Path:
+        if not self._prepared:
+            raise RuntimeError("model publisher is not prepared")
+        path = self.checkpoint_path(trainer.model_version)
+        metadata = self._checkpoint_metadata(
+            train_update_id=train_update_id,
+            behavior_model=behavior_model,
+            batch_ids=batch_ids,
+            stats=stats,
+            sample_count=sample_count,
+            train_updates=train_updates,
+            trained_samples=trained_samples,
+        )
+        if path.exists():
+            checkpoint = self._load_checkpoint(path)
+            if (
+                checkpoint.get("model_version") != trainer.model_version
+                or checkpoint.get("metadata", {}).get("train_update_id")
+                != train_update_id
+            ):
+                raise RuntimeError(f"checkpoint identity conflicts: {path}")
+            return path
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        trainer.save_checkpoint(str(temporary), metadata=metadata)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        return path
+
     def publish_runtime(
         self,
         trainer: PPOTrainer,
         *,
         train_update_id: str,
-        behavior_model_version: int | None,
+        behavior_model: dict | None,
         batch_ids: list[str],
         stats: dict | None = None,
         sample_count: int = 0,
@@ -236,212 +386,180 @@ class ModelPublisher:
         model_path = self.model_path(version)
         checkpoint_path = self.checkpoint_path(version)
         manifest_path = self.manifest_path(version)
-        if manifest_path.exists():
-            raise RuntimeError(
-                f"runtime model version already exists: {manifest_path}"
-            )
-        if model_path.exists():
-            model_path.unlink()
-        if checkpoint_path.exists() and not checkpoint_precommitted:
-            raise RuntimeError(
-                f"runtime checkpoint already exists: {checkpoint_path}"
-            )
+        if manifest_path.exists() or model_path.exists():
+            raise RuntimeError(f"runtime model version already exists: {version}")
         temporary_model = model_path.with_name(
             f".{model_path.name}.{os.getpid()}.tmp"
         )
         temporary_checkpoint = checkpoint_path.with_name(
             f".{checkpoint_path.name}.{os.getpid()}.tmp"
         )
-        metadata = {
-            "train_update_id": train_update_id,
-            "behavior_model_version": behavior_model_version,
-            "batch_ids": batch_ids,
-            "stats": stats or {},
-            "sample_count": sample_count,
-            "train_updates": train_updates,
-            "trained_samples": trained_samples,
-            **self.initial_checkpoint_identity,
-        }
         trainer.export_onnx(str(temporary_model))
+        metadata = self._checkpoint_metadata(
+            train_update_id=train_update_id,
+            behavior_model=behavior_model,
+            batch_ids=batch_ids,
+            stats=stats or {},
+            sample_count=sample_count,
+            train_updates=train_updates,
+            trained_samples=trained_samples,
+        )
         if checkpoint_precommitted:
             checkpoint = self._load_checkpoint(checkpoint_path)
-            checkpoint_metadata = checkpoint.get("metadata", {})
             if (
                 checkpoint.get("model_version") != version
-                or checkpoint_metadata.get("train_update_id")
+                or checkpoint.get("metadata", {}).get("train_update_id")
                 != train_update_id
             ):
-                raise RuntimeError(
-                    "precommitted checkpoint identity does not match"
-                )
+                raise RuntimeError("precommitted checkpoint identity mismatch")
         else:
-            trainer.save_checkpoint(
-                str(temporary_checkpoint), metadata=metadata
-            )
-        sync_paths = [temporary_model]
-        if not checkpoint_precommitted:
-            sync_paths.append(temporary_checkpoint)
-        for path in sync_paths:
+            trainer.save_checkpoint(str(temporary_checkpoint), metadata=metadata)
+        for path in (
+            [temporary_model]
+            if checkpoint_precommitted
+            else [temporary_model, temporary_checkpoint]
+        ):
             with path.open("rb") as stream:
                 os.fsync(stream.fileno())
         if not checkpoint_precommitted:
             os.replace(temporary_checkpoint, checkpoint_path)
         os.replace(temporary_model, model_path)
-
-        manifest = {
-            "schema_version": 1,
-            "contract_version": "0.6.0",
-            "model_version": version,
-            "artifact_uri": model_path.as_uri(),
-            "model_file": model_path.name,
-            "size_bytes": model_path.stat().st_size,
-            "sha256": sha256_file(model_path),
+        artifact_digest = sha256_file(model_path)
+        document = {
+            "manifest_schema_version": 1,
+            "contract": contract_document(self.contract),
+            "identity": {
+                "model_lineage_id": self.lineage_id,
+                "model_version": version,
+                "artifact_digest": artifact_digest,
+                "manifest_digest": "0" * 64,
+            },
+            "observation_schema": schema_document(
+                self.semantics.observation_schema
+            ),
+            "action_schema": schema_document(self.semantics.action_schema),
+            "model_architecture_id": self.semantics.model_architecture_id,
+            "tensor_dtype": self.tensor_dtype,
             "input_shape": [1, self.obs_dim],
             "action_shape": [1, self.action_dim],
             "value_shape": [1, 1],
+            "artifact_uri": model_path.as_uri(),
+            "model_file": model_path.name,
+            "size_bytes": model_path.stat().st_size,
             "seed": self.seed,
+            "train_updates": int(train_updates),
+            "trained_samples": int(trained_samples),
+            "training_config_digest": self.training_digest.hex,
+            "training_semantics": semantics_document(self.semantics),
+            "published_at_unix_ms": int(time.time() * 1000),
             "ready": True,
-            "published_ts_ms": int(time.time() * 1000),
+        }
+        document = finalize_manifest_digest(document)
+        runtime_document = {
+            **document,
             "checkpoint_file": checkpoint_path.name,
             "train_update_id": train_update_id,
-            "behavior_model_version": behavior_model_version,
-            "batch_ids": batch_ids,
-            "train_updates": train_updates,
-            "trained_samples": trained_samples,
+            "behavior_model": behavior_model or {},
+            "batch_ids": list(batch_ids),
             **self.initial_checkpoint_identity,
         }
-        atomic_write_json(manifest_path, manifest)
+        atomic_write_json(manifest_path, runtime_document)
         atomic_write_json(
             self.state_path,
             {
                 "schema_version": 1,
-                "latest_model_version": version,
+                "latest_model": runtime_document["identity"],
                 "latest_manifest": str(manifest_path),
                 "latest_checkpoint": str(checkpoint_path),
-                "train_updates": train_updates,
-                "trained_samples": trained_samples,
-                "updated_ts_ms": int(time.time() * 1000),
+                "train_updates": int(train_updates),
+                "trained_samples": int(trained_samples),
+                "updated_at_unix_ms": int(time.time() * 1000),
                 **self.initial_checkpoint_identity,
             },
         )
-        return manifest
-
-    def commit_optimizer_checkpoint(
-        self,
-        trainer: PPOTrainer,
-        *,
-        train_update_id: str,
-        behavior_model_version: int,
-        batch_ids: list[str],
-        stats: dict,
-        sample_count: int,
-        train_updates: int,
-        trained_samples: int,
-    ) -> Path:
-        if not self._prepared:
-            raise RuntimeError("model publisher is not prepared")
-        checkpoint_path = self.checkpoint_path(trainer.model_version)
-        if checkpoint_path.exists():
-            checkpoint = self._load_checkpoint(checkpoint_path)
-            if (
-                checkpoint.get("model_version") != trainer.model_version
-                or checkpoint.get("metadata", {}).get("train_update_id")
-                != train_update_id
-            ):
-                raise RuntimeError(
-                    f"checkpoint identity conflicts: {checkpoint_path}"
-                )
-            return checkpoint_path
-        temporary = checkpoint_path.with_name(
-            f".{checkpoint_path.name}.{os.getpid()}.tmp"
-        )
-        trainer.save_checkpoint(
-            str(temporary),
-            metadata={
-                "train_update_id": train_update_id,
-                "behavior_model_version": behavior_model_version,
-                "batch_ids": batch_ids,
-                "stats": stats,
-                "sample_count": sample_count,
-                "train_updates": train_updates,
-                "trained_samples": trained_samples,
-                **self.initial_checkpoint_identity,
-            },
-        )
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, checkpoint_path)
-        return checkpoint_path
-
-    @staticmethod
-    def _load_checkpoint(path: Path) -> dict:
-        try:
-            return torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            return torch.load(path, map_location="cpu")
+        return runtime_document
 
     def complete_manifest(
-        self,
-        version: int,
-        train_update_id: str | None = None,
+        self, version: int, train_update_id: str | None = None
     ) -> dict | None:
-        manifest_path = self.manifest_path(version)
+        path = self.manifest_path(version)
         model_path = self.model_path(version)
         checkpoint_path = self.checkpoint_path(version)
-        if not (
-            manifest_path.is_file()
-            and model_path.is_file()
-            and checkpoint_path.is_file()
-        ):
+        if not (path.is_file() and model_path.is_file() and checkpoint_path.is_file()):
             return None
         try:
-            manifest = read_json(manifest_path)
+            document = read_json(path)
             checkpoint = self._load_checkpoint(checkpoint_path)
-            model_size = model_path.stat().st_size
-            model_checksum = sha256_file(model_path)
+            canonical = {
+                key: document[key]
+                for key in (
+                    "manifest_schema_version",
+                    "contract",
+                    "identity",
+                    "observation_schema",
+                    "action_schema",
+                    "model_architecture_id",
+                    "tensor_dtype",
+                    "input_shape",
+                    "action_shape",
+                    "value_shape",
+                    "artifact_uri",
+                    "model_file",
+                    "size_bytes",
+                    "seed",
+                    "train_updates",
+                    "trained_samples",
+                    "training_config_digest",
+                    "training_semantics",
+                    "published_at_unix_ms",
+                    "ready",
+                )
+            }
+            expected = finalize_manifest_digest(canonical)
         except (OSError, ValueError, KeyError, RuntimeError):
             return None
         metadata = checkpoint.get("metadata", {})
         if (
-            manifest.get("schema_version") != 1
-            or manifest.get("contract_version") != "0.6.0"
-            or manifest.get("model_version") != version
-            or manifest.get("model_file") != model_path.name
-            or not manifest.get("ready")
-            or manifest.get("size_bytes") != model_size
-            or manifest.get("sha256") != model_checksum
+            document.get("contract") != contract_document(self.contract)
+            or document.get("identity", {}).get("model_version") != version
+            or document.get("identity", {}).get("artifact_digest")
+            != sha256_file(model_path)
+            or document.get("identity", {}).get("manifest_digest")
+            != expected["identity"]["manifest_digest"]
+            or document.get("model_file") != model_path.name
+            or document.get("size_bytes") != model_path.stat().st_size
+            or document.get("training_semantics")
+            != semantics_document(self.semantics)
+            or not document.get("ready")
             or checkpoint.get("model_version") != version
             or metadata.get("train_update_id")
-            != manifest.get("train_update_id")
+            != document.get("train_update_id")
             or (
                 train_update_id is not None
-                and metadata.get("train_update_id") != train_update_id
+                and document.get("train_update_id") != train_update_id
             )
         ):
             return None
-        return manifest
+        return document
 
     def complete_manifests(self) -> list[dict]:
-        result = []
+        result: list[dict] = []
         for path in sorted(self.published_dir.glob("manifest_v*.json")):
             try:
                 version = int(path.stem.removeprefix("manifest_v"))
             except ValueError:
                 continue
-            manifest = self.complete_manifest(version)
-            if manifest is not None:
-                result.append(manifest)
+            document = self.complete_manifest(version)
+            if document:
+                result.append(document)
         return result
 
     def latest_complete_checkpoint(self) -> Path | None:
         manifests = self.complete_manifests()
         if not manifests:
             return None
-        return self.checkpoint_path(manifests[-1]["model_version"])
-
-    def checkpoint_metadata(self, version: int) -> dict:
-        checkpoint = self._load_checkpoint(self.checkpoint_path(version))
-        return checkpoint.get("metadata", {})
+        version = int(manifests[-1]["identity"]["model_version"])
+        return self.checkpoint_path(version)
 
     def should_archive(self, version: int) -> bool:
         return version == 0 or version % self.archive_interval_updates == 0
@@ -451,50 +569,41 @@ class ModelPublisher:
         if manifest is None:
             raise RuntimeError(f"cannot archive incomplete model v{version}")
         target = self.archive_path(version)
+        artifact_digest = manifest["identity"]["artifact_digest"]
         if target.exists():
-            archive_manifest = self.archive_manifest_path(version)
-            if not archive_manifest.is_file():
-                raise RuntimeError(f"archive is incomplete: {target}")
-            existing = read_json(archive_manifest)
-            archived_model = target / str(existing.get("model_file", ""))
-            archived_checkpoint = target / str(
-                existing.get("checkpoint_file", "")
-            )
+            existing = read_json(self.archive_manifest_path(version))
             if (
-                existing.get("model_version") != version
-                or existing.get("sha256") != manifest["sha256"]
-                or existing.get("model_file") != self.ARCHIVE_MODEL_FILE
-                or existing.get("checkpoint_file")
-                != self.ARCHIVE_CHECKPOINT_FILE
-                or not archived_model.is_file()
-                or not archived_checkpoint.is_file()
-                or sha256_file(archived_model) != manifest["sha256"]
+                existing.get("runtime_manifest_identity")
+                != manifest["identity"]
+                or sha256_file(target / self.ARCHIVE_MODEL_FILE)
+                != artifact_digest
             ):
                 raise RuntimeError(f"archive identity conflicts: {target}")
             return existing
-
         temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
         temporary.mkdir(parents=False, exist_ok=False)
         try:
-            archived_model = temporary / self.ARCHIVE_MODEL_FILE
-            archived_checkpoint = temporary / self.ARCHIVE_CHECKPOINT_FILE
-            shutil.copyfile(self.model_path(version), archived_model)
             shutil.copyfile(
-                self.checkpoint_path(version), archived_checkpoint
+                self.model_path(version), temporary / self.ARCHIVE_MODEL_FILE
+            )
+            shutil.copyfile(
+                self.checkpoint_path(version),
+                temporary / self.ARCHIVE_CHECKPOINT_FILE,
             )
             archive_manifest = {
-                **manifest,
-                "artifact_uri": (
-                    target / self.ARCHIVE_MODEL_FILE
-                ).as_uri(),
-                "model_file": archived_model.name,
-                "checkpoint_file": archived_checkpoint.name,
+                "schema_version": 1,
+                "runtime_manifest_identity": manifest["identity"],
+                "runtime_manifest_digest": manifest["identity"][
+                    "manifest_digest"
+                ],
+                "model_file": self.ARCHIVE_MODEL_FILE,
+                "checkpoint_file": self.ARCHIVE_CHECKPOINT_FILE,
+                "artifact_digest": artifact_digest,
                 "archive_reason": reason,
-                "archived_ts_ms": int(time.time() * 1000),
+                "archived_at_unix_ms": int(time.time() * 1000),
             }
             atomic_write_json(
-                temporary / self.ARCHIVE_MANIFEST_FILE,
-                archive_manifest,
+                temporary / self.ARCHIVE_MANIFEST_FILE, archive_manifest
             )
             os.replace(temporary, target)
             return archive_manifest
@@ -505,7 +614,7 @@ class ModelPublisher:
     def prune_runtime(self, current_version: int) -> None:
         minimum = current_version - self.serving_retention_versions + 1
         for manifest in self.complete_manifests():
-            version = int(manifest["model_version"])
+            version = int(manifest["identity"]["model_version"])
             if version >= minimum:
                 continue
             for path in (
@@ -520,13 +629,13 @@ class LeaseRenewer:
     def __init__(
         self,
         stub,
-        consumer_id: str,
+        consumer: common_pb2.ServiceInstanceIdentity,
         delivery_id: str,
         lease_timeout_ms: int,
     ):
         self.stub = stub
-        self.request = maze_pb2.RenewLeaseReq(
-            consumer_instance_id=consumer_id,
+        self.request = training_pb2.RenewLeaseReq(
+            consumer=consumer,
             delivery_id=delivery_id,
             lease_timeout_ms=lease_timeout_ms,
         )
@@ -540,345 +649,440 @@ class LeaseRenewer:
         self._thread.start()
         return self
 
-    def _run(self):
+    def _run(self) -> None:
         last_success = time.monotonic()
-        last_error = ""
         while not self._stop.wait(self.interval):
             try:
                 response = self.stub.RenewLease(self.request, timeout=2.0)
-                if response.result != maze_pb2.DELIVERY_RESULT_APPLIED:
-                    self.error = response.message
+                if response.result != training_pb2.DELIVERY_RESULT_APPLIED:
+                    self.error = response.message or "lease renewal rejected"
                     return
                 last_success = time.monotonic()
-                last_error = ""
-            except grpc.RpcError as exc:
-                last_error = exc.details() or str(exc)
+            except grpc.RpcError as error:
                 if time.monotonic() - last_success >= self.failure_deadline:
-                    self.error = last_error
+                    self.error = error.details() or str(error)
                     return
 
-    def close(self):
+    def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=3.0)
 
 
 class TrainingRuntime:
-    def __init__(
-        self,
-        config: dict,
-        initial_checkpoint: str = "",
-    ):
+    def __init__(self, config: dict, initial_checkpoint: str = ""):
+        validate_config(config)
         self.config = config
-        self.learner_id = os.environ.get("MAZE_LEARNER_ID", "learner-0")
-        self.consumer_id = (
-            f"{self.learner_id}-{os.getpid()}-{int(time.time() * 1000)}"
-        )
         self.logger = setup_logger("TrainingRuntime")
+        self.contract = contract_identity(config)
+        self.semantics = training_semantics(config)
+        self.policy_digest = policy_spec_digest(config)
         self.trainer = PPOTrainer(config)
         self.publisher = ModelPublisher(config)
+        if (
+            self.trainer.max_policy_lag + 1
+            > self.publisher.serving_retention_versions
+        ):
+            raise ValueError(
+                "max_policy_lag requires more retained serving versions"
+            )
+
+        learner_name = os.environ.get("RL_LEARNER_INSTANCE", "learner-0")
+        instance = f"{learner_name}-{os.getpid()}-{int(time.time() * 1000)}"
+        self.learner_service = service_identity("learner", instance, 1)
         self.sequence = 0
         self.train_updates = 0
         self.trained_samples = 0
+        self.initial_model_version = 0
         self.last_stats: dict = {}
-        self._acked_update_ids: set[str] = set()
-        self._accounted_update_ids: set[str] = set()
-        self._recorded_update_ids: set[str] = set()
-        self._behavior_checksums: dict[int, str] = {}
+        self.model_manifests: dict[int, dict] = {}
         self._last_archive_version: int | None = None
-        self._metrics_lock = threading.Lock()
-        self._metrics_stop = threading.Event()
-        self._metrics_thread: threading.Thread | None = None
         self._metrics_context = {
-            "behavior_model_version": -1,
+            "behavior_model": {},
             "actual_batch_size": 0,
             "disposition": "STARTING",
             "train_update_id": "",
             "error": "",
         }
-        self._rate_snapshot: dict = {}
+        self._metrics_lock = threading.RLock()
+        self._committed_learner_metrics = {
+            "model_identity": {},
+            "model_version": self.trainer.model_version,
+            "model_step": self.train_updates,
+            "run_train_updates": self.train_updates,
+            "run_trained_samples": self.trained_samples,
+            "policy_lag": 0,
+            "max_policy_lag": self.trainer.max_policy_lag,
+        }
+        self._metrics_stop = threading.Event()
+        self._metrics_thread: threading.Thread | None = None
+        self._rate_snapshot: dict[str, float] = {}
         self._last_actor_snapshot: dict = {}
         self._last_distributor_snapshot: dict = {}
         self._last_model_snapshot: dict = {}
         self._last_resource_time = time.monotonic()
         self._last_process_cpu = time.process_time()
 
-        dashboard = config.get("dashboard", {})
-        model = config.get("model", {})
-        configured_checkpoint = str(
-            model.get("initial_checkpoint", "") or ""
-        )
-        initial_checkpoint = str(
+        self.publisher.prepare()
+        configured_checkpoint = str(config["model"]["initial_checkpoint"] or "")
+        checkpoint = (
             initial_checkpoint
-            or os.environ.get("MAZE_INITIAL_CHECKPOINT", "")
+            or os.environ.get("RL_INITIAL_CHECKPOINT", "")
             or configured_checkpoint
         )
-        self.publisher.prepare()
         self._startup_mode = "fresh"
-        if initial_checkpoint:
+        if checkpoint:
             self._startup_mode = "initial-checkpoint"
             restored = self.publisher.load_initial_checkpoint(
-                self.trainer, initial_checkpoint
+                self.trainer, checkpoint
             )
             self.train_updates = int(restored["train_updates"])
             self.trained_samples = int(restored["trained_samples"])
 
-        sample = config.get("sample_distributor", {})
+        sample = config["sample_distributor"]
         sample_host = os.environ.get(
-            "MAZE_SAMPLE_DISTRIBUTOR_HOST",
-            sample.get("host", "maze-aiserver"),
+            "RL_SAMPLE_POOL_HOST", str(sample["host"])
         )
         sample_port = int(
-            os.environ.get(
-                "MAZE_SAMPLE_DISTRIBUTOR_PORT", sample.get("port", 9100)
-            )
+            os.environ.get("RL_SAMPLE_POOL_PORT", str(sample["port"]))
         )
-        self.train_batch_size = int(sample.get("train_batch_size", 512))
-        self.preference_timeout_ms = int(
-            sample.get("current_version_wait_ms", 10000)
-        )
-        self.get_timeout_ms = int(sample.get("get_timeout_ms", 1000))
-        self.lease_timeout_ms = int(
-            sample.get("lease_timeout_ms", 30000)
-        )
+        self.train_batch_size = int(sample["train_batch_size"])
+        self.preference_timeout_ms = int(sample["current_version_wait_ms"])
+        self.get_timeout_ms = int(sample["get_timeout_ms"])
+        self.lease_timeout_ms = int(sample["lease_timeout_ms"])
         self.shutdown_drain_timeout_ms = int(
-            sample.get("shutdown_drain_timeout_ms", 20000)
+            sample["shutdown_drain_timeout_ms"]
         )
-        self.sample_channel = grpc.insecure_channel(
-            f"{sample_host}:{sample_port}"
-        )
-        self.sample_stub = maze_pb2_grpc.SampleDistributorServiceStub(
+        self.sample_address = f"{sample_host}:{sample_port}"
+        self.sample_channel = grpc.insecure_channel(self.sample_address)
+        self.sample_stub = training_pb2_grpc.SampleDistributorServiceStub(
             self.sample_channel
         )
 
-        model = config.get("model_distributor", {})
+        model = config["model_distributor"]
         model_host = os.environ.get(
-            "MAZE_MODEL_DISTRIBUTOR_HOST", model.get("host", "127.0.0.1")
+            "RL_MODEL_DISTRIBUTOR_HOST", str(model["host"])
         )
         model_port = int(
-            os.environ.get(
-                "MAZE_MODEL_DISTRIBUTOR_PORT", model.get("port", 9200)
-            )
+            os.environ.get("RL_MODEL_DISTRIBUTOR_PORT", str(model["port"]))
         )
-        self.model_channel = grpc.insecure_channel(
-            f"{model_host}:{model_port}"
-        )
-        self.model_stub = maze_pb2_grpc.ModelDistributorServiceStub(
+        self.model_startup_timeout = float(model["startup_timeout_sec"])
+        self.model_address = f"{model_host}:{model_port}"
+        self.model_channel = grpc.insecure_channel(self.model_address)
+        self.model_stub = training_pb2_grpc.ModelDistributorServiceStub(
             self.model_channel
         )
 
-        aiserver_host = os.environ.get("MAZE_AISERVER_HOST", "maze-aiserver")
-        aiserver_port = int(os.environ.get("MAZE_AISERVER_PORT", 9002))
-        self.aiserver_channel = grpc.insecure_channel(
-            f"{aiserver_host}:{aiserver_port}"
+        actor = config["aiserver_status"]
+        actor_host = os.environ.get("RL_AISERVER_HOST", str(actor["host"]))
+        actor_port = int(
+            os.environ.get("RL_AISERVER_PORT", str(actor["port"]))
         )
-        self.aiserver_stub = maze_pb2_grpc.MazeServiceStub(
-            self.aiserver_channel
+        self.actor_address = f"{actor_host}:{actor_port}"
+        self.actor_channel = grpc.insecure_channel(self.actor_address)
+        self.actor_stub = training_pb2_grpc.AIServerTrainingStatusServiceStub(
+            self.actor_channel
         )
 
-        self.metrics = create_backend(
-            dashboard.get("backend", "jsonl"),
-            str(self.publisher.metrics_dir),
+        dashboard = config["dashboard"]
+        self.metrics_backend = create_backend(
+            str(dashboard["backend"]), str(self.publisher.metrics_dir)
         )
-        self._restore_metric_counters()
 
-    def _restore_metric_counters(self) -> None:
-        metrics_dir_getter = getattr(self.metrics, "get_metrics_dir", None)
-        if callable(metrics_dir_getter):
-            for path in Path(metrics_dir_getter()).glob("*.jsonl"):
-                try:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                except OSError:
-                    continue
-                for line in lines:
-                    try:
-                        record = json.loads(line)
-                    except (TypeError, ValueError):
-                        continue
-                    self.sequence = max(
-                        self.sequence, int(record.get("sequence", 0))
-                    )
-                    update_id = str(
-                        record.get("learner", {}).get(
-                            "train_update_id",
-                            record.get("train_update_id", ""),
-                        )
-                    )
-                    if update_id:
-                        self._recorded_update_ids.add(update_id)
-
-        receipts = []
-        for path in self.publisher.update_dir.glob("*.json"):
-            try:
-                receipt = read_json(path)
-            except (OSError, ValueError):
-                continue
-            if (
-                receipt.get("state") != "ACKED"
-                or not receipt.get("train_update_id")
-            ):
-                continue
-            receipts.append(receipt)
-
-        receipts.sort(
-            key=lambda item: (
-                int(item.get("target_model_version", -1)),
-                str(item.get("train_update_id", "")),
+    @staticmethod
+    def _manifest_for_wire(document: dict) -> dict:
+        return {
+            key: document[key]
+            for key in (
+                "manifest_schema_version",
+                "contract",
+                "identity",
+                "observation_schema",
+                "action_schema",
+                "model_architecture_id",
+                "tensor_dtype",
+                "input_shape",
+                "action_shape",
+                "value_shape",
+                "artifact_uri",
+                "model_file",
+                "size_bytes",
+                "seed",
+                "train_updates",
+                "trained_samples",
+                "training_config_digest",
+                "training_semantics",
+                "published_at_unix_ms",
+                "ready",
             )
-        )
-        for receipt in receipts:
-            update_id = str(receipt["train_update_id"])
-            if update_id in self._acked_update_ids:
-                continue
-            self._acked_update_ids.add(update_id)
-            if update_id not in self._accounted_update_ids:
-                self._accounted_update_ids.add(update_id)
-                receipt_updates = receipt.get("train_updates")
-                receipt_samples = receipt.get("trained_samples")
-                if receipt_updates is None or receipt_samples is None:
-                    self.train_updates += 1
-                    self.trained_samples += int(
-                        receipt.get("sample_count", 0)
-                    )
-                else:
-                    self.train_updates = max(
-                        self.train_updates, int(receipt_updates)
-                    )
-                    self.trained_samples = max(
-                        self.trained_samples, int(receipt_samples)
-                    )
-            self.last_stats = receipt.get("stats", self.last_stats)
+        }
 
-    def _register(
-        self,
-        manifest: dict,
-        timeout: float = 30.0,
-        interruptible: bool = True,
-    ) -> None:
-        deadline = time.monotonic() + timeout
-        last_error = ""
-        request = maze_pb2.RegisterModelReq(
-            manifest=manifest_message(manifest)
+    def _register(self, document: dict) -> None:
+        response = self.model_stub.RegisterModel(
+            training_pb2.RegisterModelReq(
+                manifest=manifest_message(self._manifest_for_wire(document))
+            ),
+            timeout=5.0,
         )
-        while (
-            time.monotonic() < deadline
-            and (not interruptible or not _stop_requested.is_set())
+        if response.result not in (
+            training_pb2.MODEL_REGISTER_RESULT_REGISTERED,
+            training_pb2.MODEL_REGISTER_RESULT_ALREADY_REGISTERED,
         ):
+            raise RuntimeError(
+                f"model registration rejected: {response.message}"
+            )
+        expected = manifest_message(self._manifest_for_wire(document))
+        if not _same_message(response.manifest, expected):
+            raise RuntimeError("model distributor returned a different manifest")
+
+    def _wait_model_loaded(self, document: dict) -> None:
+        expected = manifest_message(self._manifest_for_wire(document)).identity
+        deadline = time.monotonic() + self.model_startup_timeout
+        last = ""
+        while time.monotonic() < deadline and not _stop_requested.is_set():
             try:
-                response = self.model_stub.RegisterModel(
-                    request, timeout=2.0
+                status = self.model_stub.GetModelDistributorStatus(
+                    training_pb2.ModelDistributorStatusReq(), timeout=2.0
                 )
-                if response.result in (
-                    maze_pb2.MODEL_REGISTER_RESULT_REGISTERED,
-                    maze_pb2.MODEL_REGISTER_RESULT_ALREADY_REGISTERED,
+                if (
+                    status.ready
+                    and status.latest_ack_status
+                    == training_pb2.MODEL_LOAD_STATUS_LOADED
+                    and _same_message(status.latest_ack_model, expected)
                 ):
                     return
-                last_error = response.message
-                if (
-                    response.result
-                    == maze_pb2.MODEL_REGISTER_RESULT_REJECTED_CONFLICT
-                ):
-                    break
-            except grpc.RpcError as exc:
-                last_error = exc.details() or str(exc)
+                last = (
+                    f"status={training_pb2.ModelLoadStatus.Name(status.latest_ack_status)} "
+                    f"ack={model_identity_document(status.latest_ack_model)}"
+                )
+            except grpc.RpcError as error:
+                last = error.details() or str(error)
             time.sleep(0.2)
-        raise RuntimeError(f"model registration failed: {last_error}")
+        raise RuntimeError(f"AIServer did not ACK exact model identity: {last}")
 
     def _initialize_models(self) -> None:
-        train_update_id = (
-            "bootstrap-v0"
-            if self._startup_mode == "fresh"
-            else "initial-checkpoint"
+        version = self.trainer.model_version
+        update_id = (
+            "initial-checkpoint"
+            if self._startup_mode == "initial-checkpoint"
+            else "bootstrap-v0"
         )
-        manifest = self.publisher.publish_runtime(
+        document = self.publisher.publish_runtime(
             self.trainer,
-            train_update_id=train_update_id,
-            behavior_model_version=None,
+            train_update_id=update_id,
+            behavior_model=None,
             batch_ids=[],
             train_updates=self.train_updates,
             trained_samples=self.trained_samples,
         )
-        self.publisher.archive_version(
-            self.trainer.model_version,
-            "bootstrap"
-            if self._startup_mode == "fresh"
-            else "initial-checkpoint",
+        self.model_manifests[version] = document
+        self.initial_model_version = version
+        self._register(document)
+        self._wait_model_loaded(document)
+        self.publisher.archive_version(version, self._startup_mode)
+        self._last_archive_version = version
+        self._commit_learner_metrics(
+            document,
+            behavior_model={},
+            actual_batch_size=0,
+            disposition="READY",
+            train_update_id=update_id,
+            train_updates=self.train_updates,
+            trained_samples=self.trained_samples,
+            stats={},
         )
-        self._last_archive_version = self.trainer.model_version
         self.logger.info(
-            "启动模型已提交: version=%d checksum=%s mode=%s",
-            self.trainer.model_version,
-            manifest["sha256"],
+            "Learner training ready: model=v%d artifact=%s startup=%s",
+            version,
+            document["identity"]["artifact_digest"],
             self._startup_mode,
         )
-        manifests = self.publisher.complete_manifests()
-        if not manifests:
-            raise RuntimeError("runtime has no complete model manifest")
-        for manifest in manifests:
-            self._register(manifest)
-            self._behavior_checksums[int(manifest["model_version"])] = str(
-                manifest["sha256"]
+
+    def _sample_pool_status(self):
+        return self.sample_stub.GetStatus(
+            training_pb2.DistributorStatusReq(), timeout=2.0
+        )
+
+    def _allowed_behavior_documents(self) -> list[dict]:
+        minimum = self.trainer.model_version - self.trainer.max_policy_lag
+        return [
+            self.model_manifests[version]
+            for version in sorted(self.model_manifests, reverse=True)
+            if minimum <= version <= self.trainer.model_version
+        ]
+
+    def _select_behavior_document(self) -> dict | None:
+        status = self._sample_pool_status()
+        if not (
+            status.ready
+            and status.ingress_ready
+            and status.pool_ready
+            and _same_message(status.contract, self.contract)
+        ):
+            raise RuntimeError("sample pool is not ready for the exact contract")
+        ready: dict[bytes, int] = {
+            item.behavior_model.SerializeToString(deterministic=True): int(
+                item.ready_samples
             )
-        if self.trainer.model_version not in self._behavior_checksums:
-            raise RuntimeError(
-                "current trainer version has no complete runtime model"
-            )
+            for item in status.behavior_versions
+        }
+        for document in self._allowed_behavior_documents():
+            identity = manifest_message(
+                self._manifest_for_wire(document)
+            ).identity
+            if ready.get(
+                identity.SerializeToString(deterministic=True), 0
+            ) >= self.train_batch_size:
+                return document
+        return None
 
-    def _model_status(self):
-        return self.model_stub.GetModelDistributorStatus(
-            maze_pb2.ModelDistributorStatusReq(),
-            timeout=2.0,
-        )
-
-    def _wait_loaded(self, version: int, timeout: float = 60.0) -> None:
-        deadline = time.monotonic() + timeout
-        last = ""
-        while time.monotonic() < deadline:
-            try:
-                status = self._model_status()
-                if (
-                    status.latest_ack_model_version >= version
-                    and status.latest_ack_status
-                    == maze_pb2.MODEL_LOAD_STATUS_LOADED
-                ):
-                    return
-                last = (
-                    f"ack_version={status.latest_ack_model_version}, "
-                    f"ack_status={status.latest_ack_status}"
-                )
-            except grpc.RpcError as exc:
-                last = exc.details() or str(exc)
-            time.sleep(0.2)
-        raise RuntimeError(
-            f"AIServer did not ACK model v{version}: {last}"
-        )
-
-    def _get_batch(
-        self,
-        version: int,
-        timeout_ms: int,
-        policy: int,
-    ):
-        request = maze_pb2.GetBatchReq(
-            batch_size=self.train_batch_size,
-            timeout_ms=timeout_ms,
-            consumer_instance_id=self.consumer_id,
-            lease_timeout_ms=self.lease_timeout_ms,
-            behavior_model_version=version,
-            selection_policy=policy,
-        )
+    def _get_batch(self, behavior_document: dict):
+        identity = manifest_message(
+            self._manifest_for_wire(behavior_document)
+        ).identity
         return self.sample_stub.GetBatch(
-            request, timeout=max(2.0, timeout_ms / 1000.0 + 2.0)
+            training_pb2.GetBatchReq(
+                batch_size=self.train_batch_size,
+                timeout_ms=self.get_timeout_ms,
+                consumer=self.learner_service,
+                lease_timeout_ms=self.lease_timeout_ms,
+                target_model=identity,
+                selection_policy=(
+                    training_pb2.BATCH_SELECTION_POLICY_TARGET_ONLY
+                ),
+                required_semantics=self.semantics,
+            ),
+            timeout=max(2.0, self.get_timeout_ms / 1000.0 + 1.0),
         )
+
+    @staticmethod
+    def _validate_sample(sample: training_pb2.Sample) -> None:
+        values = [
+            *sample.observation,
+            *sample.next_observation,
+            sample.reward,
+            sample.old_log_probability,
+            sample.old_value_prediction,
+        ]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("sample contains non-finite values")
+        if sample.action < 0 or sample.action >= 9:
+            raise ValueError("sample action is outside maze.action.v1")
+        if len(sample.observation) != 17 or len(sample.next_observation) != 17:
+            raise ValueError("sample does not match maze.observation.v3")
+        if sample.terminated and sample.truncated:
+            raise ValueError("sample cannot be terminated and truncated")
+        expected = (
+            training_pb2.TRANSITION_END_KIND_ENVIRONMENT_TERMINATED
+            if sample.terminated
+            else training_pb2.TRANSITION_END_KIND_EXTERNAL_TRUNCATION
+            if sample.truncated
+            else training_pb2.TRANSITION_END_KIND_CONTINUING
+        )
+        if sample.end_kind != expected:
+            raise ValueError("sample end_kind conflicts with terminal flags")
+
+    def _validate_delivery(self, response, behavior_document: dict) -> None:
+        if (
+            response.result != training_pb2.GET_BATCH_RESULT_LEASED
+            or response.actual_batch_size != self.train_batch_size
+            or response.returned_samples != self.train_batch_size
+            or not response.delivery_id
+        ):
+            raise ValueError("sample delivery is not an exact training batch")
+        expected_model = manifest_message(
+            self._manifest_for_wire(behavior_document)
+        ).identity
+        expected_policy = training_pb2.BehaviorPolicyIdentity(
+            model=expected_model,
+            distribution_schema_id=self.semantics.policy_distribution_schema_id,
+            policy_spec_digest=self.policy_digest,
+        )
+        if not _same_message(response.behavior_policy, expected_policy):
+            raise ValueError("delivery behavior policy identity mismatch")
+        sample_count = 0
+        for batch in response.batches:
+            if (
+                not batch.batch_id
+                or not batch.trajectory_id
+                or not _same_message(batch.contract, self.contract)
+                or not _same_message(batch.training_semantics, self.semantics)
+                or not _same_message(batch.behavior_policy, expected_policy)
+                or not batch.producer.instance_id
+                or batch.producer.component != "aiserver"
+                or batch.first_action_step > batch.last_action_step
+            ):
+                raise ValueError("sample batch identity is invalid")
+            digest_copy = training_pb2.SampleBatch()
+            digest_copy.CopyFrom(batch)
+            supplied = digest_copy.payload_digest.hex
+            digest_copy.ClearField("payload_digest")
+            actual = hashlib.sha256(
+                digest_copy.SerializeToString(deterministic=True)
+            ).hexdigest()
+            if supplied != actual:
+                raise ValueError("sample batch payload digest mismatch")
+            for index, sample in enumerate(batch.samples):
+                self._validate_sample(sample)
+                if index != len(batch.samples) - 1 and (
+                    sample.terminated or sample.truncated
+                ):
+                    raise ValueError("fragment continues after end transition")
+                sample_count += 1
+            terminal = bool(batch.samples and batch.samples[-1].terminated)
+            truncated = bool(batch.samples and batch.samples[-1].truncated)
+            if terminal:
+                if batch.bootstrap_valid or batch.bootstrap_value != 0.0:
+                    raise ValueError("terminated fragment must not bootstrap")
+            elif not batch.bootstrap_valid or not math.isfinite(
+                batch.bootstrap_value
+            ):
+                raise ValueError(
+                    "continuing or truncated fragment requires bootstrap"
+                )
+            if batch.trajectory_end != (terminal or truncated):
+                raise ValueError("trajectory_end conflicts with final sample")
+        if sample_count != self.train_batch_size:
+            raise ValueError("delivery sample count does not match response")
+
+    def _training_samples(self, batches) -> list[dict]:
+        result: list[dict] = []
+        for batch in batches:
+            trajectory = [
+                {
+                    "observation": list(sample.observation),
+                    "next_observation": list(sample.next_observation),
+                    "action": int(sample.action),
+                    "reward": float(sample.reward),
+                    "old_log_probability": float(
+                        sample.old_log_probability
+                    ),
+                    "old_value_prediction": float(
+                        sample.old_value_prediction
+                    ),
+                    "terminated": bool(sample.terminated),
+                    "truncated": bool(sample.truncated),
+                    "action_step": int(sample.action_step),
+                }
+                for sample in batch.samples
+            ]
+            result.extend(
+                self.trainer.compute_gae(
+                    trajectory,
+                    bootstrap_value=float(batch.bootstrap_value),
+                    bootstrap_valid=bool(batch.bootstrap_valid),
+                )
+            )
+        return result
 
     def _ack(
         self,
         delivery_id: str,
         disposition: int,
         train_update_id: str = "",
-    ):
+    ) -> None:
         response = self.sample_stub.AckBatch(
-            maze_pb2.AckBatchReq(
-                consumer_instance_id=self.consumer_id,
+            training_pb2.AckBatchReq(
+                consumer=self.learner_service,
                 delivery_id=delivery_id,
                 disposition=disposition,
                 train_update_id=train_update_id,
@@ -886,1055 +1090,549 @@ class TrainingRuntime:
             timeout=3.0,
         )
         if response.result not in (
-            maze_pb2.DELIVERY_RESULT_APPLIED,
-            maze_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
+            training_pb2.DELIVERY_RESULT_APPLIED,
+            training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
         ):
-            raise RuntimeError(
-                f"sample Ack failed: {response.message}"
-            )
-        return response
+            raise RuntimeError(f"sample ACK failed: {response.message}")
 
-    def _sample_status(self):
-        return self.sample_stub.GetStatus(
-            maze_pb2.DistributorStatusReq(), timeout=2.0
-        )
-
-    def _drain_stale(self) -> None:
-        status = self._sample_status()
-        minimum = self.trainer.model_version - 1
-        for version in status.behavior_versions:
-            if (
-                version.behavior_model_version >= minimum
-                or version.ready_samples <= 0
-            ):
-                continue
-            remaining = version.ready_samples
-            while remaining > 0:
-                response = self._get_batch(
-                    version.behavior_model_version,
-                    self.get_timeout_ms,
-                    maze_pb2.BATCH_SELECTION_POLICY_DRAIN_AVAILABLE,
-                )
-                if response.result != maze_pb2.GET_BATCH_RESULT_LEASED:
-                    break
-                self._ack(
-                    response.delivery_id,
-                    maze_pb2.ACK_DISPOSITION_STALE,
-                )
-                remaining -= response.actual_batch_size
-
-    def _select_batch(self):
-        current = self.trainer.model_version
-        response = self._get_batch(
-            current,
-            self.preference_timeout_ms,
-            maze_pb2.BATCH_SELECTION_POLICY_TARGET_ONLY,
-        )
-        if response.result == maze_pb2.GET_BATCH_RESULT_LEASED:
-            return response
-        if (
-            response.result != maze_pb2.GET_BATCH_RESULT_TIMEOUT
-            or current == 0
-        ):
-            return None
-        response = self._get_batch(
-            current - 1,
-            self.get_timeout_ms,
-            maze_pb2.BATCH_SELECTION_POLICY_TARGET_ONLY,
-        )
-        return (
-            response
-            if response.result == maze_pb2.GET_BATCH_RESULT_LEASED
-            else None
-        )
-
-    def _validate_fragments(
-        self, batches: Iterable
-    ) -> tuple[int, list[str]]:
-        batches = list(batches)
-        if not batches:
-            raise ValueError("delivery has no fragments")
-        version = batches[0].behavior_model_version
-        checksum = batches[0].behavior_model_checksum
-        expected_checksum = self._behavior_checksums.get(version)
-        if expected_checksum is None:
-            manifest = self.publisher.complete_manifest(version)
-            if manifest is not None:
-                expected_checksum = str(manifest["sha256"])
-                self._behavior_checksums[version] = expected_checksum
-        if checksum != expected_checksum:
-            raise ValueError(
-                "fragment behavior checksum does not match the published model"
-            )
-        batch_ids = []
-        seen_batch_ids = set()
-        for batch in batches:
-            if batch.protocol_version != 3:
-                raise ValueError("fragment protocol version is invalid")
-            if batch.behavior_model_version != version:
-                raise ValueError("delivery mixes behavior model versions")
-            if (
-                batch.behavior_model_checksum != checksum
-                or len(batch.behavior_model_checksum) != 64
-            ):
-                raise ValueError("fragment behavior checksum is inconsistent")
-            if not batch.bootstrap_valid or not math.isfinite(
-                batch.bootstrap_value
-            ):
-                raise ValueError("fragment bootstrap is invalid")
-            if len(batch.samples) == 0:
-                raise ValueError("fragment is empty")
-            if not batch.batch_id or batch.batch_id in seen_batch_ids:
-                raise ValueError("fragment batch identity is invalid")
-            seen_batch_ids.add(batch.batch_id)
-            expected = batch.first_action_frame_id
-            for index, sample in enumerate(batch.samples):
-                if sample.action_frame_id != expected:
-                    raise ValueError("fragment action frames are not contiguous")
-                if sample.terminated and sample.truncated:
-                    raise ValueError(
-                        "sample cannot be terminated and truncated"
-                    )
-                if (
-                    len(sample.obs) != self.trainer.obs_dim
-                    or not all(math.isfinite(value) for value in sample.obs)
-                    or sample.action < 0
-                    or sample.action >= self.trainer.action_dim
-                    or not all(
-                        math.isfinite(value)
-                        for value in (
-                            sample.reward,
-                            sample.old_log_prob,
-                            sample.old_vpred,
-                        )
-                    )
-                ):
-                    raise ValueError("sample tensor or scalar is invalid")
-                if (
-                    (sample.terminated or sample.truncated)
-                    and index != len(batch.samples) - 1
-                ):
-                    raise ValueError(
-                        "terminal transition must end the fragment"
-                    )
-                expected += 1
-            if expected - 1 != batch.last_action_frame_id:
-                raise ValueError("fragment frame range is inconsistent")
-            terminal = (
-                batch.samples[-1].terminated
-                or batch.samples[-1].truncated
-            )
-            if terminal != batch.is_episode_end:
-                raise ValueError("fragment episode-end metadata is inconsistent")
-            if batch.samples[-1].terminated and batch.bootstrap_value != 0.0:
-                raise ValueError("terminated fragment bootstrap must be zero")
-            batch_ids.append(batch.batch_id)
-        return version, batch_ids
-
-    def _training_samples(self, batches: Iterable) -> list[dict]:
-        result = []
-        for batch in batches:
-            trajectory = [
-                {
-                    "obs": list(sample.obs),
-                    "action": sample.action,
-                    "reward": sample.reward,
-                    "old_log_prob": sample.old_log_prob,
-                    "old_vpred": sample.old_vpred,
-                    "terminated": sample.terminated,
-                    "truncated": sample.truncated,
-                }
-                for sample in batch.samples
-            ]
-            result.extend(
-                self.trainer.compute_gae(
-                    trajectory,
-                    bootstrap_value=batch.bootstrap_value,
-                    bootstrap_valid=batch.bootstrap_valid,
-                )
-            )
-        return result
-
-    def _update_id(self, behavior_version: int, batch_ids: list[str]) -> str:
-        identity = json.dumps(
-            {
-                "behavior_model_version": behavior_version,
-                "batch_ids": batch_ids,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-    def _write_receipt(self, path: Path, receipt: dict, state: str, **extra):
-        receipt = {
-            **receipt,
-            **extra,
-            "state": state,
-            "updated_ts_ms": int(time.time() * 1000),
-        }
-        atomic_write_json(path, receipt)
-        return receipt
-
-    def _checkpoint_committed(self, receipt: dict) -> bool:
-        return (
-            self.publisher.complete_manifest(
-                receipt["target_model_version"],
-                receipt["train_update_id"],
-            )
-            is not None
-        )
-
-    def _recover_committed_receipt(
-        self, path: Path, receipt: dict
-    ) -> dict:
-        version = receipt["target_model_version"]
-        manifest = self.publisher.complete_manifest(
-            version, receipt["train_update_id"]
-        )
-        if manifest is None:
-            return receipt
-        metadata = self.publisher.checkpoint_metadata(version)
-        return self._write_receipt(
-            path,
-            receipt,
-            "RUNTIME_COMMITTED",
-            manifest=manifest,
-            stats=metadata.get("stats", {}),
-            sample_count=int(metadata.get("sample_count", 0)),
-            train_updates=int(
-                metadata.get("train_updates", self.train_updates)
-            ),
-            trained_samples=int(
-                metadata.get("trained_samples", self.trained_samples)
-            ),
-        )
-
-    def _ensure_trainer_version(self, version: int) -> None:
-        if self.trainer.model_version == version:
-            return
-        checkpoint = self.publisher.checkpoint_path(version)
-        if not self.trainer.load_checkpoint(str(checkpoint)):
-            raise RuntimeError(
-                f"cannot restore committed model v{version}"
-            )
-
-    def _ensure_archive_for_receipt(
-        self, path: Path, receipt: dict
-    ) -> dict:
-        version = int(receipt["target_model_version"])
-        if not self.publisher.should_archive(version):
-            return receipt
-        archive = self.publisher.archive_version(version, "interval")
-        self._last_archive_version = version
-        return self._write_receipt(
-            path,
-            receipt,
-            receipt["state"],
-            archive_committed=True,
-            archive_manifest=str(
-                self.publisher.archive_manifest_path(version)
-            ),
-            archive_checksum=archive["sha256"],
-        )
-
-    def _remember_acked_receipt(self, receipt: dict) -> None:
-        update_id = str(receipt["train_update_id"])
-        self._acked_update_ids.add(update_id)
-        if update_id not in self._accounted_update_ids:
-            self._accounted_update_ids.add(update_id)
-            self.train_updates = int(
-                receipt.get("train_updates", self.train_updates + 1)
-            )
-            self.trained_samples = int(
-                receipt.get(
-                    "trained_samples",
-                    self.trained_samples
-                    + int(receipt.get("sample_count", 0)),
-                )
-            )
-        self.last_stats = receipt.get("stats", self.last_stats)
-        if update_id in self._recorded_update_ids:
-            return
-        self._record_metrics(
-            behavior_version=int(receipt["behavior_model_version"]),
-            actual_batch_size=int(receipt.get("sample_count", 0)),
-            stats=self.last_stats,
-            disposition="TRAINED",
-            train_update_id=update_id,
-            error="",
-        )
-        self._recorded_update_ids.add(update_id)
-
-    def _reconcile_receipts(self) -> None:
-        receipts = []
-        for path in self.publisher.update_dir.glob("*.json"):
-            try:
-                receipt = read_json(path)
-            except (OSError, ValueError):
-                continue
-            if not receipt.get("train_update_id"):
-                continue
-            receipts.append((path, receipt))
-        receipts.sort(
-            key=lambda item: (
-                int(item[1].get("target_model_version", -1)),
-                str(item[1].get("train_update_id", "")),
-            )
-        )
-
-        for path, receipt in receipts:
-            state = receipt.get("state")
-            if state == "ACKED":
-                self._remember_acked_receipt(receipt)
-                continue
-            if (
-                state in ("LEASED", "OPTIMIZER_COMMITTED")
-                and self._checkpoint_committed(receipt)
-            ):
-                receipt = self._recover_committed_receipt(path, receipt)
-                state = receipt["state"]
-            if state in ("RUNTIME_COMMITTED", "MODEL_COMMITTED"):
-                receipt = self._ensure_archive_for_receipt(path, receipt)
-                manifest = receipt.get("manifest") or (
-                    self.publisher.complete_manifest(
-                        int(receipt["target_model_version"]),
-                        str(receipt["train_update_id"]),
-                    )
-                )
-                if manifest is None:
-                    continue
-                try:
-                    self._register(manifest, timeout=5.0)
-                except (grpc.RpcError, RuntimeError):
-                    continue
-                receipt = self._write_receipt(
-                    path, receipt, "REGISTERED", manifest=manifest
-                )
-                state = receipt["state"]
-            if state != "REGISTERED" or not receipt.get("delivery_id"):
-                continue
-            try:
-                self._ack(
-                    str(receipt["delivery_id"]),
-                    maze_pb2.ACK_DISPOSITION_TRAINED,
-                    str(receipt["train_update_id"]),
-                )
-            except (grpc.RpcError, RuntimeError):
-                continue
-            receipt = self._write_receipt(path, receipt, "ACKED")
-            self._remember_acked_receipt(receipt)
-
-    def _process_delivery(self, delivery) -> None:
+    def _nack(self, delivery_id: str, reason: str) -> None:
         try:
-            behavior_version, batch_ids = self._validate_fragments(
-                delivery.batches
+            response = self.sample_stub.NackBatch(
+                training_pb2.NackBatchReq(
+                    consumer=self.learner_service,
+                    delivery_id=delivery_id,
+                    reason=reason[:256],
+                ),
+                timeout=3.0,
             )
-            delivered_samples = sum(
-                len(batch.samples) for batch in delivery.batches
-            )
-            if (
-                delivered_samples != delivery.actual_batch_size
-                or delivered_samples < self.train_batch_size
-                or delivery.behavior_model_version != behavior_version
+            if response.result not in (
+                training_pb2.DELIVERY_RESULT_APPLIED,
+                training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
             ):
-                raise ValueError("delivery batch accounting is inconsistent")
-        except ValueError as exc:
-            self.logger.error("样本 fragment 无效: %s", exc)
-            self._ack(
-                delivery.delivery_id,
-                maze_pb2.ACK_DISPOSITION_INVALID,
-            )
-            self._record_metrics(
-                behavior_version=-1,
-                actual_batch_size=delivery.actual_batch_size,
-                stats={},
-                disposition="INVALID",
-                train_update_id="",
-                error=str(exc),
-            )
-            return
+                self.logger.error("sample NACK rejected: %s", response.message)
+        except grpc.RpcError as error:
+            self.logger.error("sample NACK failed: %s", error)
 
-        current_version = self.trainer.model_version
-        if behavior_version < current_version - 1:
-            self._ack(
-                delivery.delivery_id, maze_pb2.ACK_DISPOSITION_STALE
-            )
-            return
-        if behavior_version > current_version:
-            self._ack(
-                delivery.delivery_id, maze_pb2.ACK_DISPOSITION_INVALID
-            )
-            raise RuntimeError(
-                "Sample Pool returned a future behavior model version"
-            )
+    def _write_receipt(self, update_id: str, document: dict) -> None:
+        atomic_write_json(self.publisher.receipt_path(update_id), document)
 
-        train_update_id = self._update_id(behavior_version, batch_ids)
-        receipt_path = self.publisher.receipt_path(train_update_id)
-        target_version = current_version + 1
-        receipt = (
-            read_json(receipt_path)
-            if receipt_path.is_file()
-            else {
-                "schema_version": 1,
-                "train_update_id": train_update_id,
-                "behavior_model_version": behavior_version,
-                "batch_ids": batch_ids,
-                "target_model_version": target_version,
-                "created_ts_ms": int(time.time() * 1000),
-            }
-        )
-        receipt["delivery_id"] = delivery.delivery_id
-        if not receipt_path.is_file():
-            receipt = self._write_receipt(
-                receipt_path, receipt, "LEASED"
-            )
-        if (
-            receipt["state"] in ("LEASED", "OPTIMIZER_COMMITTED")
-            and self._checkpoint_committed(receipt)
-        ):
-            receipt = self._recover_committed_receipt(
-                receipt_path, receipt
-            )
-
+    def _train_delivery(self, response, behavior_document: dict) -> None:
+        self._validate_delivery(response, behavior_document)
+        behavior_identity = behavior_document["identity"]
+        behavior_version = int(behavior_identity["model_version"])
+        update_number = self.train_updates + 1
+        update_id = f"train-update-{update_number:08d}"
+        batch_ids = [batch.batch_id for batch in response.batches]
+        receipt = {
+            "schema_version": 1,
+            "train_update_id": update_id,
+            "delivery_id": response.delivery_id,
+            "behavior_model": behavior_identity,
+            "batch_ids": batch_ids,
+            "state": "LEASED",
+            "sample_count": int(response.actual_batch_size),
+        }
+        self._write_receipt(update_id, receipt)
         renewer = LeaseRenewer(
             self.sample_stub,
-            self.consumer_id,
-            delivery.delivery_id,
+            self.learner_service,
+            response.delivery_id,
             self.lease_timeout_ms,
         ).start()
         try:
-            if receipt["state"] == "LEASED":
-                self._wait_loaded(current_version)
-                samples = self._training_samples(delivery.batches)
-                if len(samples) < self.train_batch_size:
-                    raise RuntimeError(
-                        "TARGET_ONLY delivery is smaller than train batch"
-                    )
-                stats = self.trainer.train_on_batch(samples)
-                if self.trainer.model_version != target_version:
-                    raise RuntimeError("PPO model version did not advance once")
-                if not all(
-                    math.isfinite(float(stats[field]))
-                    for field in (
-                        "policy_loss",
-                        "value_loss",
-                        "total_loss",
-                        "entropy",
-                        "approx_kl",
-                        "clip_fraction",
-                        "gradient_norm",
-                    )
-                ):
-                    raise RuntimeError("PPO update produced non-finite metrics")
-                committed_train_updates = self.train_updates + 1
-                committed_trained_samples = (
-                    self.trained_samples + len(samples)
-                )
-                self.publisher.commit_optimizer_checkpoint(
-                    self.trainer,
-                    train_update_id=train_update_id,
-                    behavior_model_version=behavior_version,
-                    batch_ids=batch_ids,
-                    stats=stats,
-                    sample_count=len(samples),
-                    train_updates=committed_train_updates,
-                    trained_samples=committed_trained_samples,
-                )
-                receipt = self._write_receipt(
-                    receipt_path,
-                    receipt,
-                    "OPTIMIZER_COMMITTED",
-                    stats=stats,
-                    sample_count=len(samples),
-                    train_updates=committed_train_updates,
-                    trained_samples=committed_trained_samples,
-                    optimizer_committed=True,
-                )
-                manifest = self.publisher.publish_runtime(
-                    self.trainer,
-                    train_update_id=train_update_id,
-                    behavior_model_version=behavior_version,
-                    batch_ids=batch_ids,
-                    stats=stats,
-                    sample_count=len(samples),
-                    train_updates=committed_train_updates,
-                    trained_samples=committed_trained_samples,
-                    checkpoint_precommitted=True,
-                )
-                self._behavior_checksums[
-                    int(manifest["model_version"])
-                ] = str(manifest["sha256"])
-                receipt = self._write_receipt(
-                    receipt_path,
-                    receipt,
-                    "RUNTIME_COMMITTED",
-                    manifest=manifest,
-                    stats=stats,
-                    sample_count=len(samples),
-                    train_updates=committed_train_updates,
-                    trained_samples=committed_trained_samples,
-                    runtime_committed=True,
-                )
-                receipt = self._ensure_archive_for_receipt(
-                    receipt_path, receipt
-                )
-            else:
-                self._ensure_trainer_version(
-                    receipt["target_model_version"]
-                )
-                stats = receipt.get("stats", {})
-
-            if receipt["state"] in (
-                "RUNTIME_COMMITTED",
-                "MODEL_COMMITTED",
-            ):
-                receipt = self._ensure_archive_for_receipt(
-                    receipt_path, receipt
-                )
-                manifest = receipt.get("manifest") or read_json(
-                    self.publisher.manifest_path(
-                        receipt["target_model_version"]
-                    )
-                )
-                self._register(manifest, interruptible=False)
-                receipt = self._write_receipt(
-                    receipt_path, receipt, "REGISTERED"
-                )
-
-            if renewer.error:
-                raise RuntimeError(
-                    f"sample lease renewal failed: {renewer.error}"
-                )
-            if receipt["state"] in ("REGISTERED", "ACKED"):
-                self._ack(
-                    delivery.delivery_id,
-                    maze_pb2.ACK_DISPOSITION_TRAINED,
-                    train_update_id,
-                )
-                receipt = self._write_receipt(
-                    receipt_path, receipt, "ACKED"
-                )
-
-            if receipt["state"] != "ACKED":
-                raise RuntimeError(
-                    "training receipt did not reach ACKED"
-                )
-            self._remember_acked_receipt(receipt)
-            self.publisher.prune_runtime(self.trainer.model_version)
-            sample_count = int(receipt.get("sample_count", 0))
-            self.logger.info(
-                "Train Update 完成: behavior=v%d model=v%d samples=%d update=%s",
-                behavior_version,
-                self.trainer.model_version,
-                sample_count,
-                train_update_id[:12],
+            training_samples = self._training_samples(response.batches)
+            stats = self.trainer.train_on_batch(
+                training_samples,
+                behavior_model_version=behavior_version,
             )
+            if renewer.error:
+                raise RuntimeError(f"sample lease lost: {renewer.error}")
+            target_updates = self.train_updates + 1
+            target_samples = self.trained_samples + len(training_samples)
+            self.publisher.commit_optimizer_checkpoint(
+                self.trainer,
+                train_update_id=update_id,
+                behavior_model=behavior_identity,
+                batch_ids=batch_ids,
+                stats=stats,
+                sample_count=len(training_samples),
+                train_updates=target_updates,
+                trained_samples=target_samples,
+            )
+            receipt.update(
+                {
+                    "state": "OPTIMIZER_COMMITTED",
+                    "target_model_version": self.trainer.model_version,
+                    "stats": stats,
+                    "train_updates": target_updates,
+                    "trained_samples": target_samples,
+                }
+            )
+            self._write_receipt(update_id, receipt)
+            manifest = self.publisher.publish_runtime(
+                self.trainer,
+                train_update_id=update_id,
+                behavior_model=behavior_identity,
+                batch_ids=batch_ids,
+                stats=stats,
+                sample_count=len(training_samples),
+                train_updates=target_updates,
+                trained_samples=target_samples,
+                checkpoint_precommitted=True,
+            )
+            self.model_manifests[self.trainer.model_version] = manifest
+            receipt.update(
+                {"state": "MODEL_COMMITTED", "model": manifest["identity"]}
+            )
+            self._write_receipt(update_id, receipt)
+            with self._metrics_lock:
+                self._register(manifest)
+                receipt["state"] = "REGISTERED"
+                self._write_receipt(update_id, receipt)
+                self._wait_model_loaded(manifest)
+                self._ack(
+                    response.delivery_id,
+                    training_pb2.ACK_DISPOSITION_TRAINED,
+                    update_id,
+                )
+                receipt["state"] = "ACKED"
+                self._write_receipt(update_id, receipt)
+                self._commit_learner_metrics(
+                    manifest,
+                    behavior_model=behavior_identity,
+                    actual_batch_size=len(training_samples),
+                    disposition="TRAINED",
+                    train_update_id=update_id,
+                    train_updates=target_updates,
+                    trained_samples=target_samples,
+                    stats=stats,
+                )
+            if self.publisher.should_archive(self.trainer.model_version):
+                self.publisher.archive_version(
+                    self.trainer.model_version, "interval"
+                )
+                self._last_archive_version = self.trainer.model_version
+            self.publisher.prune_runtime(self.trainer.model_version)
+            self._record_metrics()
+        except Exception:
+            if receipt.get("state") == "LEASED":
+                self._nack(response.delivery_id, "learner update failed")
+            raise
         finally:
             renewer.close()
 
-    def _record_metrics(
+    @staticmethod
+    def _metric_snapshot(snapshot: training_pb2.MetricSnapshot) -> tuple[dict, dict]:
+        descriptors = {item.field_id: item for item in snapshot.descriptors}
+        values: dict[str, float] = {}
+        labels: dict[str, str] = {}
+        for item in snapshot.values:
+            descriptor = descriptors.get(item.field_id)
+            if descriptor is None:
+                continue
+            value = float(item.value)
+            if not math.isfinite(value):
+                continue
+            values[item.field_id] = value
+            labels[item.field_id] = descriptor.label
+        return values, labels
+
+    @staticmethod
+    def _component_error_snapshot(component: str, error: str) -> dict:
+        return {
+            "component": component,
+            "ready": False,
+            "error": error,
+            "timestamp": time.time(),
+        }
+
+    def _actor_snapshot(self) -> dict:
+        try:
+            status = self.actor_stub.GetAIServerStatus(
+                training_pb2.AIServerStatusReq(), timeout=1.5
+            )
+            if not _same_message(status.contract, self.contract):
+                raise RuntimeError("AIServer contract identity mismatch")
+            values, labels = self._metric_snapshot(status.metrics)
+            reward_components: dict[str, float] = {}
+            prefix = "server.reward.component."
+            suffix = ".transition_mean.v1"
+            for field_id, value in values.items():
+                if field_id.startswith(prefix) and field_id.endswith(suffix):
+                    reward_components[field_id[len(prefix) : -len(suffix)]] = value
+            episode_return = values.get(
+                "server.episode.learning_return.mean.v1", 0.0
+            )
+            success_value = values.get(
+                "server.episode.success.agent_rate.v1", 0.0
+            )
+            if success_value > 1.0:
+                success_value /= 100.0
+            return {
+                "ready": bool(status.ready),
+                "state": training_pb2.AIServerState.Name(status.state),
+                "instance_id": status.aiserver.instance_id,
+                "lifecycle_epoch": int(status.aiserver.lifecycle_epoch),
+                "model_identity": model_identity_document(status.loaded_model),
+                "staged_model_identity": model_identity_document(
+                    status.staged_model
+                ),
+                "produced": int(status.produced_unique_samples),
+                "produced_batches": int(status.produced_unique_batches),
+                "accepted": int(status.accepted_unique_samples),
+                "push_attempts": int(status.push_attempt_count),
+                "duplicate_push_attempts": int(
+                    status.duplicate_push_attempt_count
+                ),
+                "rejected_push_attempts": int(
+                    status.rejected_push_attempt_count
+                ),
+                "retry_attempts": int(status.retry_attempt_count),
+                "final_drop": int(status.final_drop_unique_samples),
+                "outbound_pending": int(status.outbound_queue_samples),
+                "inference_count": int(status.inference_count),
+                "inference_mean_ms": (
+                    float(status.inference_latency_sum_ms)
+                    / max(1, int(status.inference_count))
+                ),
+                "inference_max_ms": float(status.inference_latency_max_ms),
+                "push_rpc_count": int(status.push_rpc_count),
+                "push_rpc_mean_ms": (
+                    float(status.push_rpc_latency_sum_ms)
+                    / max(1, int(status.push_rpc_count))
+                ),
+                "push_rpc_max_ms": float(status.push_rpc_latency_max_ms),
+                "metric_source": {
+                    "instance_id": status.metrics.source.instance_id,
+                    "lifecycle_epoch": int(
+                        status.metrics.source.lifecycle_epoch
+                    ),
+                    "sequence": int(status.metrics.sequence),
+                    "timestamp_unix_ms": int(
+                        status.metrics.timestamp_unix_ms
+                    ),
+                },
+                "metric_values": values,
+                "metric_labels": labels,
+                "episodes": {
+                    "mean_agent_return": episode_return,
+                    "min_agent_return": values.get(
+                        "server.episode.learning_return.min.v1",
+                        episode_return,
+                    ),
+                    "max_agent_return": values.get(
+                        "server.episode.learning_return.max.v1",
+                        episode_return,
+                    ),
+                    "agent_success_rate": success_value,
+                    "reward_components": reward_components,
+                },
+                "error": status.last_error,
+                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
+            }
+        except (grpc.RpcError, RuntimeError, ValueError) as error:
+            return self._component_error_snapshot("aiserver", str(error))
+
+    def _distributor_snapshot(self) -> dict:
+        try:
+            status = self._sample_pool_status()
+            if not _same_message(status.contract, self.contract):
+                raise RuntimeError("sample pool contract identity mismatch")
+            return {
+                "ready": bool(status.ready),
+                "ingress_ready": bool(status.ingress_ready),
+                "pool_ready": bool(status.pool_ready),
+                "instance_id": status.distributor.instance_id,
+                "lifecycle_epoch": int(status.distributor.lifecycle_epoch),
+                "accepted": int(status.accepted_unique_samples),
+                "accepted_batches": int(status.accepted_unique_batches),
+                "acked": int(status.acked_unique_samples),
+                "acked_batches": int(status.acked_unique_batches),
+                "trained": int(status.trained_sample_count),
+                "stale": int(status.stale_sample_count),
+                "invalid": int(status.invalid_sample_count),
+                "shutdown_untrained": int(
+                    status.shutdown_untrained_sample_count
+                ),
+                "ready_samples": int(status.ready_queue_samples),
+                "ready_fragments": int(status.ready_queue_fragments),
+                "leased_samples": int(status.leased_samples),
+                "leased_fragments": int(status.leased_fragments),
+                "resident_samples": int(status.resident_samples),
+                "resident_fragments": int(status.resident_fragments),
+                "redelivery_count": int(status.redelivery_count),
+                "nack_count": int(status.nack_count),
+                "expired_lease_count": int(status.expired_lease_count),
+                "last_error": status.last_error,
+                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
+            }
+        except (grpc.RpcError, RuntimeError) as error:
+            return self._component_error_snapshot("sample-pool", str(error))
+
+    def _model_snapshot(self) -> dict:
+        try:
+            status = self.model_stub.GetModelDistributorStatus(
+                training_pb2.ModelDistributorStatusReq(), timeout=1.5
+            )
+            if not _same_message(status.contract, self.contract):
+                raise RuntimeError("model distributor contract identity mismatch")
+            return {
+                "ready": bool(status.ready),
+                "instance_id": status.distributor.instance_id,
+                "lifecycle_epoch": int(status.distributor.lifecycle_epoch),
+                "registered_model_count": int(status.registered_model_count),
+                "latest_model_identity": model_identity_document(
+                    status.latest_model
+                ),
+                "latest_ack_model_identity": model_identity_document(
+                    status.latest_ack_model
+                ),
+                "latest_ack_status": training_pb2.ModelLoadStatus.Name(
+                    status.latest_ack_status
+                ),
+                "latest_ack_aiserver": status.latest_ack_aiserver.instance_id,
+                "last_error": status.last_error,
+                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
+            }
+        except (grpc.RpcError, RuntimeError) as error:
+            return self._component_error_snapshot(
+                "model-distributor", str(error)
+            )
+
+    def _resource_snapshot(self) -> dict:
+        now = time.monotonic()
+        process_cpu = time.process_time()
+        elapsed = max(now - self._last_resource_time, 1e-6)
+        cpu = max(0.0, (process_cpu - self._last_process_cpu) / elapsed * 100.0)
+        self._last_resource_time = now
+        self._last_process_cpu = process_cpu
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_mb = float(usage.ru_maxrss) / 1024.0
+        if sys.platform == "darwin":
+            rss_mb /= 1024.0
+        return {"cpu_percent": cpu, "memory_mb": rss_mb}
+
+    def _rates(self, actor: dict, distributor: dict, timestamp: float) -> dict:
+        counters = {
+            "produced": float(actor.get("produced", 0)),
+            "accepted": float(distributor.get("accepted", 0)),
+            "acked": float(distributor.get("acked", 0)),
+            "trained": float(distributor.get("trained", 0)),
+            "timestamp": timestamp,
+        }
+        previous = self._rate_snapshot
+        self._rate_snapshot = counters
+        elapsed = timestamp - float(previous.get("timestamp", timestamp))
+        if elapsed <= 0:
+            return {
+                "produced_sps": 0.0,
+                "accepted_sps": 0.0,
+                "acked_sps": 0.0,
+                "trained_sps": 0.0,
+            }
+        return {
+            f"{name}_sps": max(
+                0.0, (counters[name] - float(previous.get(name, counters[name]))) / elapsed
+            )
+            for name in ("produced", "accepted", "acked", "trained")
+        }
+
+    def _commit_learner_metrics(
         self,
+        manifest: dict,
         *,
-        behavior_version: int,
+        behavior_model: dict,
         actual_batch_size: int,
-        stats: dict,
         disposition: str,
         train_update_id: str,
-        error: str,
+        train_updates: int,
+        trained_samples: int,
+        stats: dict,
     ) -> None:
+        identity = dict(manifest["identity"])
+        committed = {
+            "model_identity": identity,
+            "model_version": int(identity["model_version"]),
+            "model_step": int(train_updates),
+            "run_train_updates": int(train_updates),
+            "run_trained_samples": int(trained_samples),
+            "policy_lag": int(stats.get("policy_lag", 0)),
+            "max_policy_lag": self.trainer.max_policy_lag,
+            **dict(stats),
+        }
         with self._metrics_lock:
-            if stats:
-                self.last_stats = stats
+            self.train_updates = int(train_updates)
+            self.trained_samples = int(trained_samples)
+            self.last_stats = dict(stats)
+            self._committed_learner_metrics = committed
             self._metrics_context = {
-                "behavior_model_version": behavior_version,
-                "actual_batch_size": actual_batch_size,
+                "behavior_model": dict(behavior_model),
+                "actual_batch_size": int(actual_batch_size),
                 "disposition": disposition,
                 "train_update_id": train_update_id,
-                "error": error,
+                "error": "",
             }
-            self.sequence += 1
-            timestamp = time.time()
-            monotonic_now = time.monotonic()
-            try:
-                distributor_status = self._sample_status()
-                distributor = {
-                    "service_name": "LocalSampleService",
-                    "ready": distributor_status.ready,
-                    "ingress_ready": distributor_status.ingress_ready,
-                    "pool_ready": distributor_status.pool_ready,
-                    "backend_type": maze_pb2.SampleBackendType.Name(
-                        distributor_status.backend_type
-                    ),
-                    "max_concurrent_consumers": (
-                        distributor_status.max_concurrent_consumers
-                    ),
-                    "active_consumer_count": (
-                        distributor_status.active_consumer_count
-                    ),
-                    "consumer_busy_count": (
-                        distributor_status.consumer_busy_count
-                    ),
-                    "instance_id": (
-                        distributor_status.distributor_instance_id
-                    ),
-                    "push_attempts": (
-                        distributor_status.push_attempt_count
-                    ),
-                    "accepted": (
-                        distributor_status.accepted_unique_samples
-                    ),
-                    "duplicates": (
-                        distributor_status.duplicate_sample_attempts
-                    ),
-                    "rejected": (
-                        distributor_status.rejected_sample_attempts
-                    ),
-                    "acked": distributor_status.acked_unique_samples,
-                    "ready_samples": (
-                        distributor_status.ready_queue_samples
-                    ),
-                    "leased_samples": distributor_status.leased_samples,
-                    "resident_samples": distributor_status.resident_samples,
-                    "trained": distributor_status.trained_sample_count,
-                    "stale": distributor_status.stale_sample_count,
-                    "invalid": distributor_status.invalid_sample_count,
-                    "shutdown_untrained": (
-                        distributor_status.shutdown_untrained_sample_count
-                    ),
-                    "redelivered": distributor_status.redelivery_count,
-                    "lease_renewals": distributor_status.lease_renew_count,
-                    "pressure": maze_pb2.PressureState.Name(
-                        distributor_status.pressure_state
-                    ),
-                }
-                self._last_distributor_snapshot = distributor
-            except grpc.RpcError as exc:
-                distributor = self._component_error_snapshot(
-                    self._last_distributor_snapshot,
-                    exc.details() or str(exc),
-                )
-            try:
-                actor_status = self.aiserver_stub.GetAIServerStatus(
-                    maze_pb2.AIServerStatusReq(),
-                    timeout=0.75,
-                )
-                episodes = actor_status.episode_metrics
-                actor = {
-                    "ready": actor_status.ready,
-                    "instance_id": actor_status.producer_instance_id,
-                    "state": maze_pb2.AIServerState.Name(
-                        actor_status.state
-                    ),
-                    "workload_mode": maze_pb2.WorkloadMode.Name(
-                        actor_status.workload_mode
-                    ),
-                    "produced": actor_status.produced_unique_samples,
-                    "accepted": actor_status.accepted_unique_samples,
-                    "outbound_pending": (
-                        actor_status.outbound_queue_samples
-                    ),
-                    "final_drop": (
-                        actor_status.final_drop_unique_samples
-                    ),
-                    "model_version": actor_status.loaded_model_version,
-                    "model_checksum": actor_status.loaded_model_checksum,
-                    "staged_model_version": (
-                        actor_status.staged_model_version
-                    ),
-                    "model_switches": actor_status.model_switch_count,
-                    "quarantined_samples": (
-                        actor_status.quarantined_sample_count
-                    ),
-                    "update_rpc_mean_ms": (
-                        actor_status.update_rpc_latency_sum_ms
-                        / actor_status.update_rpc_count
-                        if actor_status.update_rpc_count
-                        else 0.0
-                    ),
-                    "update_rpc_max_ms": (
-                        actor_status.update_rpc_latency_max_ms
-                    ),
-                    "inference_mean_ms": (
-                        actor_status.inference_latency_sum_ms
-                        / actor_status.inference_count
-                        if actor_status.inference_count
-                        else 0.0
-                    ),
-                    "inference_max_ms": (
-                        actor_status.inference_latency_max_ms
-                    ),
-                    "push_rpc_mean_ms": (
-                        actor_status.push_rpc_latency_sum_ms
-                        / actor_status.push_rpc_count
-                        if actor_status.push_rpc_count
-                        else 0.0
-                    ),
-                    "episodes": {
-                        "window_size": episodes.configured_window_size,
-                        "completed": episodes.completed_episode_count,
-                        "agents": episodes.completed_agent_count,
-                        "mean_agent_return": episodes.mean_agent_return,
-                        "min_agent_return": episodes.min_agent_return,
-                        "max_agent_return": episodes.max_agent_return,
-                        "agent_success_count": (
-                            episodes.agent_success_count
-                        ),
-                        "agent_success_rate": episodes.agent_success_rate,
-                        "any_success_count": (
-                            episodes.environment_any_success_count
-                        ),
-                        "any_success_rate": (
-                            episodes.environment_any_success_rate
-                        ),
-                        "all_success_count": (
-                            episodes.environment_all_success_count
-                        ),
-                        "all_success_rate": (
-                            episodes.environment_all_success_rate
-                        ),
-                        "excluded": episodes.excluded_episode_count,
-                        "termination_reasons": {
-                            maze_pb2.TerminationReason.Name(item.reason): (
-                                item.count
-                            )
-                            for item in episodes.termination_counts
-                        },
-                        "reward_components": dict(
-                            episodes.reward_component_mean
-                        ),
-                    },
-                }
-                self._last_actor_snapshot = actor
-            except grpc.RpcError as exc:
-                actor = self._component_error_snapshot(
-                    self._last_actor_snapshot,
-                    exc.details() or str(exc),
-                    {"episodes": {}},
-                )
-            try:
-                model_status = self._model_status()
-                model = {
-                    "ready": model_status.ready,
-                    "latest_version": model_status.latest_model_version,
-                    "latest_checksum": model_status.latest_model_checksum,
-                    "latest_ack_version": (
-                        model_status.latest_ack_model_version
-                    ),
-                    "latest_ack_status": maze_pb2.ModelLoadStatus.Name(
-                        model_status.latest_ack_status
-                    ),
-                    "serving_retention_versions": (
-                        self.publisher.serving_retention_versions
-                    ),
-                    "last_archive_version": self._last_archive_version,
-                    "next_archive_version": (
-                        (
-                            self.trainer.model_version
-                            // self.publisher.archive_interval_updates
-                        )
-                        + 1
-                    )
-                    * self.publisher.archive_interval_updates,
-                }
-                self._last_model_snapshot = model
-            except grpc.RpcError as exc:
-                model = self._component_error_snapshot(
-                    self._last_model_snapshot,
-                    exc.details() or str(exc),
-                    {
-                        "last_archive_version": (
-                            self._last_archive_version
-                        )
-                    },
-                )
 
-            interval = self._rate_interval(
-                monotonic_now, actor, distributor
+    def _learner_metrics_snapshot(self) -> dict:
+        with self._metrics_lock:
+            context = copy.deepcopy(self._metrics_context)
+            committed = copy.deepcopy(self._committed_learner_metrics)
+        return {
+            "instance_id": self.learner_service.instance_id,
+            "lifecycle_epoch": int(self.learner_service.lifecycle_epoch),
+            **committed,
+            "actual_batch_size": int(context.get("actual_batch_size", 0)),
+            "behavior_model": context.get("behavior_model", {}),
+            "disposition": context.get("disposition", ""),
+            "train_update_id": context.get("train_update_id", ""),
+        }
+
+    def _record_metrics(self) -> None:
+        with self._metrics_lock:
+            actor = self._actor_snapshot()
+            distributor = self._distributor_snapshot()
+            model = self._model_snapshot()
+            now = time.time()
+            context = copy.deepcopy(self._metrics_context)
+            learner = self._learner_metrics_snapshot()
+            chain = training_chain_status(
+                actor,
+                distributor,
+                learner,
+                model,
+                str(context.get("error", "")),
             )
-            resources = self._process_resources(monotonic_now)
-            learner = {
-                "train_updates": self.train_updates,
-                "trained_samples": self.trained_samples,
-                "actual_batch_size": actual_batch_size,
-                "behavior_model_version": behavior_version,
-                "model_version": self.trainer.model_version,
-                "model_lag": max(
-                    0,
-                    self.trainer.model_version
-                    - int(actor.get("model_version", 0)),
-                ),
-                "train_update_id": train_update_id,
-                "ack_disposition": disposition,
-                "startup_mode": self._startup_mode,
-                "resources": resources,
-                **self.last_stats,
-                "error": error,
-            }
+            self.sequence += 1
             record = {
                 "schema_version": 3,
                 "mode": "training",
                 "sequence": self.sequence,
-                "train_step": self.train_updates,
-                "timestamp": timestamp,
-                "timestamp_ms": int(timestamp * 1000),
-                "interval_ms": int(interval["seconds"] * 1000),
-                "rates": interval["rates"],
+                "timestamp": now,
+                "interval_ms": 1000,
+                "contract": contract_document(self.contract),
+                "training_semantics": semantics_document(self.semantics),
+                "learner": learner,
                 "actor": actor,
                 "distributor": distributor,
-                "learner": learner,
                 "model": model,
-                "chain": {
-                    "ready": bool(
-                        actor.get("ready")
-                        and distributor.get("ready")
-                        and model.get("ready")
-                        and not error
-                    ),
-                    "error": error,
-                },
-                "model_version": self.trainer.model_version,
-                "behavior_model_version": behavior_version,
-                "trained_samples": self.trained_samples,
-                "mean_episode_reward": actor.get("episodes", {}).get(
-                    "mean_agent_return", 0.0
-                ),
-                "pass_rate": actor.get("episodes", {}).get(
-                    "agent_success_rate", 0.0
-                ),
-                **self.last_stats,
+                "chain": chain,
+                "rates": self._rates(actor, distributor, now),
+                "resources": {"learner": self._resource_snapshot()},
             }
-            self.metrics.write(record)
-
-    @staticmethod
-    def _component_error_snapshot(
-        previous: dict, error: str, fallback: dict | None = None
-    ) -> dict:
-        snapshot = dict(fallback or {})
-        snapshot.update(previous)
-        snapshot["ready"] = False
-        snapshot["error"] = error
-        return snapshot
-
-    def _rate_interval(
-        self, monotonic_now: float, actor: dict, distributor: dict
-    ) -> dict:
-        current = {
-            "timestamp": monotonic_now,
-            "actor_instance": actor.get("instance_id", ""),
-            "distributor_instance": distributor.get("instance_id", ""),
-            "produced": int(actor.get("produced", 0)),
-            "accepted": int(distributor.get("accepted", 0)),
-            "acked": int(distributor.get("acked", 0)),
-            "trained": int(self.trained_samples),
-        }
-        previous = self._rate_snapshot
-        self._rate_snapshot = current
-        if not previous:
-            return {
-                "seconds": 1.0,
-                "rates": {
-                    "produced_sps": 0.0,
-                    "accepted_sps": 0.0,
-                    "acked_sps": 0.0,
-                    "trained_sps": 0.0,
-                },
-            }
-        seconds = max(
-            0.001, monotonic_now - float(previous["timestamp"])
-        )
-        actor_reset = (
-            current["actor_instance"] != previous["actor_instance"]
-        )
-        distributor_reset = (
-            current["distributor_instance"]
-            != previous["distributor_instance"]
-        )
-
-        def rate(name: str, reset: bool) -> float:
-            if reset or current[name] < previous[name]:
-                return 0.0
-            return (current[name] - previous[name]) / seconds
-
-        return {
-            "seconds": seconds,
-            "rates": {
-                "produced_sps": rate("produced", actor_reset),
-                "accepted_sps": rate("accepted", distributor_reset),
-                "acked_sps": rate("acked", distributor_reset),
-                "trained_sps": rate("trained", False),
-            },
-        }
-
-    def _process_resources(self, monotonic_now: float) -> dict:
-        process_cpu = time.process_time()
-        elapsed = max(0.001, monotonic_now - self._last_resource_time)
-        cpu_percent = max(
-            0.0,
-            (process_cpu - self._last_process_cpu) / elapsed * 100.0,
-        )
-        self._last_resource_time = monotonic_now
-        self._last_process_cpu = process_cpu
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss_multiplier = 1 if sys.platform == "darwin" else 1024
-        return {
-            "cpu_percent": cpu_percent,
-            "rss_bytes": int(usage.ru_maxrss * rss_multiplier),
-            "gpu_memory_bytes": None,
-        }
+            self.metrics_backend.write(record)
+            self._last_actor_snapshot = actor
+            self._last_distributor_snapshot = distributor
+            self._last_model_snapshot = model
 
     def _metrics_loop(self) -> None:
         while not self._metrics_stop.wait(1.0):
-            context = dict(self._metrics_context)
             try:
-                self._record_metrics(
-                    behavior_version=int(
-                        context["behavior_model_version"]
-                    ),
-                    actual_batch_size=int(context["actual_batch_size"]),
-                    stats=self.last_stats,
-                    disposition=str(context["disposition"]),
-                    train_update_id=str(context["train_update_id"]),
-                    error=str(context["error"]),
-                )
-            except Exception as exc:
-                self.logger.debug("周期指标采集失败: %s", exc)
+                self._record_metrics()
+            except Exception as error:
+                self.logger.error("metrics snapshot failed: %s", error)
 
-    def _drain_shutdown(self) -> None:
-        deadline = (
-            time.monotonic() + self.shutdown_drain_timeout_ms / 1000.0
+    def _start_metrics(self) -> None:
+        self._metrics_thread = threading.Thread(
+            target=self._metrics_loop,
+            name="learner-metrics",
+            daemon=True,
         )
+        self._metrics_thread.start()
+
+    def _stop_metrics(self) -> None:
+        self._metrics_stop.set()
+        if self._metrics_thread:
+            self._metrics_thread.join(timeout=3.0)
+
+    def _shutdown_drain(self) -> None:
+        deadline = time.monotonic() + self.shutdown_drain_timeout_ms / 1000.0
         while time.monotonic() < deadline:
             try:
-                status = self._sample_status()
+                status = self._sample_pool_status()
             except grpc.RpcError:
                 return
-            versions = [
-                item
-                for item in status.behavior_versions
-                if item.ready_samples > 0
-            ]
-            if not versions:
+            if status.ready_queue_samples == 0 and status.leased_samples == 0:
                 return
-            for version in versions:
-                response = self._get_batch(
-                    version.behavior_model_version,
-                    self.get_timeout_ms,
-                    maze_pb2.BATCH_SELECTION_POLICY_DRAIN_AVAILABLE,
+            behavior = self._select_behavior_document()
+            if behavior is None:
+                time.sleep(0.1)
+                continue
+            response = self._get_batch(behavior)
+            if response.result == training_pb2.GET_BATCH_RESULT_LEASED:
+                self._ack(
+                    response.delivery_id,
+                    training_pb2.ACK_DISPOSITION_SHUTDOWN_UNTRAINED,
                 )
-                if response.result == maze_pb2.GET_BATCH_RESULT_LEASED:
+            else:
+                time.sleep(0.1)
+
+    def run(self) -> int:
+        self._initialize_models()
+        self._start_metrics()
+        self._record_metrics()
+        try:
+            while not _stop_requested.is_set():
+                behavior = self._select_behavior_document()
+                if behavior is None:
+                    time.sleep(0.1)
+                    continue
+                response = self._get_batch(behavior)
+                if response.result == training_pb2.GET_BATCH_RESULT_TIMEOUT:
+                    continue
+                if response.result != training_pb2.GET_BATCH_RESULT_LEASED:
+                    raise RuntimeError(
+                        f"sample GetBatch failed: {response.message}"
+                    )
+                try:
+                    self._train_delivery(response, behavior)
+                except ValueError as error:
                     self._ack(
                         response.delivery_id,
-                        maze_pb2.ACK_DISPOSITION_SHUTDOWN_UNTRAINED,
+                        training_pb2.ACK_DISPOSITION_INVALID,
                     )
-                elif response.result != maze_pb2.GET_BATCH_RESULT_TIMEOUT:
-                    return
-
-    def run(self) -> None:
-        sample_distributor_connected = False
-        sample_distributor_waiting = False
-        initialized = False
-        try:
-            self._initialize_models()
-            initialized = True
-            self._metrics_thread = threading.Thread(
-                target=self._metrics_loop,
-                name="learner-metrics",
-                daemon=True,
-            )
-            self._metrics_thread.start()
-            self._record_metrics(
-                behavior_version=-1,
-                actual_batch_size=0,
-                stats={},
-                disposition="READY",
-                train_update_id="",
-                error="",
-            )
-            self.logger.info(
-                "Learner training 就绪: model=v%d batch=%d startup=%s",
-                self.trainer.model_version,
-                self.train_batch_size,
-                self._startup_mode,
-            )
-            while not _stop_requested.is_set():
-                try:
-                    self._drain_stale()
-                    self._reconcile_receipts()
-                    delivery = self._select_batch()
-                except grpc.RpcError as exc:
-                    if not sample_distributor_waiting:
-                        log_wait = (
-                            self.logger.warning
-                            if sample_distributor_connected
-                            else self.logger.info
-                        )
-                        log_wait(
-                            "等待 LocalSampleService: %s",
-                            exc.details() or str(exc),
-                        )
-                        sample_distributor_waiting = True
-                    _stop_requested.wait(0.5)
-                    continue
-                if sample_distributor_waiting:
-                    self.logger.info(
-                        "LocalSampleService 连接%s",
-                        "已恢复"
-                        if sample_distributor_connected
-                        else "已建立",
-                    )
-                sample_distributor_connected = True
-                sample_distributor_waiting = False
-                if delivery is None:
-                    continue
-                self._process_delivery(delivery)
+                    raise RuntimeError(str(error)) from error
+            with self._metrics_lock:
+                self._metrics_context["disposition"] = "STOPPING"
+            self._shutdown_drain()
+            if (
+                self.publisher.archive_on_graceful_shutdown
+                and self._last_archive_version != self.trainer.model_version
+            ):
+                self.publisher.archive_version(
+                    self.trainer.model_version, "graceful-shutdown"
+                )
+            self._record_metrics()
+            return 0
+        except Exception as error:
+            with self._metrics_lock:
+                self._metrics_context["error"] = str(error)
+                self._metrics_context["disposition"] = "FAILED"
+            self.logger.exception("Learner training failed")
+            try:
+                self._record_metrics()
+            except Exception:
+                pass
+            return 1
         finally:
-            self._metrics_stop.set()
-            if self._metrics_thread is not None:
-                self._metrics_thread.join(timeout=5.0)
-            if _stop_requested.is_set():
-                self._drain_shutdown()
-                if (
-                    initialized
-                    and self.publisher.archive_on_graceful_shutdown
-                ):
-                    self.publisher.archive_version(
-                        self.trainer.model_version, "graceful-shutdown"
-                    )
-                    self._last_archive_version = (
-                        self.trainer.model_version
-                    )
-                    self._record_metrics(
-                        behavior_version=self.trainer.model_version,
-                        actual_batch_size=0,
-                        stats=self.last_stats,
-                        disposition="STOPPED",
-                        train_update_id="",
-                        error="",
-                    )
-            self.metrics.close()
-            self.sample_channel.close()
+            self._stop_metrics()
+            self.metrics_backend.close()
+            self.actor_channel.close()
             self.model_channel.close()
-            self.aiserver_channel.close()
+            self.sample_channel.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run PPO training")
-    parser.add_argument("--config", default="configs/learner_config.yaml")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--initial-checkpoint",
-        default=os.environ.get("MAZE_INITIAL_CHECKPOINT", ""),
+        "--config", default="configs/learner_config.yaml"
     )
-    args = parser.parse_args()
-    _stop_requested.clear()
+    parser.add_argument("--initial-checkpoint", default="")
+    arguments = parser.parse_args()
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-    runtime = TrainingRuntime(
-        load_config(args.config),
-        initial_checkpoint=args.initial_checkpoint,
-    )
-    runtime.run()
-    return 0
+    config = load_config(arguments.config)
+    runtime = TrainingRuntime(config, arguments.initial_checkpoint)
+    return runtime.run()
 
 
 if __name__ == "__main__":

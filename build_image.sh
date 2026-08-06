@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-LEARNER_IMAGE_TAG="${LEARNER_IMAGE_TAG:-training-001}"
+LEARNER_IMAGE_TAG="${RL_LEARNER_IMAGE_TAG:-training-001}"
 
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
@@ -15,18 +15,18 @@ platform_dir="${platform//\//-}"
 contract_dir="${contract_root}/${RL_CONTRACTS_VERSION}/${platform_dir}"
 sample_pool_dir="${repo_dir}/sample-pool"
 model_distributor_dir="${repo_dir}/model-distributor"
-if ! test -f "${contract_dir}/python/maze_pb2.py"; then
+if ! test -f "${contract_dir}/python/training_pb2.py"; then
     echo "rl-contracts artifact is missing; run: (cd ../rl-contracts && bash build_artifact.sh)" >&2
     exit 1
 fi
 if ! test -x "${sample_pool_dir}/bin/maze_sample_distributor"; then
-    echo "Staged LocalSampleService artifact is missing: ${sample_pool_dir}" >&2
+    echo "Staged Sample Pool artifact is missing: ${sample_pool_dir}" >&2
     echo "Build it in rl-sample-pool, then copy the selected version here explicitly:" >&2
     echo "  cp -R ../.workspace/artifacts/rl-sample-pool/${RL_SAMPLE_POOL_VERSION}/${platform_dir}/. sample-pool/" >&2
     exit 1
 fi
 if ! test -x "${model_distributor_dir}/bin/maze_model_distributor"; then
-    echo "Staged ModelDistributor artifact is missing: ${model_distributor_dir}" >&2
+    echo "Staged Model Distributor artifact is missing: ${model_distributor_dir}" >&2
     echo "Build it in rl-model-distributor, then copy the selected version here explicitly:" >&2
     echo "  cp -R ../.workspace/artifacts/rl-model-distributor/${RL_MODEL_DISTRIBUTOR_VERSION}/${platform_dir}/. model-distributor/" >&2
     exit 1
@@ -76,15 +76,23 @@ if distributor.get("package") != "rl-model-distributor" or distributor.get("vers
 if distributor.get("platform") != sys.argv[7]:
     raise SystemExit("ModelDistributor artifact platform is invalid")
 verify_files(distributor_path.parent, distributor)
-expected = (contract["version"], contract["source_id"], contract["source_sha256"])
+expected = (
+    contract["version"],
+    contract["source_digest"]["hex"],
+    contract["artifact_digest"]["hex"],
+    contract["generator_identity"],
+    contract["platform"],
+)
 for name, manifest in (
-    ("LocalSampleService", sample_pool),
-    ("ModelDistributor", distributor),
+    ("Sample Pool", sample_pool),
+    ("Model Distributor", distributor),
 ):
     actual = (
         manifest["contract"]["version"],
-        manifest["contract"]["source_id"],
-        manifest["contract"]["source_sha256"],
+        manifest["contract"]["source_digest"]["hex"],
+        manifest["contract"]["artifact_digest"]["hex"],
+        manifest["contract"]["generator_identity"],
+        manifest["contract"]["platform"],
     )
     if actual != expected:
         raise SystemExit(
@@ -129,6 +137,6 @@ cp "${model_distributor_dir}/manifest.json" \
     "${context_dir}/_deps/identity/model-distributor.json"
 
 docker build --tag "${image_ref}" "${context_dir}"
-LEARNER_IMAGE_REF="${image_ref}" \
+RL_LEARNER_IMAGE_REF="${image_ref}" \
     bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
 printf '%s\n' "${image_ref}"
