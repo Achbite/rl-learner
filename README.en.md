@@ -25,11 +25,13 @@ read-only metrics service.
 (cd ../rl-contracts && bash build_artifact.sh)
 (cd ../rl-sample-pool && bash build_artifact.sh)
 (cd ../rl-model-distributor && bash build_artifact.sh)
-cp -R ../.workspace/artifacts/rl-sample-pool/0.8.0/linux-arm64/. \
-  sample-pool/
-cp -R ../.workspace/artifacts/rl-model-distributor/0.8.0/linux-arm64/. \
-  model-distributor/
+bash scripts/sync_runtime_artifacts.sh
 ```
+
+`artifact_versions.env` pins the Contracts, Sample Pool, Model Distributor,
+and target platform. The sync command verifies the versions, platform, clean
+savepoints, Contracts identity, and every file checksum before and after
+copying. It never resolves `latest` or rewrites the workspace artifact store.
 
 Build the runtime image:
 

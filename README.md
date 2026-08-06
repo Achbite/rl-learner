@@ -24,11 +24,12 @@ Sample Pool、Model Distributor、Training Runtime 和只读指标服务。
 (cd ../rl-contracts && bash build_artifact.sh)
 (cd ../rl-sample-pool && bash build_artifact.sh)
 (cd ../rl-model-distributor && bash build_artifact.sh)
-cp -R ../.workspace/artifacts/rl-sample-pool/0.8.0/linux-arm64/. \
-  sample-pool/
-cp -R ../.workspace/artifacts/rl-model-distributor/0.8.0/linux-arm64/. \
-  model-distributor/
+bash scripts/sync_runtime_artifacts.sh
 ```
+
+`artifact_versions.env` 固定选择 Contracts、Sample Pool、Model Distributor 及目标平台。
+同步入口会在复制前后校验版本、平台、clean savepoint、Contracts 身份和全部文件的
+SHA-256；不读取 `latest`，也不会改写工作区 artifact store。
 
 构建运行镜像：
 
