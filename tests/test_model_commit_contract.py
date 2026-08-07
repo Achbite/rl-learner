@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import yaml
@@ -88,6 +89,27 @@ class ModelCommitContractTest(unittest.TestCase):
         )
         self.assertNotIn("map_id", document)
         self.assertNotIn("reward", document)
+
+    def test_archive_interval_uses_only_canonical_runtime_override(self):
+        document = config(Path("/tmp/learner-archive-override"), 200)
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "RL_ARCHIVE_INTERVAL_UPDATES": "2",
+                "MAZE_ARCHIVE_INTERVAL_UPDATES": "1",
+            },
+            clear=False,
+        ):
+            publisher = ModelPublisher(document)
+        self.assertEqual(publisher.archive_interval_updates, 2)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"MAZE_ARCHIVE_INTERVAL_UPDATES": "1"},
+            clear=True,
+        ):
+            publisher = ModelPublisher(document)
+        self.assertEqual(publisher.archive_interval_updates, 200)
 
     def test_training_identity_digests_are_canonical(self):
         document = yaml.safe_load(

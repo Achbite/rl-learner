@@ -187,7 +187,12 @@ class ModelPublisher:
         self.state_path = self.runtime_dir / "state.json"
         self.archive_dir = self.local_train_root / "archive"
         self.metrics_dir = self.local_train_root / "metrics"
-        self.archive_interval_updates = int(model["archive_interval_updates"])
+        self.archive_interval_updates = int(
+            os.environ.get(
+                "RL_ARCHIVE_INTERVAL_UPDATES",
+                str(model["archive_interval_updates"]),
+            )
+        )
         self.archive_on_graceful_shutdown = bool(
             model["archive_on_graceful_shutdown"]
         )
