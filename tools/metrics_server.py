@@ -336,6 +336,12 @@ _STATIC_METRIC_DEFINITIONS = (
         ("distributor", "stale"),
     ),
     _metric_definition(
+        "sample.flow.producer_stale_before_ingress.total.v1",
+        "Producer Stale Before Ingress", "sample_flow", "sample_count",
+        "samples", "server", "total", "counter",
+        ("actor", "producer_stale_before_ingress"),
+    ),
+    _metric_definition(
         "sample.flow.shutdown_untrained.total.v1", "Shutdown Untrained",
         "sample_flow", "sample_count", "samples", "sample_chain", "total",
         "counter", ("distributor", "shutdown_untrained"),

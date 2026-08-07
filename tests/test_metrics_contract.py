@@ -164,6 +164,7 @@ class MetricsContractTest(unittest.TestCase):
                 },
                 "actor": {
                     "produced": 100,
+                    "producer_stale_before_ingress": 8,
                     "push_rpc_mean_ms": 1.25,
                     "metric_values": {
                         "server.environment_step.v1": 37.0,
@@ -286,6 +287,12 @@ class MetricsContractTest(unittest.TestCase):
             self.assertEqual(
                 values["server.latency.sample_send.mean_ms.v1"], 1.25
             )
+            self.assertEqual(
+                values[
+                    "sample.flow.producer_stale_before_ingress.total.v1"
+                ],
+                8,
+            )
             self.assertEqual(values["server.environment_step.v1"], 37.0)
             self.assertEqual(
                 values["server.task.curriculum.multiplier.v1"], 8.0
@@ -382,6 +389,10 @@ class MetricsContractTest(unittest.TestCase):
         self.assertIn("learner.value.prediction_mean.v1", document)
         self.assertIn("learner.value.return_target_mean.v1", document)
         self.assertIn("learner.value.explained_variance.v1", document)
+        self.assertIn(
+            "sample.flow.producer_stale_before_ingress.total.v1",
+            document,
+        )
         self.assertNotIn("potential_reward", document)
         self.assertNotIn("loiter_penalty", document)
         self.assertNotIn("rank_reward", document)

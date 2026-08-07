@@ -1460,6 +1460,9 @@ class TrainingRuntime:
                     status.rejected_push_attempt_count
                 ),
                 "retry_attempts": int(status.retry_attempt_count),
+                "producer_stale_before_ingress": int(
+                    status.producer_stale_count
+                ),
                 "final_drop": int(status.final_drop_unique_samples),
                 "outbound_pending": int(status.outbound_queue_samples),
                 "inference_count": int(status.inference_count),
