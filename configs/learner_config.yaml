@@ -74,6 +74,9 @@ sample_distributor:
   max_sample_age_ms: 120000        # freshness bound at Pool and Learner
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
+  finalize_drain_timeout_ms: 30000  # bounded Run tail is trained only after an explicit finalize request
+  finalize_request_path: /tmp/rl-training-finalize
+  finalize_complete_path: /tmp/rl-training-finalized
   shutdown_drain_timeout_ms: 20000
   demand_ttl_ms: 10000              # short-lived Consumer Demand lease
   demand_refresh_interval_ms: 3000  # refresh well before TTL expiry

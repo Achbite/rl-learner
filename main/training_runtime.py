@@ -697,6 +697,8 @@ class TrainingRuntime:
         self.sequence = 0
         self.train_updates = 0
         self.trained_samples = 0
+        self._run_start_train_updates = 0
+        self._run_start_trained_samples = 0
         self.initial_model_version = 0
         self.last_stats: dict = {}
         self.model_manifests: dict[int, dict] = {}
@@ -742,6 +744,8 @@ class TrainingRuntime:
             )
             self.train_updates = int(restored["train_updates"])
             self.trained_samples = int(restored["trained_samples"])
+        self._run_start_train_updates = self.train_updates
+        self._run_start_trained_samples = self.trained_samples
 
         sample = config["sample_distributor"]
         sample_host = os.environ.get(
@@ -755,6 +759,24 @@ class TrainingRuntime:
         self.max_sample_age_ms = int(sample["max_sample_age_ms"])
         self.get_timeout_ms = int(sample["get_timeout_ms"])
         self.lease_timeout_ms = int(sample["lease_timeout_ms"])
+        self.finalize_drain_timeout_ms = int(
+            sample["finalize_drain_timeout_ms"]
+        )
+        self.finalize_request_path = Path(
+            os.environ.get(
+                "RL_TRAINING_FINALIZE_REQUEST_PATH",
+                str(sample["finalize_request_path"]),
+            )
+        )
+        self.finalize_complete_path = Path(
+            os.environ.get(
+                "RL_TRAINING_FINALIZE_COMPLETE_PATH",
+                str(sample["finalize_complete_path"]),
+            )
+        )
+        self.finalize_request_path.unlink(missing_ok=True)
+        self.finalize_complete_path.unlink(missing_ok=True)
+        self._finalized = False
         self.shutdown_drain_timeout_ms = int(
             sample["shutdown_drain_timeout_ms"]
         )
@@ -1082,10 +1104,13 @@ class TrainingRuntime:
         if sample.end_kind != expected:
             raise ValueError("sample end_kind conflicts with terminal flags")
 
-    def _validate_delivery(self, response) -> dict:
+    def _validate_delivery(
+        self, response, *, allow_partial: bool = False
+    ) -> dict:
+        minimum_samples = 1 if allow_partial else self.train_batch_size
         if (
             response.result != training_pb2.GET_BATCH_RESULT_LEASED
-            or response.actual_batch_size < self.train_batch_size
+            or response.actual_batch_size < minimum_samples
             or response.actual_batch_size > self.max_train_batch_size
             or response.returned_samples != response.actual_batch_size
             or response.returned_fragments != len(response.batches)
@@ -1267,8 +1292,10 @@ class TrainingRuntime:
     def _write_receipt(self, update_id: str, document: dict) -> None:
         atomic_write_json(self.publisher.receipt_path(update_id), document)
 
-    def _train_delivery(self, response) -> None:
-        behavior_identity = self._validate_delivery(response)
+    def _train_delivery(self, response, *, allow_partial: bool = False) -> None:
+        behavior_identity = self._validate_delivery(
+            response, allow_partial=allow_partial
+        )
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
         batch_ids = [batch.batch_id for batch in response.batches]
@@ -1627,8 +1654,14 @@ class TrainingRuntime:
             "model_identity": identity,
             "model_version": int(identity["model_version"]),
             "model_step": int(train_updates),
-            "run_train_updates": int(train_updates),
-            "run_trained_samples": int(trained_samples),
+            "train_updates": int(train_updates),
+            "trained_samples": int(trained_samples),
+            "run_train_updates": int(
+                train_updates - self._run_start_train_updates
+            ),
+            "run_trained_samples": int(
+                trained_samples - self._run_start_trained_samples
+            ),
             "policy_lag": int(stats.get("policy_lag", 0)),
             "max_policy_lag": self.trainer.max_policy_lag,
             **dict(stats),
@@ -1654,6 +1687,9 @@ class TrainingRuntime:
             "instance_id": self.learner_service.instance_id,
             "lifecycle_epoch": int(self.learner_service.lifecycle_epoch),
             **committed,
+            "initial_model_version": int(self.initial_model_version),
+            "train_batch_size": int(self.train_batch_size),
+            "max_train_batch_size": int(self.max_train_batch_size),
             "actual_batch_size": int(context.get("actual_batch_size", 0)),
             "behavior_model": context.get("behavior_model", {}),
             "disposition": context.get("disposition", ""),
@@ -1737,6 +1773,43 @@ class TrainingRuntime:
             else:
                 time.sleep(0.1)
 
+    def _finalize_training(self) -> None:
+        deadline = (
+            time.monotonic() + self.finalize_drain_timeout_ms / 1000.0
+        )
+        while time.monotonic() < deadline:
+            status = self._sample_pool_status()
+            if (
+                status.ready_queue_samples == 0
+                and status.leased_samples == 0
+                and status.reserved_samples == 0
+            ):
+                self._release_demand(required=True)
+                with self._metrics_lock:
+                    self._metrics_context["disposition"] = "FINALIZED"
+                self._record_metrics()
+                self.finalize_complete_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                self.finalize_complete_path.write_text(
+                    f"{self.train_updates} {self.trained_samples}\n",
+                    encoding="utf-8",
+                )
+                self._finalized = True
+                return
+            response = self._get_batch(
+                training_pb2.BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE
+            )
+            if response.result == training_pb2.GET_BATCH_RESULT_LEASED:
+                self._train_delivery(response, allow_partial=True)
+                continue
+            if response.result != training_pb2.GET_BATCH_RESULT_TIMEOUT:
+                raise RuntimeError(
+                    f"final sample drain failed: {response.message}"
+                )
+            time.sleep(0.1)
+        raise RuntimeError("final sample drain timed out")
+
     def run(self) -> int:
         self._initialize_models()
         self._upsert_demand(force=True)
@@ -1744,6 +1817,11 @@ class TrainingRuntime:
         self._record_metrics()
         try:
             while not _stop_requested.is_set():
+                if self.finalize_request_path.is_file():
+                    self._finalize_training()
+                    while not _stop_requested.wait(0.2):
+                        pass
+                    break
                 self._upsert_demand()
                 self._assert_sample_pool_ready()
                 response = self._get_batch()

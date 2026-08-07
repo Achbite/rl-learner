@@ -135,6 +135,23 @@ def delivery(runtime):
     )
 
 
+def partial_delivery(runtime):
+    batches = [_batch(runtime, 0, 1, 248), _batch(runtime, 1, 249, 248)]
+    created = [batch.created_at_unix_ms for batch in batches]
+    return training_pb2.GetBatchRsp(
+        result=training_pb2.GET_BATCH_RESULT_LEASED,
+        delivery_id="delivery-final",
+        returned_samples=496,
+        actual_batch_size=496,
+        returned_fragments=2,
+        minimum_behavior_model_version=0,
+        maximum_behavior_model_version=1,
+        oldest_sample_created_at_unix_ms=min(created),
+        newest_sample_created_at_unix_ms=max(created),
+        batches=batches,
+    )
+
+
 class DeliveryContractTest(unittest.TestCase):
     def runtime(self):
         cfg = config()
@@ -157,6 +174,15 @@ class DeliveryContractTest(unittest.TestCase):
     def test_bounded_multi_version_delivery_passes(self):
         runtime = self.runtime()
         summary = runtime._validate_delivery(delivery(runtime))
+        self.assertEqual(summary["minimum_model_version"], 0)
+        self.assertEqual(summary["maximum_model_version"], 1)
+
+    def test_partial_delivery_is_accepted_only_for_explicit_final_drain(self):
+        runtime = self.runtime()
+        response = partial_delivery(runtime)
+        with self.assertRaisesRegex(ValueError, "bounded batch assembly"):
+            runtime._validate_delivery(response)
+        summary = runtime._validate_delivery(response, allow_partial=True)
         self.assertEqual(summary["minimum_model_version"], 0)
         self.assertEqual(summary["maximum_model_version"], 1)
 

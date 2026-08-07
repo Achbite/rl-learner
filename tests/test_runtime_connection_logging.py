@@ -1,4 +1,6 @@
 import inspect
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,6 +164,57 @@ class RuntimeSelectionTest(unittest.TestCase):
         runtime._release_demand(required=False)
         self.assertFalse(runtime._demand_active)
         self.assertEqual(stub.releases[-1].demand_epoch, 4)
+
+    def test_explicit_finalize_trains_available_tail_before_completion(self):
+        runtime = TrainingRuntime.__new__(TrainingRuntime)
+        runtime.finalize_drain_timeout_ms = 1000
+        runtime.train_updates = 6
+        runtime.trained_samples = 3072
+        runtime._metrics_lock = threading.RLock()
+        runtime._metrics_context = {"disposition": "TRAINED"}
+        runtime._finalized = False
+        statuses = iter(
+            (
+                training_pb2.DistributorStatusRsp(
+                    ready_queue_samples=496,
+                ),
+                training_pb2.DistributorStatusRsp(),
+            )
+        )
+        runtime._sample_pool_status = lambda: next(statuses)
+        modes = []
+        delivery = training_pb2.GetBatchRsp(
+            result=training_pb2.GET_BATCH_RESULT_LEASED,
+            delivery_id="tail-delivery",
+        )
+        runtime._get_batch = lambda mode: modes.append(mode) or delivery
+        trained = []
+        runtime._train_delivery = lambda response, allow_partial=False: (
+            trained.append((response.delivery_id, allow_partial))
+        )
+        released = []
+        runtime._release_demand = lambda required: released.append(required)
+        recorded = []
+        runtime._record_metrics = lambda: recorded.append(True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime.finalize_complete_path = (
+                Path(directory) / "training-finalized"
+            )
+            runtime._finalize_training()
+            self.assertEqual(
+                runtime.finalize_complete_path.read_text(encoding="utf-8"),
+                "6 3072\n",
+            )
+
+        self.assertEqual(
+            modes, [training_pb2.BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE]
+        )
+        self.assertEqual(trained, [("tail-delivery", True)])
+        self.assertEqual(released, [True])
+        self.assertEqual(recorded, [True])
+        self.assertEqual(runtime._metrics_context["disposition"], "FINALIZED")
+        self.assertTrue(runtime._finalized)
 
 
 if __name__ == "__main__":

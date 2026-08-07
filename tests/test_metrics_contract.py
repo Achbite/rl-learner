@@ -450,6 +450,9 @@ class MetricsContractTest(unittest.TestCase):
             lifecycle_epoch=1,
         )
         runtime.trainer = SimpleNamespace(model_version=3)
+        runtime.initial_model_version = 0
+        runtime.train_batch_size = 512
+        runtime.max_train_batch_size = 639
         runtime.model_manifests = {}
 
         snapshot = runtime._learner_metrics_snapshot()
@@ -458,6 +461,8 @@ class MetricsContractTest(unittest.TestCase):
         self.assertEqual(snapshot["model_step"], 2)
         self.assertEqual(snapshot["model_identity"]["model_version"], 2)
         self.assertEqual(snapshot["run_trained_samples"], 1024)
+        self.assertEqual(snapshot["initial_model_version"], 0)
+        self.assertEqual(snapshot["max_train_batch_size"], 639)
 
     def test_metrics_reader_exposes_schema_three_summary_and_stale(self):
         with tempfile.TemporaryDirectory() as directory:

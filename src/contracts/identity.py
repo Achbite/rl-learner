@@ -298,6 +298,16 @@ def validate_config(config: dict) -> None:
         or int(config["sample_distributor"]["max_train_batch_size"])
         < int(config["sample_distributor"]["train_batch_size"])
         or int(config["sample_distributor"]["max_sample_age_ms"]) <= 0
+        or int(config["sample_distributor"]["finalize_drain_timeout_ms"])
+        <= 0
+        or not str(
+            config["sample_distributor"]["finalize_request_path"]
+        ).startswith("/")
+        or not str(
+            config["sample_distributor"]["finalize_complete_path"]
+        ).startswith("/")
+        or config["sample_distributor"]["finalize_request_path"]
+        == config["sample_distributor"]["finalize_complete_path"]
         or int(config["sample_distributor"]["demand_ttl_ms"]) <= 0
         or int(config["sample_distributor"]["demand_refresh_interval_ms"])
         <= 0
