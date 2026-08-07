@@ -14,34 +14,33 @@ def tcp_ready(port: int) -> bool:
         return False
 
 
+def metrics_service_ready(status: dict) -> bool:
+    try:
+        started_at = float(status.get("started_at", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return (
+        status.get("schema_version") == 1
+        and status.get("service") == "learner-metrics"
+        and status.get("stream") == "current"
+        and status.get("mode") == "training"
+        and bool(status.get("service_instance_id"))
+        and bool(status.get("metrics_source_id"))
+        and started_at > 0.0
+    )
+
+
 def main() -> int:
     if not all(tcp_ready(port) for port in (9100, 9200, 9005)):
         return 1
     try:
         with urllib.request.urlopen(
-            "http://127.0.0.1:9005/api/metrics/latest", timeout=1
+            "http://127.0.0.1:9005/api/status", timeout=1
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError):
+            status = json.loads(response.read().decode("utf-8"))
+    except (OSError, TypeError, ValueError):
         return 1
-
-    record = payload.get("record")
-    if not isinstance(record, dict):
-        return 1
-    distributor = record.get("distributor", {})
-    model = record.get("model", {})
-    learner = record.get("learner", {})
-    backend_type = distributor.get("backend_type")
-    return 0 if (
-        distributor.get("service_name") == "LocalSampleService"
-        and distributor.get("ingress_ready") is True
-        and distributor.get("pool_ready") is True
-        and backend_type == "SAMPLE_BACKEND_TYPE_LOCAL_MEMORY"
-        and int(distributor.get("max_concurrent_consumers", 0)) == 1
-        and model.get("ready") is True
-        and int(model.get("latest_version", -1)) >= 0
-        and int(learner.get("model_version", -1)) >= 0
-    ) else 1
+    return 0 if isinstance(status, dict) and metrics_service_ready(status) else 1
 
 
 if __name__ == "__main__":
