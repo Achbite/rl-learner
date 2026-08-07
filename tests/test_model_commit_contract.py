@@ -89,6 +89,11 @@ class ModelCommitContractTest(unittest.TestCase):
         )
         self.assertNotIn("map_id", document)
         self.assertNotIn("reward", document)
+        sample = document["sample_distributor"]
+        self.assertGreaterEqual(
+            sample["demand_max_fragments"],
+            sample["max_train_batch_size"],
+        )
 
     def test_archive_interval_uses_only_canonical_runtime_override(self):
         document = config(Path("/tmp/learner-archive-override"), 200)

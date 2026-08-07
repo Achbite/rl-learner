@@ -77,7 +77,7 @@ sample_distributor:
   shutdown_drain_timeout_ms: 20000
   demand_ttl_ms: 10000              # short-lived Consumer Demand lease
   demand_refresh_interval_ms: 3000  # refresh well before TTL expiry
-  demand_max_fragments: 5           # one bounded 512..639-sample delivery
+  demand_max_fragments: 639         # worst case: one sample per partial fragment
   demand_max_estimated_bytes: 8388608
 
 model_distributor:

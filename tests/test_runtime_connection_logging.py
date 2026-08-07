@@ -43,7 +43,7 @@ class RuntimeSelectionTest(unittest.TestCase):
         runtime.max_sample_age_ms = 120000
         runtime.demand_ttl_ms = 10000
         runtime.demand_refresh_interval_ms = 3000
-        runtime.demand_max_fragments = 5
+        runtime.demand_max_fragments = 639
         runtime.demand_max_estimated_bytes = 8 * 1024 * 1024
         runtime.demand_id = "learner-test-training-demand"
         runtime._demand_epoch = 0
@@ -145,7 +145,7 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertEqual(first.assembly.target_samples, 512)
         self.assertEqual(first.assembly.max_samples, 639)
         self.assertEqual(first.max_buffered_samples, 639)
-        self.assertEqual(first.max_buffered_fragments, 5)
+        self.assertEqual(first.max_buffered_fragments, 639)
         runtime._upsert_demand()
         self.assertEqual(len(stub.upserts), 1)
 

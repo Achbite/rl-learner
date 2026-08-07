@@ -766,6 +766,10 @@ class TrainingRuntime:
         self.demand_max_estimated_bytes = int(
             sample["demand_max_estimated_bytes"]
         )
+        if self.demand_max_fragments < self.max_train_batch_size:
+            raise ValueError(
+                "demand_max_fragments must cover one-sample partial fragments"
+            )
         self.demand_id = f"{self.learner_service.instance_id}-training-demand"
         self._demand_epoch = 0
         self._demand_active = False
