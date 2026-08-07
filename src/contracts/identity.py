@@ -1,4 +1,4 @@
-"""Build and validate the exact rl-contracts 0.9.1 training identities."""
+"""Build and validate the exact rl-contracts 0.10.0 training identities."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.9.1"
+CONTRACT_VERSION = "0.10.0"
 REWARD_SCHEMA_ID = "maze.reward.v4"
 REWARD_SCHEMA_DIGEST = (
     "ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929"
@@ -55,7 +55,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the selected 0.9.1 artifact")
+        raise ValueError("contract identity is not the selected 0.10.0 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -298,6 +298,16 @@ def validate_config(config: dict) -> None:
         or int(config["sample_distributor"]["max_train_batch_size"])
         < int(config["sample_distributor"]["train_batch_size"])
         or int(config["sample_distributor"]["max_sample_age_ms"]) <= 0
+        or int(config["sample_distributor"]["demand_ttl_ms"]) <= 0
+        or int(config["sample_distributor"]["demand_refresh_interval_ms"])
+        <= 0
+        or int(config["sample_distributor"]["demand_refresh_interval_ms"])
+        >= int(config["sample_distributor"]["demand_ttl_ms"])
+        or int(config["sample_distributor"]["demand_max_fragments"]) <= 0
+        or int(
+            config["sample_distributor"]["demand_max_estimated_bytes"]
+        )
+        <= 0
     ):
         raise ValueError("integer training parameters are invalid")
 

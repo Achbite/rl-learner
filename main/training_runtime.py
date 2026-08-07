@@ -1,4 +1,4 @@
-"""Task-neutral leased-sample PPO runtime for rl-contracts 0.9.1."""
+"""Task-neutral leased-sample PPO runtime for rl-contracts 0.10.0."""
 
 from __future__ import annotations
 
@@ -753,6 +753,18 @@ class TrainingRuntime:
         self.shutdown_drain_timeout_ms = int(
             sample["shutdown_drain_timeout_ms"]
         )
+        self.demand_ttl_ms = int(sample["demand_ttl_ms"])
+        self.demand_refresh_interval_ms = int(
+            sample["demand_refresh_interval_ms"]
+        )
+        self.demand_max_fragments = int(sample["demand_max_fragments"])
+        self.demand_max_estimated_bytes = int(
+            sample["demand_max_estimated_bytes"]
+        )
+        self.demand_id = f"{self.learner_service.instance_id}-training-demand"
+        self._demand_epoch = 0
+        self._demand_active = False
+        self._last_demand_refresh = 0.0
         self.sample_address = f"{sample_host}:{sample_port}"
         self.sample_channel = grpc.insecure_channel(self.sample_address)
         self.sample_stub = training_pb2_grpc.SampleDistributorServiceStub(
@@ -903,6 +915,93 @@ class TrainingRuntime:
             training_pb2.DistributorStatusReq(), timeout=2.0
         )
 
+    def _demand_message(self) -> training_pb2.SampleDemand:
+        return training_pb2.SampleDemand(
+            demand_id=self.demand_id,
+            demand_epoch=self.trainer.model_version + 1,
+            consumer=self.learner_service,
+            contract=self.contract,
+            training_semantics=self.semantics,
+            freshness=training_pb2.SampleFreshnessPolicy(
+                model_lineage_id=self.publisher.lineage_id,
+                reference_model_version=self.trainer.model_version,
+                max_version_lag=self.trainer.max_policy_lag,
+                max_sample_age_ms=self.max_sample_age_ms,
+                distribution_schema_id=(
+                    self.semantics.policy_distribution_schema_id
+                ),
+                policy_spec_digest=self.policy_digest,
+            ),
+            assembly=training_pb2.BatchAssemblySpec(
+                target_samples=self.train_batch_size,
+                max_samples=self.max_train_batch_size,
+                mode=training_pb2.BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
+            ),
+            max_buffered_samples=self.max_train_batch_size,
+            max_buffered_fragments=self.demand_max_fragments,
+            max_buffered_estimated_bytes=self.demand_max_estimated_bytes,
+            expires_at_unix_ms=int(time.time() * 1000) + self.demand_ttl_ms,
+        )
+
+    def _upsert_demand(self, force: bool = False) -> None:
+        epoch = self.trainer.model_version + 1
+        now = time.monotonic()
+        if (
+            not force
+            and self._demand_active
+            and self._demand_epoch == epoch
+            and (now - self._last_demand_refresh) * 1000
+            < self.demand_refresh_interval_ms
+        ):
+            return
+        demand = self._demand_message()
+        response = self.sample_stub.UpsertSampleDemand(
+            training_pb2.UpsertSampleDemandReq(demand=demand), timeout=3.0
+        )
+        if response.result not in (
+            training_pb2.SAMPLE_DEMAND_RESULT_APPLIED,
+            training_pb2.SAMPLE_DEMAND_RESULT_ALREADY_APPLIED,
+        ):
+            raise RuntimeError(f"sample demand rejected: {response.message}")
+        if (
+            response.demand.demand_id != demand.demand_id
+            or int(response.demand.demand_epoch) != int(demand.demand_epoch)
+            or not _same_message(response.demand.consumer, self.learner_service)
+        ):
+            raise RuntimeError("sample distributor returned another demand")
+        self._demand_epoch = epoch
+        self._demand_active = True
+        self._last_demand_refresh = now
+
+    def _release_demand(self, required: bool) -> None:
+        if not self._demand_active:
+            return
+        released = False
+        try:
+            response = self.sample_stub.ReleaseSampleDemand(
+                training_pb2.ReleaseSampleDemandReq(
+                    consumer=self.learner_service,
+                    contract=self.contract,
+                    demand_id=self.demand_id,
+                    demand_epoch=self._demand_epoch,
+                ),
+                timeout=3.0,
+            )
+            if response.result not in (
+                training_pb2.SAMPLE_DEMAND_RESULT_RELEASED,
+                training_pb2.SAMPLE_DEMAND_RESULT_NOT_FOUND,
+            ):
+                raise RuntimeError(
+                    f"sample demand release rejected: {response.message}"
+                )
+            released = True
+        except (grpc.RpcError, RuntimeError) as error:
+            if required:
+                raise RuntimeError("sample demand release failed") from error
+            self.logger.error("sample demand release failed: %s", error)
+        if released:
+            self._demand_active = False
+
     def _assert_sample_pool_ready(self) -> None:
         status = self._sample_pool_status()
         if not (
@@ -910,8 +1009,13 @@ class TrainingRuntime:
             and status.ingress_ready
             and status.pool_ready
             and _same_message(status.contract, self.contract)
+            and status.distributor.component == "sample-distributor"
+            and status.active_demand_count == 1
+            and int(status.active_demand_epoch) == self._demand_epoch
         ):
-            raise RuntimeError("sample pool is not ready for the exact contract")
+            raise RuntimeError(
+                "sample distributor is not ready for the exact demand"
+            )
 
     def _get_batch(
         self,
@@ -1370,7 +1474,11 @@ class TrainingRuntime:
         try:
             status = self._sample_pool_status()
             if not _same_message(status.contract, self.contract):
-                raise RuntimeError("sample pool contract identity mismatch")
+                raise RuntimeError(
+                    "sample distributor contract identity mismatch"
+                )
+            if status.distributor.component != "sample-distributor":
+                raise RuntimeError("sample distributor component mismatch")
             return {
                 "ready": bool(status.ready),
                 "ingress_ready": bool(status.ingress_ready),
@@ -1393,6 +1501,28 @@ class TrainingRuntime:
                 "leased_fragments": int(status.leased_fragments),
                 "resident_samples": int(status.resident_samples),
                 "resident_fragments": int(status.resident_fragments),
+                "reserved_samples": int(status.reserved_samples),
+                "reserved_fragments": int(status.reserved_fragments),
+                "active_demand_count": int(status.active_demand_count),
+                "active_demand_epoch": int(status.active_demand_epoch),
+                "credit_requests": int(status.credit_request_count),
+                "credit_grants": int(status.credit_grant_count),
+                "credit_commits": int(status.credit_commit_count),
+                "credit_releases": int(status.credit_release_count),
+                "credit_expirations": int(status.credit_expire_count),
+                "credit_revocations": int(status.credit_revoke_count),
+                "credit_wait_no_demand": int(
+                    status.credit_wait_no_demand_count
+                ),
+                "credit_wait_inflight_limit": int(
+                    status.credit_wait_inflight_limit_count
+                ),
+                "credit_wait_capacity": int(
+                    status.credit_wait_capacity_count
+                ),
+                "credit_wait_draining": int(
+                    status.credit_wait_draining_count
+                ),
                 "redelivery_count": int(status.redelivery_count),
                 "nack_count": int(status.nack_count),
                 "expired_lease_count": int(status.expired_lease_count),
@@ -1400,7 +1530,9 @@ class TrainingRuntime:
                 "timestamp": int(status.timestamp_unix_ms) / 1000.0,
             }
         except (grpc.RpcError, RuntimeError) as error:
-            return self._component_error_snapshot("sample-pool", str(error))
+            return self._component_error_snapshot(
+                "sample-distributor", str(error)
+            )
 
     def _model_snapshot(self) -> dict:
         try:
@@ -1599,10 +1731,12 @@ class TrainingRuntime:
 
     def run(self) -> int:
         self._initialize_models()
+        self._upsert_demand(force=True)
         self._start_metrics()
         self._record_metrics()
         try:
             while not _stop_requested.is_set():
+                self._upsert_demand()
                 self._assert_sample_pool_ready()
                 response = self._get_batch()
                 if response.result == training_pb2.GET_BATCH_RESULT_TIMEOUT:
@@ -1621,6 +1755,7 @@ class TrainingRuntime:
                     raise RuntimeError(str(error)) from error
             with self._metrics_lock:
                 self._metrics_context["disposition"] = "STOPPING"
+            self._release_demand(required=True)
             self._shutdown_drain()
             if (
                 self.publisher.archive_on_graceful_shutdown
@@ -1642,6 +1777,7 @@ class TrainingRuntime:
                 pass
             return 1
         finally:
+            self._release_demand(required=False)
             self._stop_metrics()
             self.metrics_backend.close()
             self.actor_channel.close()

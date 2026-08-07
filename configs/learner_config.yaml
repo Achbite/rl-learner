@@ -3,9 +3,9 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.9.1
-  source_digest: 861575536f18342fd427661c8f21b7b98994913e1e1c998f87fce5ee1490d438
-  artifact_digest: b8e8cdabf05b15b830b27edd1555904269202042756ecf0ed8158184e57ce8f6
+  package_version: 0.10.0
+  source_digest: fc1bf2e3dfd804431f2528d8da53227e55ca9b58b32fc95327558d91cebb3b97
+  artifact_digest: d90083d97e377230f50c820d040a5d83ce7435dc88c4f948c222c86ac4a429ae
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
@@ -75,6 +75,10 @@ sample_distributor:
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
   shutdown_drain_timeout_ms: 20000
+  demand_ttl_ms: 10000              # short-lived Consumer Demand lease
+  demand_refresh_interval_ms: 3000  # refresh well before TTL expiry
+  demand_max_fragments: 5           # one bounded 512..639-sample delivery
+  demand_max_estimated_bytes: 8388608
 
 model_distributor:
   host: 127.0.0.1

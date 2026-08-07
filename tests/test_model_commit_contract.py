@@ -80,7 +80,7 @@ def publish_update(trainer, publisher, behavior) -> dict:
 class ModelCommitContractTest(unittest.TestCase):
     def test_config_is_complete_and_old_environment_alias_is_ignored(self):
         document = load_config(str(ROOT / "configs" / "learner_config.yaml"))
-        self.assertEqual(document["contract"]["package_version"], "0.9.1")
+        self.assertEqual(document["contract"]["package_version"], "0.10.0")
         self.assertEqual(document["model"]["obs_dim"], 17)
         self.assertEqual(
             document["training_semantics"]["reward_schema"]["schema_id"],
@@ -166,7 +166,7 @@ class ModelCommitContractTest(unittest.TestCase):
                 behavior_model=None,
                 batch_ids=[],
             )
-            self.assertEqual(manifest["contract"]["package_version"], "0.9.1")
+            self.assertEqual(manifest["contract"]["package_version"], "0.10.0")
             self.assertEqual(manifest["observation_schema"]["schema_id"], "maze.observation.v3")
             self.assertEqual(manifest["input_shape"], [1, 17])
             wire = manifest_message(TrainingRuntime._manifest_for_wire(manifest))
