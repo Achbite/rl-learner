@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -87,6 +88,15 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertEqual(request.freshness.reference_model_version, 2)
         self.assertEqual(request.freshness.max_version_lag, 2)
         self.assertEqual(request.freshness.max_sample_age_ms, 120000)
+
+    def test_exact_serving_ack_is_bootstrap_only(self):
+        bootstrap_source = inspect.getsource(
+            TrainingRuntime._initialize_models
+        )
+        update_source = inspect.getsource(TrainingRuntime._train_delivery)
+
+        self.assertIn("_wait_initial_model_loaded", bootstrap_source)
+        self.assertNotIn("_wait_initial_model_loaded", update_source)
 
     def test_rejects_pool_contract_drift(self):
         cfg = config()

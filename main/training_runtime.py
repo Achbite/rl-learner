@@ -852,7 +852,7 @@ class TrainingRuntime:
         if not _same_message(response.manifest, expected):
             raise RuntimeError("model distributor returned a different manifest")
 
-    def _wait_model_loaded(self, document: dict) -> None:
+    def _wait_initial_model_loaded(self, document: dict) -> None:
         expected = manifest_message(self._manifest_for_wire(document)).identity
         deadline = time.monotonic() + self.model_startup_timeout
         last = ""
@@ -895,7 +895,7 @@ class TrainingRuntime:
         self.model_manifests[version] = document
         self.initial_model_version = version
         self._register(document)
-        self._wait_model_loaded(document)
+        self._wait_initial_model_loaded(document)
         self.publisher.archive_version(version, self._startup_mode)
         self._last_archive_version = version
         self._commit_learner_metrics(
@@ -1331,7 +1331,6 @@ class TrainingRuntime:
                 self._register(manifest)
                 receipt["state"] = "REGISTERED"
                 self._write_receipt(update_id, receipt)
-                self._wait_model_loaded(manifest)
                 self._ack(
                     response.delivery_id,
                     training_pb2.ACK_DISPOSITION_TRAINED,
