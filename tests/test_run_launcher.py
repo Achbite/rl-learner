@@ -35,6 +35,8 @@ class RunLauncherTest(unittest.TestCase):
         self.assertIn("training_lock", document)
         self.assertIn('trap shutdown EXIT TERM INT', document)
         self.assertIn('rm -rf -- "${training_lock}"', document)
+        self.assertIn('exit "${child_status}"', document)
+        self.assertNotIn('wait "${process}"\n            exit $?', document)
         self.assertIn("expected_local_train_root", document)
         self.assertNotIn("docker rm", document)
 

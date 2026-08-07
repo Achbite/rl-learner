@@ -141,7 +141,8 @@ class PpoUpdateTest(unittest.TestCase):
         trainer = PPOTrainer(config())
         trainer.train_on_batch(self._samples(trainer), behavior_model_version=0)
         trainer.train_on_batch(self._samples(trainer), behavior_model_version=0)
-        self.assertEqual(trainer.model_version, 2)
+        trainer.train_on_batch(self._samples(trainer), behavior_model_version=0)
+        self.assertEqual(trainer.model_version, 3)
         with self.assertRaisesRegex(ValueError, "max_policy_lag"):
             trainer.train_on_batch(
                 self._samples(trainer), behavior_model_version=0
@@ -151,9 +152,21 @@ class PpoUpdateTest(unittest.TestCase):
         state = copy.deepcopy(trainer.model.state_dict())
         with self.assertRaisesRegex(ValueError, "invalid tensors"):
             trainer.train_on_batch(invalid, behavior_model_version=1)
-        self.assertEqual(trainer.model_version, 2)
+        self.assertEqual(trainer.model_version, 3)
         for key, value in state.items():
             self.assertTrue(torch.equal(value, trainer.model.state_dict()[key]))
+
+    def test_mixed_compatible_behavior_versions_train_once(self):
+        trainer = PPOTrainer(config())
+        trainer.train_on_batch(self._samples(trainer), behavior_model_version=0)
+        samples = self._samples(trainer)
+        samples[0]["behavior_model_version"] = 0
+        samples[1]["behavior_model_version"] = 1
+        stats = trainer.train_on_batch(samples)
+        self.assertEqual(trainer.model_version, 2)
+        self.assertEqual(stats["minimum_behavior_model_version"], 0)
+        self.assertEqual(stats["maximum_behavior_model_version"], 1)
+        self.assertEqual(stats["policy_lag"], 1)
 
 
 if __name__ == "__main__":

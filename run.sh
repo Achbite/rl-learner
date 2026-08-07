@@ -293,8 +293,13 @@ while [ "${stopping}" -eq 0 ]; do
             continue
         fi
         if ! kill -0 "${process}" 2>/dev/null; then
-            wait "${process}"
-            exit $?
+            if wait "${process}"; then
+                child_status=0
+            else
+                child_status=$?
+            fi
+            shutdown
+            exit "${child_status}"
         fi
     done
     sleep 0.2

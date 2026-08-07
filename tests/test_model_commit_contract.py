@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from main.training_runtime import ModelPublisher, TrainingRuntime, load_config
-from src.contracts.identity import manifest_message
+from src.contracts.identity import canonical_config_digest, manifest_message
 from src.training.ppo_trainer import PPOTrainer
 
 
@@ -80,10 +80,71 @@ def publish_update(trainer, publisher, behavior) -> dict:
 class ModelCommitContractTest(unittest.TestCase):
     def test_config_is_complete_and_old_environment_alias_is_ignored(self):
         document = load_config(str(ROOT / "configs" / "learner_config.yaml"))
-        self.assertEqual(document["contract"]["package_version"], "0.8.0")
+        self.assertEqual(document["contract"]["package_version"], "0.9.1")
         self.assertEqual(document["model"]["obs_dim"], 17)
+        self.assertEqual(
+            document["training_semantics"]["reward_schema"]["schema_id"],
+            "maze.reward.v4",
+        )
         self.assertNotIn("map_id", document)
         self.assertNotIn("reward", document)
+
+    def test_training_identity_digests_are_canonical(self):
+        document = yaml.safe_load(
+            (ROOT / "configs" / "learner_config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        semantics = copy.deepcopy(document["training_semantics"])
+        configured_semantics_digest = semantics.pop("semantics_digest")
+        self.assertEqual(
+            canonical_config_digest(semantics),
+            configured_semantics_digest,
+        )
+
+        training_identity = {
+            "training_semantics_digest": configured_semantics_digest,
+            "policy_spec_digest": document["policy"]["policy_spec_digest"],
+            "model_lineage_id": document["identity"]["model_lineage_id"],
+            "training": {
+                key: document["training"][key]
+                for key in (
+                    "device",
+                    "seed",
+                    "learning_rate",
+                    "gamma",
+                    "gae_lambda",
+                    "clip_epsilon",
+                    "value_clip_epsilon",
+                    "entropy_coef",
+                    "value_coef",
+                    "max_grad_norm",
+                    "n_epochs",
+                    "mini_batch_size",
+                    "normalize_advantage",
+                    "max_policy_lag",
+                )
+            },
+            "model": {
+                key: document["model"][key]
+                for key in (
+                    "obs_dim",
+                    "action_dim",
+                    "hidden_dim",
+                    "bootstrap_seed",
+                    "tensor_dtype",
+                )
+            },
+            "sample": {
+                "train_batch_size": document["sample_distributor"][
+                    "train_batch_size"
+                ]
+            },
+        }
+        self.assertEqual(
+            canonical_config_digest(training_identity),
+            document["identity"]["training_config_digest"],
+        )
 
     def test_prepare_rejects_unclean_local_train_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -105,7 +166,7 @@ class ModelCommitContractTest(unittest.TestCase):
                 behavior_model=None,
                 batch_ids=[],
             )
-            self.assertEqual(manifest["contract"]["package_version"], "0.8.0")
+            self.assertEqual(manifest["contract"]["package_version"], "0.9.1")
             self.assertEqual(manifest["observation_schema"]["schema_id"], "maze.observation.v3")
             self.assertEqual(manifest["input_shape"], [1, 17])
             wire = manifest_message(TrainingRuntime._manifest_for_wire(manifest))
@@ -131,12 +192,14 @@ class ModelCommitContractTest(unittest.TestCase):
             publisher.archive_version(0, "bootstrap")
             second = publish_update(trainer, publisher, first["identity"])
             third = publish_update(trainer, publisher, second["identity"])
-            publisher.archive_version(2, "interval")
-            publisher.prune_runtime(2)
+            fourth = publish_update(trainer, publisher, third["identity"])
+            publisher.archive_version(3, "interval")
+            publisher.prune_runtime(3)
             self.assertFalse(publisher.model_path(0).exists())
             self.assertTrue(publisher.model_path(1).exists())
             self.assertTrue(publisher.model_path(2).exists())
-            archive = publisher.archive_path(2)
+            self.assertTrue(publisher.model_path(3).exists())
+            archive = publisher.archive_path(3)
             self.assertEqual(
                 {path.name for path in archive.iterdir()},
                 {"SaveModel.onnx", "checkpoint.pt", "manifest.json"},

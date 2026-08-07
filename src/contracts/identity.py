@@ -1,4 +1,4 @@
-"""Build and validate the exact rl-contracts 0.8 training identities."""
+"""Build and validate the exact rl-contracts 0.9.1 training identities."""
 
 from __future__ import annotations
 
@@ -12,7 +12,17 @@ from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.8.0"
+CONTRACT_VERSION = "0.9.1"
+REWARD_SCHEMA_ID = "maze.reward.v4"
+REWARD_SCHEMA_DIGEST = (
+    "ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929"
+)
+TRAINING_SEMANTICS_DIGEST = (
+    "6cd834542f8263135b4bfd069f372ddfdb99334060d305f58b00ce56eea10b4c"
+)
+TRAINING_CONFIG_DIGEST = (
+    "b8a98bd14abc5f09e57c65516ff1eae8222b9515b058d76c34af4a88dee7551f"
+)
 
 
 def _digest(value: str) -> common_pb2.ContentDigest:
@@ -45,7 +55,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the locked 0.8 artifact")
+        raise ValueError("contract identity is not the selected 0.9.1 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -245,9 +255,17 @@ def validate_config(config: dict) -> None:
         or int(model["hidden_dim"]) != 64
         or semantics.observation_schema.schema_id != "maze.observation.v3"
         or semantics.action_schema.schema_id != "maze.action.v1"
+        or semantics.reward_schema.schema_id != REWARD_SCHEMA_ID
+        or semantics.reward_schema.schema_version != 1
+        or semantics.reward_schema.canonical_digest.hex
+        != REWARD_SCHEMA_DIGEST
+        or semantics.semantics_digest.hex != TRAINING_SEMANTICS_DIGEST
+        or training_config_digest(config).hex != TRAINING_CONFIG_DIGEST
         or semantics.model_architecture_id != "maze.mlp-17x64x64.v1"
     ):
-        raise ValueError("model/schema does not match the locked 17x64x64 contract")
+        raise ValueError(
+            "model/schema does not match the locked Reward V4 17x64x64 contract"
+        )
     if (
         policy.get("distribution_schema_id")
         != semantics.policy_distribution_schema_id
@@ -277,6 +295,9 @@ def validate_config(config: dict) -> None:
         or int(training["mini_batch_size"]) <= 0
         or int(training["max_policy_lag"]) < 0
         or int(config["sample_distributor"]["train_batch_size"]) != 512
+        or int(config["sample_distributor"]["max_train_batch_size"])
+        < int(config["sample_distributor"]["train_batch_size"])
+        or int(config["sample_distributor"]["max_sample_age_ms"]) <= 0
     ):
         raise ValueError("integer training parameters are invalid")
 

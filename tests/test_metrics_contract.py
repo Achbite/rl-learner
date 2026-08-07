@@ -169,7 +169,7 @@ class MetricsContractTest(unittest.TestCase):
                         "max_agent_return": -2.0,
                         "agent_success_rate": 0.25,
                         "reward_components": {
-                            "geodesic_pbrs": 0.125,
+                            "geodesic_progress": 0.125,
                             "custom_bonus_2": 0.5,
                             "Bad Reward": 99.0,
                             "double__underscore": 99.0,
@@ -257,7 +257,7 @@ class MetricsContractTest(unittest.TestCase):
             )
             self.assertEqual(
                 values[
-                    "server.reward.component.geodesic_pbrs."
+                    "server.reward.component.geodesic_progress."
                     "transition_mean.v1"
                 ],
                 0.125,
@@ -354,11 +354,12 @@ class MetricsContractTest(unittest.TestCase):
         self.assertIn("quantile(sorted, .96)", document)
         self.assertNotIn("Total Reward", document)
         self.assertNotIn("Reward Functions", document)
-        self.assertIn("server.reward.component.geodesic_pbrs", document)
-        self.assertIn("server.reward.component.timeout_base", document)
-        self.assertIn("server.reward.component.timeout_progress", document)
+        self.assertIn("server.reward.component.geodesic_progress", document)
+        self.assertIn("server.reward.component.timeout_penalty", document)
         self.assertIn("server.reward.component.first_visit_bonus", document)
-        self.assertNotIn("server.reward.component.success_efficiency", document)
+        self.assertIn(
+            "server.reward.component.wasted_action_penalty", document
+        )
         self.assertIn("server.episode.path_ratio.mean.v1", document)
         self.assertIn("server.episode.step.mean.v1", document)
         self.assertIn("server.episode.unique_cells.mean.v1", document)

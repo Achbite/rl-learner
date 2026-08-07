@@ -255,20 +255,31 @@ class PPOTrainer:
         Returns:
             训练统计字典
         """
-        behavior_version = (
-            self._model_version
-            if behavior_model_version is None
-            else int(behavior_model_version)
-        )
-        policy_lag = self._model_version - behavior_version
-        if policy_lag < 0:
+        behavior_versions = [
+            int(
+                sample.get(
+                    "behavior_model_version",
+                    self._model_version
+                    if behavior_model_version is None
+                    else behavior_model_version,
+                )
+            )
+            for sample in samples
+        ]
+        policy_lags = [
+            self._model_version - version for version in behavior_versions
+        ]
+        if any(lag < 0 for lag in policy_lags):
             raise ValueError("behavior model version is from the future")
-        if policy_lag > self._max_policy_lag:
+        if any(lag > self._max_policy_lag for lag in policy_lags):
             raise ValueError(
                 "behavior model version exceeds max_policy_lag: "
-                f"current={self._model_version} behavior={behavior_version} "
+                f"current={self._model_version} "
+                f"behavior=[{min(behavior_versions)},"
+                f"{max(behavior_versions)}] "
                 f"max={self._max_policy_lag}"
             )
+        policy_lag = max(policy_lags, default=0)
         if not samples:
             return self._empty_stats(policy_lag)
 
@@ -471,6 +482,9 @@ class PPOTrainer:
             "explained_variance": round(explained_variance, 6),
             "learning_rate": self._lr,
             "policy_lag": policy_lag,
+            "minimum_behavior_model_version": min(behavior_versions),
+            "maximum_behavior_model_version": max(behavior_versions),
+            "mean_policy_lag": round(float(np.mean(policy_lags)), 6),
             "max_policy_lag": self._max_policy_lag,
             "model_version": self._model_version,
         }

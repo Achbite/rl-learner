@@ -3,9 +3,9 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.8.0
-  source_digest: 157fba14177a0727abf663c442003e2a5f5c1e297f4af97ea22b45d74cdb32b5
-  artifact_digest: 71a0f13363d62b5d076c02b00e5b4b269a3e91253b190432f2e83c43cdcf7d3a
+  package_version: 0.9.1
+  source_digest: 861575536f18342fd427661c8f21b7b98994913e1e1c998f87fce5ee1490d438
+  artifact_digest: b8e8cdabf05b15b830b27edd1555904269202042756ecf0ed8158184e57ce8f6
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
@@ -20,12 +20,12 @@ training_semantics:
     schema_version: 1
     canonical_digest: ce84c564e128f98adcc48fd420ac0df5acea61774a25de8705b602464009cfd8
   reward_schema:
-    schema_id: maze.reward.v3
+    schema_id: maze.reward.v4
     schema_version: 1
-    canonical_digest: b55437290fc9183f6197de5b4fdb493f162e08d61dde73b3415ddc9315d3c604
+    canonical_digest: ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929
   policy_distribution_schema_id: categorical.logits.v1
   model_architecture_id: maze.mlp-17x64x64.v1
-  semantics_digest: bde46f61bd04857f3fb2e79a5533f866856bb832c7ae2fb50ab65c67949ca62d
+  semantics_digest: 6cd834542f8263135b4bfd069f372ddfdb99334060d305f58b00ce56eea10b4c
 
 policy:
   distribution_schema_id: categorical.logits.v1
@@ -36,7 +36,7 @@ policy:
 
 identity:
   model_lineage_id: maze-fixed-map-seed-0
-  training_config_digest: dae748332cac644c6a25ce139f1e2701df59ec0c3df5740c59706b25871668c0
+  training_config_digest: b8a98bd14abc5f09e57c65516ff1eae8222b9515b058d76c34af4a88dee7551f
 
 training:
   device: cpu
@@ -52,14 +52,14 @@ training:
   n_epochs: 4                     # optimizer passes per leased batch, >0
   mini_batch_size: 64             # samples per optimizer mini-batch, >0
   normalize_advantage: true
-  max_policy_lag: 1               # accepted behavior-model lag, versions, >=0
+  max_policy_lag: 2               # accepted behavior-model lag, versions, >=0
 
 model:
   local_train_dir: models/local-train
   initial_checkpoint: ""
   archive_interval_updates: 200
   archive_on_graceful_shutdown: true
-  serving_retention_versions: 2
+  serving_retention_versions: 3
   obs_dim: 17
   action_dim: 9
   hidden_dim: 64
@@ -69,8 +69,9 @@ model:
 sample_distributor:
   host: 127.0.0.1
   port: 9100
-  train_batch_size: 512
-  current_version_wait_ms: 10000
+  train_batch_size: 512            # optimizer target; never split fragments
+  max_train_batch_size: 639        # target + max fragment - 1
+  max_sample_age_ms: 120000        # freshness bound at Pool and Learner
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
   shutdown_drain_timeout_ms: 20000

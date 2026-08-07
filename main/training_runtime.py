@@ -1,4 +1,4 @@
-"""Task-neutral leased-sample PPO runtime for rl-contracts 0.8.0."""
+"""Task-neutral leased-sample PPO runtime for rl-contracts 0.9.1."""
 
 from __future__ import annotations
 
@@ -746,7 +746,8 @@ class TrainingRuntime:
             os.environ.get("RL_SAMPLE_POOL_PORT", str(sample["port"]))
         )
         self.train_batch_size = int(sample["train_batch_size"])
-        self.preference_timeout_ms = int(sample["current_version_wait_ms"])
+        self.max_train_batch_size = int(sample["max_train_batch_size"])
+        self.max_sample_age_ms = int(sample["max_sample_age_ms"])
         self.get_timeout_ms = int(sample["get_timeout_ms"])
         self.lease_timeout_ms = int(sample["lease_timeout_ms"])
         self.shutdown_drain_timeout_ms = int(
@@ -902,15 +903,7 @@ class TrainingRuntime:
             training_pb2.DistributorStatusReq(), timeout=2.0
         )
 
-    def _allowed_behavior_documents(self) -> list[dict]:
-        minimum = self.trainer.model_version - self.trainer.max_policy_lag
-        return [
-            self.model_manifests[version]
-            for version in sorted(self.model_manifests, reverse=True)
-            if minimum <= version <= self.trainer.model_version
-        ]
-
-    def _select_behavior_document(self) -> dict | None:
+    def _assert_sample_pool_ready(self) -> None:
         status = self._sample_pool_status()
         if not (
             status.ready
@@ -919,35 +912,30 @@ class TrainingRuntime:
             and _same_message(status.contract, self.contract)
         ):
             raise RuntimeError("sample pool is not ready for the exact contract")
-        ready: dict[bytes, int] = {
-            item.behavior_model.SerializeToString(deterministic=True): int(
-                item.ready_samples
-            )
-            for item in status.behavior_versions
-        }
-        for document in self._allowed_behavior_documents():
-            identity = manifest_message(
-                self._manifest_for_wire(document)
-            ).identity
-            if ready.get(
-                identity.SerializeToString(deterministic=True), 0
-            ) >= self.train_batch_size:
-                return document
-        return None
 
-    def _get_batch(self, behavior_document: dict):
-        identity = manifest_message(
-            self._manifest_for_wire(behavior_document)
-        ).identity
+    def _get_batch(
+        self,
+        mode: int = training_pb2.BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
+    ):
         return self.sample_stub.GetBatch(
             training_pb2.GetBatchReq(
-                batch_size=self.train_batch_size,
+                assembly=training_pb2.BatchAssemblySpec(
+                    target_samples=self.train_batch_size,
+                    max_samples=self.max_train_batch_size,
+                    mode=mode,
+                ),
                 timeout_ms=self.get_timeout_ms,
                 consumer=self.learner_service,
                 lease_timeout_ms=self.lease_timeout_ms,
-                target_model=identity,
-                selection_policy=(
-                    training_pb2.BATCH_SELECTION_POLICY_TARGET_ONLY
+                freshness=training_pb2.SampleFreshnessPolicy(
+                    model_lineage_id=self.publisher.lineage_id,
+                    reference_model_version=self.trainer.model_version,
+                    max_version_lag=self.trainer.max_policy_lag,
+                    max_sample_age_ms=self.max_sample_age_ms,
+                    distribution_schema_id=(
+                        self.semantics.policy_distribution_schema_id
+                    ),
+                    policy_spec_digest=self.policy_digest,
                 ),
                 required_semantics=self.semantics,
             ),
@@ -981,37 +969,63 @@ class TrainingRuntime:
         if sample.end_kind != expected:
             raise ValueError("sample end_kind conflicts with terminal flags")
 
-    def _validate_delivery(self, response, behavior_document: dict) -> None:
+    def _validate_delivery(self, response) -> dict:
         if (
             response.result != training_pb2.GET_BATCH_RESULT_LEASED
-            or response.actual_batch_size != self.train_batch_size
-            or response.returned_samples != self.train_batch_size
+            or response.actual_batch_size < self.train_batch_size
+            or response.actual_batch_size > self.max_train_batch_size
+            or response.returned_samples != response.actual_batch_size
+            or response.returned_fragments != len(response.batches)
             or not response.delivery_id
         ):
-            raise ValueError("sample delivery is not an exact training batch")
-        expected_model = manifest_message(
-            self._manifest_for_wire(behavior_document)
-        ).identity
-        expected_policy = training_pb2.BehaviorPolicyIdentity(
-            model=expected_model,
-            distribution_schema_id=self.semantics.policy_distribution_schema_id,
-            policy_spec_digest=self.policy_digest,
-        )
-        if not _same_message(response.behavior_policy, expected_policy):
-            raise ValueError("delivery behavior policy identity mismatch")
+            raise ValueError("sample delivery violates bounded batch assembly")
         sample_count = 0
+        behavior_versions: set[int] = set()
+        oldest_created_at = 0
+        newest_created_at = 0
+        now_ms = int(time.time() * 1000)
         for batch in response.batches:
+            behavior = batch.behavior_policy
+            version = int(behavior.model_version)
+            lag = self.trainer.model_version - version
             if (
                 not batch.batch_id
                 or not batch.trajectory_id
                 or not _same_message(batch.contract, self.contract)
                 or not _same_message(batch.training_semantics, self.semantics)
-                or not _same_message(batch.behavior_policy, expected_policy)
+                or behavior.model_lineage_id != self.publisher.lineage_id
+                or behavior.distribution_schema_id
+                != self.semantics.policy_distribution_schema_id
+                or not _same_message(
+                    behavior.policy_spec_digest, self.policy_digest
+                )
+                or lag < 0
+                or lag > self.trainer.max_policy_lag
+                or version not in self.model_manifests
+                or batch.created_at_unix_ms <= 0
+                or now_ms - int(batch.created_at_unix_ms)
+                > self.max_sample_age_ms
                 or not batch.producer.instance_id
                 or batch.producer.component != "aiserver"
                 or batch.first_action_step > batch.last_action_step
             ):
                 raise ValueError("sample batch identity is invalid")
+            full_identity = manifest_message(
+                self._manifest_for_wire(self.model_manifests[version])
+            ).identity
+            if (
+                full_identity.model_lineage_id != behavior.model_lineage_id
+                or int(full_identity.model_version) != version
+            ):
+                raise ValueError("behavior policy cannot resolve to a model artifact")
+            behavior_versions.add(version)
+            created_at = int(batch.created_at_unix_ms)
+            oldest_created_at = (
+                created_at
+                if oldest_created_at == 0
+                else min(oldest_created_at, created_at)
+            )
+            newest_created_at = max(newest_created_at, created_at)
             digest_copy = training_pb2.SampleBatch()
             digest_copy.CopyFrom(batch)
             supplied = digest_copy.payload_digest.hex
@@ -1041,8 +1055,29 @@ class TrainingRuntime:
                 )
             if batch.trajectory_end != (terminal or truncated):
                 raise ValueError("trajectory_end conflicts with final sample")
-        if sample_count != self.train_batch_size:
+        if sample_count != response.actual_batch_size:
             raise ValueError("delivery sample count does not match response")
+        minimum_version = min(behavior_versions)
+        maximum_version = max(behavior_versions)
+        if (
+            response.minimum_behavior_model_version != minimum_version
+            or response.maximum_behavior_model_version != maximum_version
+            or response.oldest_sample_created_at_unix_ms
+            != oldest_created_at
+            or response.newest_sample_created_at_unix_ms
+            != newest_created_at
+        ):
+            raise ValueError("delivery summary does not match fragment identities")
+        models = [
+            dict(self.model_manifests[version]["identity"])
+            for version in sorted(behavior_versions)
+        ]
+        return {
+            "model_lineage_id": self.publisher.lineage_id,
+            "minimum_model_version": minimum_version,
+            "maximum_model_version": maximum_version,
+            "models": models,
+        }
 
     def _training_samples(self, batches) -> list[dict]:
         result: list[dict] = []
@@ -1065,13 +1100,16 @@ class TrainingRuntime:
                 }
                 for sample in batch.samples
             ]
-            result.extend(
-                self.trainer.compute_gae(
-                    trajectory,
-                    bootstrap_value=float(batch.bootstrap_value),
-                    bootstrap_valid=bool(batch.bootstrap_valid),
-                )
+            processed = self.trainer.compute_gae(
+                trajectory,
+                bootstrap_value=float(batch.bootstrap_value),
+                bootstrap_valid=bool(batch.bootstrap_valid),
             )
+            for sample in processed:
+                sample["behavior_model_version"] = int(
+                    batch.behavior_policy.model_version
+                )
+            result.extend(processed)
         return result
 
     def _ack(
@@ -1116,10 +1154,8 @@ class TrainingRuntime:
     def _write_receipt(self, update_id: str, document: dict) -> None:
         atomic_write_json(self.publisher.receipt_path(update_id), document)
 
-    def _train_delivery(self, response, behavior_document: dict) -> None:
-        self._validate_delivery(response, behavior_document)
-        behavior_identity = behavior_document["identity"]
-        behavior_version = int(behavior_identity["model_version"])
+    def _train_delivery(self, response) -> None:
+        behavior_identity = self._validate_delivery(response)
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
         batch_ids = [batch.batch_id for batch in response.batches]
@@ -1141,10 +1177,7 @@ class TrainingRuntime:
         ).start()
         try:
             training_samples = self._training_samples(response.batches)
-            stats = self.trainer.train_on_batch(
-                training_samples,
-                behavior_model_version=behavior_version,
-            )
+            stats = self.trainer.train_on_batch(training_samples)
             if renewer.error:
                 raise RuntimeError(f"sample lease lost: {renewer.error}")
             target_updates = self.train_updates + 1
@@ -1553,11 +1586,9 @@ class TrainingRuntime:
                 return
             if status.ready_queue_samples == 0 and status.leased_samples == 0:
                 return
-            behavior = self._select_behavior_document()
-            if behavior is None:
-                time.sleep(0.1)
-                continue
-            response = self._get_batch(behavior)
+            response = self._get_batch(
+                training_pb2.BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE
+            )
             if response.result == training_pb2.GET_BATCH_RESULT_LEASED:
                 self._ack(
                     response.delivery_id,
@@ -1572,11 +1603,8 @@ class TrainingRuntime:
         self._record_metrics()
         try:
             while not _stop_requested.is_set():
-                behavior = self._select_behavior_document()
-                if behavior is None:
-                    time.sleep(0.1)
-                    continue
-                response = self._get_batch(behavior)
+                self._assert_sample_pool_ready()
+                response = self._get_batch()
                 if response.result == training_pb2.GET_BATCH_RESULT_TIMEOUT:
                     continue
                 if response.result != training_pb2.GET_BATCH_RESULT_LEASED:
@@ -1584,7 +1612,7 @@ class TrainingRuntime:
                         f"sample GetBatch failed: {response.message}"
                     )
                 try:
-                    self._train_delivery(response, behavior)
+                    self._train_delivery(response)
                 except ValueError as error:
                     self._ack(
                         response.delivery_id,

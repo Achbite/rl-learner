@@ -1,6 +1,8 @@
 import hashlib
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -30,7 +32,7 @@ def config():
     )
 
 
-def model_document(cfg):
+def model_document(cfg, version=0):
     semantics = training_semantics(cfg)
     return finalize_manifest_digest(
         {
@@ -38,8 +40,8 @@ def model_document(cfg):
             "contract": contract_document(contract_identity(cfg)),
             "identity": {
                 "model_lineage_id": cfg["identity"]["model_lineage_id"],
-                "model_version": 0,
-                "artifact_digest": "a" * 64,
+                "model_version": version,
+                "artifact_digest": chr(ord("a") + version) * 64,
                 "manifest_digest": "0" * 64,
             },
             "observation_schema": schema_document(
@@ -65,20 +67,23 @@ def model_document(cfg):
     )
 
 
-def delivery(runtime, document):
-    model = manifest_message(runtime._manifest_for_wire(document)).identity
-    policy = training_pb2.BehaviorPolicyIdentity(
-        model=model,
-        distribution_schema_id=runtime.semantics.policy_distribution_schema_id,
+def _batch(runtime, version, first_step, sample_count):
+    policy = training_pb2.BehaviorPolicyReference(
+        model_lineage_id=runtime.publisher.lineage_id,
+        model_version=version,
+        distribution_schema_id=(
+            runtime.semantics.policy_distribution_schema_id
+        ),
         policy_spec_digest=runtime.policy_digest,
     )
+    created_at = int(time.time() * 1000)
     batch = training_pb2.SampleBatch(
-        batch_id="batch-1",
+        batch_id=f"batch-{version}",
         actor_session_id="session-1",
-        trajectory_id="trajectory-1",
-        actor_id=1,
-        fragment_id=1,
-        fragment_sequence=1,
+        trajectory_id=f"trajectory-{version}",
+        actor_id=version,
+        fragment_id=version,
+        fragment_sequence=version,
         trajectory_end=False,
         bootstrap_value=0.25,
         bootstrap_valid=True,
@@ -88,11 +93,11 @@ def delivery(runtime, document):
             component="aiserver", instance_id="aiserver-1", lifecycle_epoch=1
         ),
         contract=runtime.contract,
-        created_at_unix_ms=1,
-        first_action_step=1,
-        last_action_step=512,
+        created_at_unix_ms=created_at,
+        first_action_step=first_step,
+        last_action_step=first_step + sample_count - 1,
     )
-    for step in range(1, 513):
+    for step in range(first_step, first_step + sample_count):
         sample = batch.samples.add(
             action=step % 9,
             reward=0.01,
@@ -110,13 +115,23 @@ def delivery(runtime, document):
     batch.payload_digest.hex = hashlib.sha256(
         digest_copy.SerializeToString(deterministic=True)
     ).hexdigest()
+    return batch
+
+
+def delivery(runtime):
+    batches = [_batch(runtime, 0, 1, 256), _batch(runtime, 1, 257, 256)]
+    created = [batch.created_at_unix_ms for batch in batches]
     return training_pb2.GetBatchRsp(
         result=training_pb2.GET_BATCH_RESULT_LEASED,
         delivery_id="delivery-1",
         returned_samples=512,
         actual_batch_size=512,
-        behavior_policy=policy,
-        batches=[batch],
+        returned_fragments=2,
+        minimum_behavior_model_version=0,
+        maximum_behavior_model_version=1,
+        oldest_sample_created_at_unix_ms=min(created),
+        newest_sample_created_at_unix_ms=max(created),
+        batches=batches,
     )
 
 
@@ -127,30 +142,41 @@ class DeliveryContractTest(unittest.TestCase):
         runtime.contract = contract_identity(cfg)
         runtime.semantics = training_semantics(cfg)
         runtime.policy_digest = policy_spec_digest(cfg)
+        runtime.publisher = SimpleNamespace(
+            lineage_id=cfg["identity"]["model_lineage_id"]
+        )
+        runtime.trainer = SimpleNamespace(model_version=1, max_policy_lag=2)
         runtime.train_batch_size = 512
-        return runtime, model_document(cfg)
+        runtime.max_train_batch_size = 639
+        runtime.max_sample_age_ms = 120000
+        runtime.model_manifests = {
+            version: model_document(cfg, version) for version in (0, 1)
+        }
+        return runtime
 
-    def test_exact_delivery_passes(self):
-        runtime, document = self.runtime()
-        runtime._validate_delivery(delivery(runtime, document), document)
+    def test_bounded_multi_version_delivery_passes(self):
+        runtime = self.runtime()
+        summary = runtime._validate_delivery(delivery(runtime))
+        self.assertEqual(summary["minimum_model_version"], 0)
+        self.assertEqual(summary["maximum_model_version"], 1)
 
     def test_payload_or_policy_identity_drift_fails(self):
-        runtime, document = self.runtime()
-        response = delivery(runtime, document)
+        runtime = self.runtime()
+        response = delivery(runtime)
         response.batches[0].samples[0].reward = 9.0
         with self.assertRaisesRegex(ValueError, "payload digest"):
-            runtime._validate_delivery(response, document)
-        response = delivery(runtime, document)
-        response.behavior_policy.policy_spec_digest.hex = "b" * 64
-        with self.assertRaisesRegex(ValueError, "behavior policy"):
-            runtime._validate_delivery(response, document)
+            runtime._validate_delivery(response)
+        response = delivery(runtime)
+        response.batches[0].behavior_policy.policy_spec_digest.hex = "b" * 64
+        with self.assertRaisesRegex(ValueError, "sample batch identity"):
+            runtime._validate_delivery(response)
 
     def test_non_canonical_producer_component_fails(self):
-        runtime, document = self.runtime()
-        response = delivery(runtime, document)
+        runtime = self.runtime()
+        response = delivery(runtime)
         response.batches[0].producer.component = "rl-aiserver"
         with self.assertRaisesRegex(ValueError, "sample batch identity"):
-            runtime._validate_delivery(response, document)
+            runtime._validate_delivery(response)
 
 
 if __name__ == "__main__":

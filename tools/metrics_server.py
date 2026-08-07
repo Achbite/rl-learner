@@ -36,10 +36,10 @@ _CATALOG_FIELD_KEYS = (
 _REWARD_COMPONENT_NAME = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _KNOWN_REWARD_COMPONENTS = (
     "goal_reward",
-    "timeout_base",
-    "timeout_progress",
-    "geodesic_pbrs",
+    "timeout_penalty",
+    "geodesic_progress",
     "first_visit_bonus",
+    "wasted_action_penalty",
 )
 
 
