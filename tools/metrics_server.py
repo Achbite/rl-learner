@@ -498,6 +498,7 @@ class MetricsFileReader:
         metrics_dir: str,
         *,
         metrics_source_id: str = "",
+        runtime_mode: str = "",
         service_instance_id: str = "",
         started_at: float | None = None,
     ):
@@ -505,6 +506,7 @@ class MetricsFileReader:
         self._metrics_source_id = metrics_source_id or (
             f"local-training-{uuid.uuid4().hex}"
         )
+        self._runtime_mode = runtime_mode
         self._service_instance_id = service_instance_id or (
             f"learner-metrics-{uuid.uuid4().hex}"
         )
@@ -634,7 +636,7 @@ class MetricsFileReader:
                 "metrics_source_id": self._metrics_source_id,
                 "started_at": self._started_at,
                 "metrics_dir": self._metrics_dir,
-                "mode": latest.get("mode", ""),
+                "mode": latest.get("mode") or self._runtime_mode,
                 "record_count": len(self._records),
                 "latest_sequence": latest.get(
                     "sequence", latest.get("train_step", 0)
@@ -810,9 +812,15 @@ def main():
         "--source-id",
         default=os.environ.get("RL_METRICS_SOURCE_ID", ""),
     )
+    parser.add_argument(
+        "--mode",
+        default=os.environ.get("RL_METRICS_MODE", ""),
+    )
     args = parser.parse_args()
     metrics_reader = MetricsFileReader(
-        args.dir, metrics_source_id=args.source_id
+        args.dir,
+        metrics_source_id=args.source_id,
+        runtime_mode=args.mode,
     )
     metrics_reader.refresh()
 

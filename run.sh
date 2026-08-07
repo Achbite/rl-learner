@@ -273,7 +273,8 @@ fi
 python3 tools/metrics_server.py \
     --dir "${local_train_root}/metrics" \
     --port "${metrics_port}" \
-    --source-id "${metrics_source_id}" &
+    --source-id "${metrics_source_id}" \
+    --mode training &
 metrics_pid=$!
 
 training_args=(--config "${config}")

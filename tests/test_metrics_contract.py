@@ -115,6 +115,20 @@ class MetricsContractTest(unittest.TestCase):
                 second["service_instance_id"],
             )
 
+    def test_status_exposes_runtime_mode_before_first_metric(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reader = MetricsFileReader(
+                directory,
+                metrics_source_id="local-training-source-starting",
+                runtime_mode="training",
+            )
+
+            status = reader.status()
+
+            self.assertEqual(status["mode"], "training")
+            self.assertEqual(status["record_count"], 0)
+            self.assertTrue(status["stale"])
+
     def test_default_service_identity_changes_between_server_instances(self):
         with tempfile.TemporaryDirectory() as directory:
             first_port = self._start_metrics_server(
