@@ -20,6 +20,7 @@ class TrainingChainReadinessTest(unittest.TestCase):
             {
                 "ready": True,
                 "instance_id": "actor-current",
+                "client_session_recent": True,
                 "model_identity": actor_model,
             },
             {
@@ -64,6 +65,14 @@ class TrainingChainReadinessTest(unittest.TestCase):
         chain = training_chain_status(actor, pool, learner, model)
         self.assertIn("actor_instance_missing", chain["reasons"])
         self.assertIn("sample_pool_pool_ready_false", chain["reasons"])
+
+    def test_requires_recent_client_activity_not_only_a_session_record(self):
+        actor, pool, learner, model = self.healthy_components()
+        actor["active_sessions"] = 1
+        actor["client_session_recent"] = False
+        chain = training_chain_status(actor, pool, learner, model)
+        self.assertFalse(chain["ready"])
+        self.assertIn("client_session_not_recent", chain["reasons"])
 
     def test_rejects_policy_lag_outside_bound(self):
         actor, pool, learner, model = self.healthy_components()

@@ -31,7 +31,6 @@ policy:
   distribution_schema_id: categorical.logits.v1
   training_sampling: stochastic
   training_temperature: 1.0        # unitless; fixed for behavior log-prob identity
-  evaluation_sampling: argmax
   policy_spec_digest: e1efb81040681fd13fdae439caab09778c8e0b0f6bba16b7808c30fbbb632617
 
 identity:

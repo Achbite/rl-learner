@@ -160,7 +160,8 @@ class DeliveryContractTest(unittest.TestCase):
         runtime.semantics = training_semantics(cfg)
         runtime.policy_digest = policy_spec_digest(cfg)
         runtime.publisher = SimpleNamespace(
-            lineage_id=cfg["identity"]["model_lineage_id"]
+            lineage_id=cfg["identity"]["model_lineage_id"],
+            training_digest=training_config_digest(cfg),
         )
         runtime.trainer = SimpleNamespace(model_version=1, max_policy_lag=2)
         runtime.train_batch_size = 512

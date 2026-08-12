@@ -20,9 +20,6 @@ REWARD_SCHEMA_DIGEST = (
 TRAINING_SEMANTICS_DIGEST = (
     "6cd834542f8263135b4bfd069f372ddfdb99334060d305f58b00ce56eea10b4c"
 )
-TRAINING_CONFIG_DIGEST = (
-    "b8a98bd14abc5f09e57c65516ff1eae8222b9515b058d76c34af4a88dee7551f"
-)
 
 
 def _digest(value: str) -> common_pb2.ContentDigest:
@@ -107,8 +104,70 @@ def policy_spec_digest(config: dict) -> common_pb2.ContentDigest:
     return _digest(config["policy"]["policy_spec_digest"])
 
 
+def canonical_config_digest(document: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def training_config_document(config: dict) -> dict:
+    """Return the exact task-neutral configuration bound to model identity."""
+    semantics = config["training_semantics"]
+    training = config["training"]
+    model = config["model"]
+    return {
+        "training_semantics_digest": semantics["semantics_digest"],
+        "policy_spec_digest": config["policy"]["policy_spec_digest"],
+        "model_lineage_id": config["identity"]["model_lineage_id"],
+        "training": {
+            key: training[key]
+            for key in (
+                "device",
+                "seed",
+                "learning_rate",
+                "gamma",
+                "gae_lambda",
+                "clip_epsilon",
+                "value_clip_epsilon",
+                "entropy_coef",
+                "value_coef",
+                "max_grad_norm",
+                "n_epochs",
+                "mini_batch_size",
+                "normalize_advantage",
+                "max_policy_lag",
+            )
+        },
+        "model": {
+            key: model[key]
+            for key in (
+                "obs_dim",
+                "action_dim",
+                "hidden_dim",
+                "bootstrap_seed",
+                "tensor_dtype",
+            )
+        },
+        "sample": {
+            "train_batch_size": config["sample_distributor"][
+                "train_batch_size"
+            ]
+        },
+    }
+
+
 def training_config_digest(config: dict) -> common_pb2.ContentDigest:
-    return _digest(config["identity"]["training_config_digest"])
+    actual = canonical_config_digest(training_config_document(config))
+    configured = config["identity"].get("training_config_digest")
+    if configured is None:
+        raise ValueError("configured training_config_digest is required")
+    configured_digest = _digest(configured).hex
+    if configured_digest != actual:
+        raise ValueError(
+            "configured training_config_digest does not match the "
+            "canonical training configuration"
+        )
+    return _digest(actual)
 
 
 def model_identity(document: dict) -> training_pb2.ModelIdentity:
@@ -260,7 +319,6 @@ def validate_config(config: dict) -> None:
         or semantics.reward_schema.canonical_digest.hex
         != REWARD_SCHEMA_DIGEST
         or semantics.semantics_digest.hex != TRAINING_SEMANTICS_DIGEST
-        or training_config_digest(config).hex != TRAINING_CONFIG_DIGEST
         or semantics.model_architecture_id != "maze.mlp-17x64x64.v1"
     ):
         raise ValueError(
@@ -271,7 +329,6 @@ def validate_config(config: dict) -> None:
         != semantics.policy_distribution_schema_id
         or policy.get("training_sampling") != "stochastic"
         or float(policy.get("training_temperature")) != 1.0
-        or policy.get("evaluation_sampling") != "argmax"
     ):
         raise ValueError("policy sampling contract is invalid")
     numeric_ranges: list[tuple[str, float, float, bool]] = [
@@ -320,9 +377,3 @@ def validate_config(config: dict) -> None:
         <= 0
     ):
         raise ValueError("integer training parameters are invalid")
-
-
-def canonical_config_digest(document: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()

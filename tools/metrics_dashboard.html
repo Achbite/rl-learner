@@ -310,8 +310,8 @@
     <div class="depth-item"><div class="depth-label">Model Step</div><div id="model-step" class="depth-value">0</div></div>
     <div class="depth-item"><div class="depth-label">Train Update</div><div id="train-update" class="depth-value">0</div></div>
     <div class="depth-item"><div class="depth-label">Trained Samples</div><div id="trained-samples" class="depth-value">0</div></div>
-    <div class="depth-item"><div class="depth-label">Environment Step</div><div id="environment-step" class="depth-value not-available">暂无</div></div>
-    <div class="depth-item"><div class="depth-label">Curriculum</div><div id="curriculum-stage" class="depth-value not-available">暂无</div></div>
+    <div class="depth-item"><div class="depth-label">Produced Samples</div><div id="produced-samples" class="depth-value">0</div></div>
+    <div class="depth-item"><div class="depth-label">Workload</div><div id="training-workload" class="depth-value">Training</div></div>
   </section>
 
   <section class="toolbar" aria-label="曲线控制">
@@ -322,7 +322,7 @@
         <button class="segment" type="button" data-range="48" aria-pressed="true">48 点</button>
         <button class="segment" type="button" data-range="all" aria-pressed="false">全部</button>
       </div>
-      <label class="toggle">平滑 <input id="smoothing" class="smoothing" type="range" min="0" max="90" value="55" aria-label="平滑比例"> <output id="smoothing-output">0.55</output></label>
+      <label class="toggle">平滑 <input id="smoothing" class="smoothing" type="range" min="0" max="90" value="0" aria-label="平滑比例"> <output id="smoothing-output">0.00</output></label>
     </div>
     <div class="toolbar-group">
       <label class="toggle"><input id="outliers" type="checkbox" checked> 忽略异常值</label>
@@ -330,6 +330,7 @@
         <select id="axis" class="select">
           <option value="model">Model Step</option>
           <option value="update">Train Update</option>
+          <option value="episode">Training Episode</option>
           <option value="time">Wall Time</option>
         </select>
       </label>
@@ -352,14 +353,14 @@
   const MODEL_STEP_ID = "learner.model_step.v1";
   const TRAIN_UPDATE_ID = "learner.train_update.total.v1";
   const TRAINED_SAMPLES_ID = "learner.trained_samples.total.v1";
-  const ENVIRONMENT_STEP_ID = "server.environment_step.v1";
-  const CURRICULUM_STAGE_ID = "server.task.curriculum.multiplier.v1";
+  const TRAINING_EPISODE_ID = "server.training.episode.completed.total.v1";
+  const PRODUCED_SAMPLES_ID = "sample.flow.produced.total.v1";
   const REWARD_COMPONENT_IDS = [
-    "server.reward.component.goal_reward.transition_mean.v1",
-    "server.reward.component.timeout_penalty.transition_mean.v1",
-    "server.reward.component.geodesic_progress.transition_mean.v1",
-    "server.reward.component.first_visit_bonus.transition_mean.v1",
-    "server.reward.component.wasted_action_penalty.transition_mean.v1"
+    "server.training.reward.component.goal_reward.episode_mean.v1",
+    "server.training.reward.component.timeout_penalty.episode_mean.v1",
+    "server.training.reward.component.geodesic_progress.episode_mean.v1",
+    "server.training.reward.component.first_visit_bonus.episode_mean.v1",
+    "server.training.reward.component.wasted_action_penalty.episode_mean.v1"
   ];
   const groups = [
     {
@@ -367,8 +368,11 @@
       initial: ["learner.loss.policy.v1", "learner.loss.value.v1"]
     },
     {
-      id: "episode-return", title: "Episode Return", catalogGroup: "episode_return",
-      initial: ["server.episode.learning_return.mean.v1"]
+      id: "episode-return", title: "Agent Episode Return", catalogGroup: "episode_return",
+      initial: [
+        "server.training.episode.learning_return.mean.v1",
+        "server.training.episode.learning_return.latest_mean.v1"
+      ]
     },
     {
       id: "reward-components", title: "Reward Components", catalogGroup: "reward_components",
@@ -377,13 +381,13 @@
     {
       id: "episode-success", title: "Episode Success", catalogGroup: "episode_success",
       initial: [
-        "server.episode.success.agent_rate.v1",
-        "server.episode.success.any_rate.v1",
-        "server.episode.success.all_rate.v1",
-        "server.episode.path_ratio.mean.v1",
-        "server.episode.step.mean.v1",
-        "server.episode.unique_cells.mean.v1",
-        "server.episode.blocked_move_rate.v1"
+        "server.training.episode.success.agent_rate.v1",
+        "server.training.episode.success.any_rate.v1",
+        "server.training.episode.success.all_rate.v1",
+        "server.training.episode.path_ratio.mean.v1",
+        "server.training.episode.step.mean.v1",
+        "server.training.episode.unique_cells.mean.v1",
+        "server.training.episode.blocked_move_rate.v1"
       ]
     },
     {
@@ -428,10 +432,11 @@
   const registry = new Map();
   const state = {
     records: [],
+    recordLimit: 4096,
     cursor: 0,
     sourceId: "",
     range: 48,
-    smoothing: .55,
+    smoothing: 0,
     axis: "model",
     ignoreOutliers: true,
     focus: {},
@@ -556,6 +561,7 @@
   const axisValue = record => {
     if (state.axis === "time") return finiteNumber(record.timestamp) || 0;
     if (state.axis === "update") return metricValue(record, TRAIN_UPDATE_ID) || 0;
+    if (state.axis === "episode") return metricValue(record, TRAINING_EPISODE_ID) || 0;
     return metricValue(record, MODEL_STEP_ID) || 0;
   };
   const axisLabel = record => {
@@ -567,12 +573,7 @@
       : formatInteger(value);
   };
   const visibleRecords = () => {
-    let records = state.records;
-    if (state.axis !== "time") {
-      const byStep = new Map();
-      records.forEach(record => byStep.set(axisValue(record), record));
-      records = [...byStep.values()];
-    }
+    const records = state.records;
     return state.range === "all" ? records : records.slice(-state.range);
   };
   const ema = values => {
@@ -638,7 +639,7 @@
       "sample_count", "sample_rate", "duration", "environment_step",
       "cell_count"
     ].includes(metric.dimension);
-    const zeroBaseline = ["loss", "episode_return", "transition_reward"].includes(metric.dimension);
+    const zeroBaseline = metric.dimension === "loss";
     let minimum;
     let maximum;
     if (zeroFloor) {
@@ -732,7 +733,8 @@
       "aria-label",
       `${group.title} 曲线，横轴 ${
         state.axis === "time" ? "Wall Time" :
-        state.axis === "update" ? "Train Update" : "Model Step"
+        state.axis === "update" ? "Train Update" :
+        state.axis === "episode" ? "Training Episode" : "Model Step"
       }`
     );
     if (!records.length || !series.length) {
@@ -983,7 +985,7 @@
       (left, right) =>
         Number(left.sequence || left.train_step || 0) -
         Number(right.sequence || right.train_step || 0)
-    );
+    ).slice(-state.recordLimit);
     const latest = state.records[state.records.length - 1];
     state.cursor = latest
       ? Number(latest.sequence || latest.train_step || 0)
@@ -993,9 +995,12 @@
     const actor = record?.actor || {};
     const learnerConnected = status?.service === "learner-metrics";
     const stale = status?.stale !== false;
-    const serverReady = actor.ready === true && !actor.error && !stale;
+    const serverPresent = Boolean(actor.instance_id) && !stale;
+    const clientConnected = actor.client_session_recent === true;
+    const serverReady = serverPresent && actor.ready === true &&
+      !actor.error && clientConnected;
     byId("learner-count").textContent = learnerConnected ? "1 / 1" : "0 / 1";
-    byId("server-count").textContent = serverReady ? "1 / 1" : "0 / 1";
+    byId("server-count").textContent = serverPresent ? "1 / 1" : "0 / 1";
     setStatus(
       byId("learner-state"),
       !learnerConnected ? "未连接" : stale ? "等待指标" : "运行中",
@@ -1005,7 +1010,9 @@
       byId("server-state"),
       serverReady ? "运行中" :
         actor.error ? "异常" :
-        stale && actor.instance_id ? "状态过期" : "未就绪",
+        stale && actor.instance_id ? "状态过期" :
+        serverPresent && actor.ready !== true ? "模型同步中" :
+        serverPresent ? "等待 Client" : "未连接",
       serverReady ? "ok" : actor.error ? "bad" : "wait"
     );
     const chainReady = record?.chain?.ready === true;
@@ -1025,23 +1032,12 @@
     const modelStep = metricValue(record, MODEL_STEP_ID);
     const trainUpdate = metricValue(record, TRAIN_UPDATE_ID);
     const trainedSamples = metricValue(record, TRAINED_SAMPLES_ID);
-    const environmentStep = metricValue(record, ENVIRONMENT_STEP_ID);
-    const curriculumStage = metricValue(record, CURRICULUM_STAGE_ID);
-    const curriculumLabel = record?.actor?.metric_labels?.[CURRICULUM_STAGE_ID];
+    const producedSamples = metricValue(record, PRODUCED_SAMPLES_ID);
     byId("model-step").textContent = formatInteger(modelStep || 0);
     byId("train-update").textContent = formatInteger(trainUpdate || 0);
     byId("trained-samples").textContent = formatInteger(trainedSamples || 0);
-    byId("environment-step").textContent =
-      environmentStep === null ? "暂无" : formatInteger(environmentStep);
-    byId("environment-step").classList.toggle(
-      "not-available", environmentStep === null
-    );
-    byId("curriculum-stage").textContent = curriculumStage === null
-      ? "暂无"
-      : curriculumLabel || `${formatInteger(curriculumStage)}×`;
-    byId("curriculum-stage").classList.toggle(
-      "not-available", curriculumStage === null
-    );
+    byId("produced-samples").textContent =
+      formatInteger(producedSamples || 0);
   };
 
   const poll = async () => {
@@ -1053,6 +1049,11 @@
         throw new Error(`status HTTP ${statusResponse.status}`);
       }
       const status = await statusResponse.json();
+      const retainedRecordLimit = Number(status.retained_record_limit);
+      if (Number.isInteger(retainedRecordLimit) && retainedRecordLimit > 0) {
+        state.recordLimit = retainedRecordLimit;
+        state.records = state.records.slice(-state.recordLimit);
+      }
       const sourceChanged = state.sourceId !== status.metrics_source_id;
       if (sourceChanged) resetStream(status.metrics_source_id);
       await refreshCatalog(sourceChanged || registry.size === 0);

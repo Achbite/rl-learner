@@ -146,16 +146,22 @@ printf '%s\n' "$$" > "${training_lock}/pid"
 
 if [ -d "${local_train_root}" ]; then
     find "${local_train_root}" -mindepth 1 -maxdepth 1 \
+        ! -name metrics \
         -exec rm -rf -- {} +
 else
     mkdir -p "${local_train_root}"
+fi
+if ! rm -rf -- "${local_train_root}/metrics"; then
+    echo "Metrics cleanup unavailable; training continues without requiring metrics" >&2
 fi
 mkdir -p \
     "${local_train_root}/runtime/serving" \
     "${local_train_root}/runtime/checkpoints" \
     "${local_train_root}/runtime/receipts" \
-    "${local_train_root}/archive" \
-    "${local_train_root}/metrics"
+    "${local_train_root}/archive"
+if ! mkdir -p "${local_train_root}/metrics"; then
+    echo "Metrics directory unavailable; training continues without local metrics" >&2
+fi
 
 export PYTHONUNBUFFERED=1
 export RL_LOCAL_TRAIN_ROOT="${local_train_root}"
@@ -167,19 +173,26 @@ if [ -n "${initial_checkpoint}" ]; then
 fi
 
 metrics_pid=""
+metrics_failure_reported=0
 training_pid=""
+training_child_status=""
 model_distributor_pid=""
 sample_pool_pid=""
 stopping=0
 quiesced=0
 quiesce_marker="${RL_QUIESCE_MARKER:-/tmp/rl-training-quiesced}"
-rm -f "${quiesce_marker}"
+quiesce_failure_marker="${RL_QUIESCE_FAILURE_MARKER:-/tmp/rl-training-quiesce-failed}"
+rm -f "${quiesce_marker}" "${quiesce_failure_marker}"
 
 terminate_process() {
     local pid="$1"
     local timeout_seconds="$2"
-    if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
-        return
+    if [ -z "${pid}" ]; then
+        return 125
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null
+        return $?
     fi
     kill -TERM "${pid}" 2>/dev/null || true
     local waited=0
@@ -191,7 +204,7 @@ terminate_process() {
     if kill -0 "${pid}" 2>/dev/null; then
         kill -KILL "${pid}" 2>/dev/null || true
     fi
-    wait "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null
 }
 
 shutdown() {
@@ -199,13 +212,13 @@ shutdown() {
         return
     fi
     stopping=1
-    terminate_process "${training_pid}" 120
+    terminate_process "${training_pid}" 120 || true
     training_pid=""
-    terminate_process "${metrics_pid}" 3
+    terminate_process "${metrics_pid}" 3 || true
     metrics_pid=""
-    terminate_process "${model_distributor_pid}" 3
+    terminate_process "${model_distributor_pid}" 3 || true
     model_distributor_pid=""
-    terminate_process "${sample_pool_pid}" 10
+    terminate_process "${sample_pool_pid}" 10 || true
     sample_pool_pid=""
     rm -rf -- "${training_lock}"
 }
@@ -215,9 +228,25 @@ quiesce() {
         return
     fi
     quiesced=1
-    terminate_process "${training_pid}" 120
+    local child_status="${training_child_status}"
+    if [ -n "${training_pid}" ]; then
+        if terminate_process "${training_pid}" 120; then
+            child_status=0
+        else
+            child_status=$?
+        fi
+    elif [ -z "${child_status}" ]; then
+        child_status=125
+    fi
+    if [ -n "${training_pid}" ]; then
+        training_child_status="${child_status}"
+    fi
     training_pid=""
-    : > "${quiesce_marker}"
+    if [ "${child_status}" -eq 0 ]; then
+        : > "${quiesce_marker}"
+    else
+        printf '%s\n' "${child_status}" > "${quiesce_failure_marker}"
+    fi
 }
 
 trap quiesce USR1
@@ -288,7 +317,6 @@ while [ "${stopping}" -eq 0 ]; do
     for process in \
         "${sample_pool_pid}" \
         "${model_distributor_pid}" \
-        "${metrics_pid}" \
         "${training_pid}"; do
         if [ -z "${process}" ]; then
             continue
@@ -299,9 +327,26 @@ while [ "${stopping}" -eq 0 ]; do
             else
                 child_status=$?
             fi
+            if [ "${process}" = "${training_pid}" ]; then
+                training_child_status="${child_status}"
+                training_pid=""
+            fi
             shutdown
             exit "${child_status}"
         fi
     done
+    if [ -n "${metrics_pid}" ] &&
+       ! kill -0 "${metrics_pid}" 2>/dev/null; then
+        if wait "${metrics_pid}"; then
+            metrics_status=0
+        else
+            metrics_status=$?
+        fi
+        metrics_pid=""
+        if [ "${metrics_failure_reported}" -eq 0 ]; then
+            echo "Learner Monitor unavailable (exit=${metrics_status}); training continues" >&2
+            metrics_failure_reported=1
+        fi
+    fi
     sleep 0.2
 done

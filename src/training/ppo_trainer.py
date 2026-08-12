@@ -107,6 +107,8 @@ class PPOTrainer:
         4. export_onnx() 定期导出模型
     """
 
+    MAX_MODEL_VERSION = (1 << 64) - 1
+
     def __init__(self, config: dict):
         """
         Args:
@@ -149,6 +151,8 @@ class PPOTrainer:
 
         # ---- 模型版本号 ----
         self._model_version = 0
+        self._checkpoint_source_model_version: int | None = None
+        self._publication_version_reserved = False
 
         self._logger.info(
             "PPOTrainer 初始化完成: obs_dim=%d, action_dim=%d, hidden=%d, device=%s",
@@ -242,6 +246,47 @@ class PPOTrainer:
         return trajectory
 
     # ---- PPO 训练 ----
+    @staticmethod
+    def _importance_ratio(
+        new_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.exp(new_log_probs - old_log_probs)
+
+    @classmethod
+    def _clipped_policy_loss(
+        cls,
+        new_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        clip_epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ratio = cls._importance_ratio(new_log_probs, old_log_probs)
+        unclipped = ratio * advantages
+        clipped = torch.clamp(
+            ratio,
+            1.0 - clip_epsilon,
+            1.0 + clip_epsilon,
+        ) * advantages
+        return -torch.minimum(unclipped, clipped).mean(), ratio
+
+    @staticmethod
+    def _clipped_value_loss(
+        new_values: torch.Tensor,
+        old_values: torch.Tensor,
+        returns: torch.Tensor,
+        clip_epsilon: float,
+    ) -> torch.Tensor:
+        clipped_values = old_values + torch.clamp(
+            new_values - old_values,
+            -clip_epsilon,
+            clip_epsilon,
+        )
+        return torch.maximum(
+            (new_values - returns).pow(2),
+            (clipped_values - returns).pow(2),
+        ).mean()
+
     def train_on_batch(
         self,
         samples: List[dict],
@@ -351,21 +396,20 @@ class PPOTrainer:
                     new_log_probs, new_values, entropy = self._model.evaluate_actions(mb_obs, mb_actions)
 
                     # ---- Policy Loss（PPO-Clip）----
-                    ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                    surr1 = ratio * mb_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self._clip_epsilon, 1.0 + self._clip_epsilon) * mb_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
+                    policy_loss, ratio = self._clipped_policy_loss(
+                        new_log_probs,
+                        mb_old_log_probs,
+                        mb_advantages,
+                        self._clip_epsilon,
+                    )
 
                     # ---- Value Loss（以行为策略 V(s) 为裁剪基准）----
-                    clipped_values = mb_old_values + torch.clamp(
-                        new_values - mb_old_values,
-                        -self._value_clip_epsilon,
+                    value_loss = self._clipped_value_loss(
+                        new_values,
+                        mb_old_values,
+                        mb_td_returns,
                         self._value_clip_epsilon,
                     )
-                    value_loss = torch.maximum(
-                        (new_values - mb_td_returns).pow(2),
-                        (clipped_values - mb_td_returns).pow(2),
-                    ).mean()
 
                     # ---- Entropy Loss ----
                     entropy_loss = -entropy.mean()
@@ -557,13 +601,45 @@ class PPOTrainer:
             checkpoint = torch.load(path, map_location=self._device)
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self._model_version = checkpoint.get("model_version", 0)
+        self._model_version = int(checkpoint.get("model_version", 0))
+        self._checkpoint_source_model_version = self._model_version
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_rng_state"])
         if "numpy_rng_state" in checkpoint:
             np.random.set_state(checkpoint["numpy_rng_state"])
         self._logger.info("Checkpoint 已加载: %s (version=%d)", path, self._model_version)
         return True
+
+    def reserve_initial_checkpoint_publication_version(
+        self, expected_source_version: int
+    ) -> int:
+        if isinstance(expected_source_version, bool) or not isinstance(
+            expected_source_version, int
+        ):
+            raise ValueError("checkpoint source model version must be an integer")
+        if self._publication_version_reserved:
+            raise RuntimeError(
+                "initial checkpoint publication version was already reserved"
+            )
+        if self._checkpoint_source_model_version is None:
+            raise RuntimeError(
+                "initial checkpoint publication requires a loaded checkpoint"
+            )
+        if (
+            expected_source_version != self._checkpoint_source_model_version
+            or self._model_version != expected_source_version
+        ):
+            raise RuntimeError(
+                "initial checkpoint publication source version mismatch"
+            )
+        if not 0 <= expected_source_version < self.MAX_MODEL_VERSION:
+            raise OverflowError(
+                "initial checkpoint publication version exceeds uint64"
+            )
+        target_version = expected_source_version + 1
+        self._model_version = target_version
+        self._publication_version_reserved = True
+        return target_version
 
     # ---- 属性访问 ----
     @property

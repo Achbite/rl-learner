@@ -39,6 +39,7 @@ class RuntimeSelectionTest(unittest.TestCase):
             lineage_id=cfg["identity"]["model_lineage_id"]
         )
         runtime.trainer = SimpleNamespace(model_version=2, max_policy_lag=2)
+        runtime._effective_max_policy_lag = lambda: 2
         runtime.learner_service = service_identity("learner", "learner-test")
         runtime.train_batch_size = 512
         runtime.max_train_batch_size = 639
@@ -50,6 +51,7 @@ class RuntimeSelectionTest(unittest.TestCase):
         runtime.demand_id = "learner-test-training-demand"
         runtime._demand_epoch = 0
         runtime._demand_active = False
+        runtime._demand_authority = None
         runtime._last_demand_refresh = 0.0
         runtime.logger = SimpleNamespace(error=lambda *args: None)
         return runtime
@@ -64,6 +66,7 @@ class RuntimeSelectionTest(unittest.TestCase):
             lineage_id=cfg["identity"]["model_lineage_id"]
         )
         runtime.trainer = SimpleNamespace(model_version=2, max_policy_lag=2)
+        runtime._effective_max_policy_lag = lambda: 2
         runtime.learner_service = service_identity("learner", "learner-test")
         runtime.train_batch_size = 512
         runtime.max_train_batch_size = 639
@@ -118,25 +121,51 @@ class RuntimeSelectionTest(unittest.TestCase):
             upserts = []
             releases = []
             reject_release = False
+            active = False
+            active_epoch = 0
+            authority = service_identity(
+                "sample-distributor", "sample-distributor-test", 1
+            )
+
+            def GetStatus(self, request, timeout):
+                return training_pb2.DistributorStatusRsp(
+                    ready=True,
+                    contract=runtime.contract,
+                    distributor=self.authority,
+                    active_demand_count=1 if self.active else 0,
+                    active_demand_epoch=(
+                        self.active_epoch if self.active else 0
+                    ),
+                )
 
             def UpsertSampleDemand(self, request, timeout):
                 self.upserts.append(request)
+                self.active = True
+                self.active_epoch = request.demand.demand_epoch
                 return training_pb2.SampleDemandRsp(
+                    ret_code=0,
                     result=training_pb2.SAMPLE_DEMAND_RESULT_APPLIED,
                     demand=request.demand,
+                    distributor=self.authority,
                 )
 
             def ReleaseSampleDemand(self, request, timeout):
                 self.releases.append(request)
                 if self.reject_release:
                     return training_pb2.SampleDemandRsp(
+                        ret_code=-1,
                         result=(
                             training_pb2.SAMPLE_DEMAND_RESULT_REJECTED_STALE_EPOCH
                         ),
                         message="stale",
+                        distributor=self.authority,
                     )
+                self.active = False
+                self.active_epoch = 0
                 return training_pb2.SampleDemandRsp(
-                    result=training_pb2.SAMPLE_DEMAND_RESULT_RELEASED
+                    ret_code=0,
+                    result=training_pb2.SAMPLE_DEMAND_RESULT_RELEASED,
+                    distributor=self.authority,
                 )
 
         stub = Stub()
@@ -182,12 +211,19 @@ class RuntimeSelectionTest(unittest.TestCase):
             )
         )
         runtime._sample_pool_status = lambda: next(statuses)
+        runtime._ready_sample_distributor_authority = lambda status: (
+            service_identity(
+                "sample-distributor", "sample-distributor-finalize-test", 1
+            )
+        )
         modes = []
         delivery = training_pb2.GetBatchRsp(
             result=training_pb2.GET_BATCH_RESULT_LEASED,
             delivery_id="tail-delivery",
         )
-        runtime._get_batch = lambda mode: modes.append(mode) or delivery
+        runtime._get_batch_recovering = lambda **kwargs: (
+            modes.append(kwargs["mode"]) or delivery
+        )
         trained = []
         runtime._train_delivery = lambda response, allow_partial=False: (
             trained.append((response.delivery_id, allow_partial))
@@ -212,7 +248,10 @@ class RuntimeSelectionTest(unittest.TestCase):
         )
         self.assertEqual(trained, [("tail-delivery", True)])
         self.assertEqual(released, [True])
-        self.assertEqual(recorded, [True])
+        # Final sample settlement is authoritative; optional observation is
+        # emitted only by the background metrics thread and cannot delay or
+        # fail this control-path operation.
+        self.assertEqual(recorded, [])
         self.assertEqual(runtime._metrics_context["disposition"], "FINALIZED")
         self.assertTrue(runtime._finalized)
 

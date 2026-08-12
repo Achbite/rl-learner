@@ -7,8 +7,11 @@ import unittest
 from http.server import HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from main.training_runtime import TrainingRuntime
+from proto import training_pb2
+from src.metrics.metrics_backend import DisabledMetricsBackend, JsonlBackend
 from tools import metrics_server as metrics_server_module
 from tools.metrics_server import (
     DASHBOARD_PATH,
@@ -40,6 +43,48 @@ class MetricsContractTest(unittest.TestCase):
             return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
+
+    def test_actor_snapshot_projects_client_session_presence(self):
+        status = training_pb2.AIServerStatusRsp()
+        status.contract.package_name = "rl-contracts"
+        status.contract.package_version = "0.10.0"
+        status.aiserver.component = "rl-aiserver"
+        status.aiserver.instance_id = "aiserver-test"
+        status.aiserver.lifecycle_epoch = 3
+        status.ready = True
+        status.state = training_pb2.AISERVER_STATE_READY
+        status.active_actor_session_count = 1
+        status.active_trajectory_count = 0
+        status.metrics.descriptors.add(
+            field_id="server.client.session_recent.v1",
+            label="Client session recent",
+        )
+        status.metrics.descriptors.add(
+            field_id="server.client.last_activity_unix_ms.v1",
+            label="Client last activity",
+        )
+        status.metrics.values.add(
+            field_id="server.client.session_recent.v1", value=1.0
+        )
+        status.metrics.values.add(
+            field_id="server.client.last_activity_unix_ms.v1",
+            value=1234.0,
+        )
+
+        runtime = object.__new__(TrainingRuntime)
+        runtime.contract = type(status.contract)()
+        runtime.contract.CopyFrom(status.contract)
+        runtime.actor_stub = SimpleNamespace(
+            GetAIServerStatus=lambda *_args, **_kwargs: status
+        )
+
+        snapshot = runtime._actor_snapshot()
+
+        self.assertEqual(snapshot["active_sessions"], 1)
+        self.assertEqual(snapshot["active_trajectories"], 0)
+        self.assertTrue(snapshot["client_session_recent"])
+        self.assertEqual(snapshot["client_last_activity_unix_ms"], 1234)
+        self.assertEqual(snapshot["instance_id"], "aiserver-test")
 
     def test_root_redirects_to_monitor_and_api_index_stays_json(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,16 +212,42 @@ class MetricsContractTest(unittest.TestCase):
                     "producer_stale_before_ingress": 8,
                     "push_rpc_mean_ms": 1.25,
                     "metric_values": {
-                        "server.environment_step.v1": 37.0,
-                        "server.task.curriculum.multiplier.v1": 8.0,
+                        "server.training.episode.completed.total.v1": 6.0,
+                        "server.training.episode.learning_return.mean.v1": -3.5,
+                        "server.training.episode.learning_return.latest_mean.v1": -4.0,
+                        "server.training.reward.component.geodesic_progress.episode_mean.v1": 0.75,
+                        "server.training.reward.component.geodesic_progress.transition_mean.v1": 0.125,
+                        "server.training.reward.component.geodesic_progress.latest_episode_mean.v1": 0.5,
                         "server.episode.max_steps.current.v1": 1504.0,
                         "server.episode.path_ratio.mean.v1": 1.25,
                         "server.episode.step.mean.v1": 235.5,
                         "server.episode.unique_cells.mean.v1": 91.5,
                         "server.episode.blocked_move_rate.v1": 0.125,
                     },
-                    "metric_labels": {
-                        "server.task.curriculum.multiplier.v1": "8×",
+                    "metric_labels": {},
+                    "metric_statistics": {
+                        "server.training.episode.learning_return.mean.v1": {
+                            "value": -3.5,
+                            "sum": -28.0,
+                            "count": 8,
+                            "scope": "server_pod",
+                            "statistic": "mean",
+                            "aggregation_kind": (
+                                "METRIC_AGGREGATION_KIND_WEIGHTED_MEAN"
+                            ),
+                            "window_kind": "METRIC_WINDOW_KIND_ROLLING",
+                            "window_start_unix_ms": 0,
+                            "window_end_unix_ms": 1234,
+                        },
+                    },
+                    "metric_descriptors": {
+                        "server.training.episode.learning_return.mean.v1": {
+                            "field_id": (
+                                "server.training.episode.learning_return."
+                                "mean.v1"
+                            ),
+                            "owner_component": "maze-task-adapter",
+                        },
                     },
                     "episodes": {
                         "mean_agent_return": -3.5,
@@ -184,6 +255,10 @@ class MetricsContractTest(unittest.TestCase):
                         "max_agent_return": -2.0,
                         "agent_success_rate": 0.25,
                         "reward_components": {
+                            "geodesic_progress": 0.75,
+                            "custom_bonus_2": 5.0,
+                        },
+                        "transition_reward_components": {
                             "geodesic_progress": 0.125,
                             "custom_bonus_2": 0.5,
                             "Bad Reward": 99.0,
@@ -251,6 +326,16 @@ class MetricsContractTest(unittest.TestCase):
                 "server.reward.component.custom_bonus_2.transition_mean.v1",
                 field_ids,
             )
+            self.assertIn(
+                "server.training.reward.component.custom_bonus_2."
+                "episode_mean.v1",
+                field_ids,
+            )
+            self.assertIn(
+                "server.training.reward.component.custom_bonus_2."
+                "transition_mean.v1",
+                field_ids,
+            )
             self.assertNotIn(
                 "server.reward.component.Bad Reward.transition_mean.v1",
                 field_ids,
@@ -278,6 +363,48 @@ class MetricsContractTest(unittest.TestCase):
                 0.125,
             )
             self.assertEqual(
+                values[
+                    "server.training.reward.component.geodesic_progress."
+                    "episode_mean.v1"
+                ],
+                0.75,
+            )
+            self.assertEqual(
+                values[
+                    "server.reward.component.custom_bonus_2."
+                    "transition_mean.v1"
+                ],
+                0.5,
+            )
+            self.assertEqual(
+                values[
+                    "server.training.reward.component.custom_bonus_2."
+                    "episode_mean.v1"
+                ],
+                5.0,
+            )
+            self.assertEqual(
+                values[
+                    "server.training.reward.component.custom_bonus_2."
+                    "transition_mean.v1"
+                ],
+                0.5,
+            )
+            self.assertEqual(
+                values[
+                    "server.training.episode.learning_return.latest_mean.v1"
+                ],
+                -4.0,
+            )
+            self.assertEqual(
+                projected["metric_statistics"],
+                raw_record["actor"]["metric_statistics"],
+            )
+            self.assertEqual(
+                projected["metric_descriptors"],
+                raw_record["actor"]["metric_descriptors"],
+            )
+            self.assertEqual(
                 values["server.episode.success.agent_rate.v1"], 25.0
             )
             self.assertEqual(values["learner.loss.policy.v1"], -0.01)
@@ -293,10 +420,7 @@ class MetricsContractTest(unittest.TestCase):
                 ],
                 8,
             )
-            self.assertEqual(values["server.environment_step.v1"], 37.0)
-            self.assertEqual(
-                values["server.task.curriculum.multiplier.v1"], 8.0
-            )
+            self.assertEqual(values["sample.flow.produced.total.v1"], 100)
             self.assertEqual(
                 values["server.episode.path_ratio.mean.v1"], 1.25
             )
@@ -328,6 +452,58 @@ class MetricsContractTest(unittest.TestCase):
             self.assertNotIn("metric_values", reader.latest())
             self.assertEqual(path.read_bytes(), original_bytes)
 
+    def test_metrics_backend_open_failure_disables_observability_only(self):
+        runtime = object.__new__(TrainingRuntime)
+        runtime.logger = mock.Mock()
+
+        with mock.patch(
+            "main.training_runtime.create_backend",
+            side_effect=OSError("read-only metrics directory"),
+        ):
+            backend = runtime._create_metrics_backend(
+                "jsonl", "/unavailable/metrics"
+            )
+
+        self.assertIsInstance(backend, DisabledMetricsBackend)
+        backend.write({"sequence": 1})
+        self.assertIsNone(backend.latest())
+        self.assertEqual(backend.query(), [])
+        self.assertFalse(backend.summary()["enabled"])
+        runtime.logger.error.assert_called_once()
+
+        with mock.patch(
+            "main.training_runtime.create_backend",
+            side_effect=ValueError("unsupported backend"),
+        ):
+            with self.assertRaisesRegex(ValueError, "unsupported backend"):
+                runtime._create_metrics_backend("invalid", "/tmp/metrics")
+
+    def test_jsonl_backend_keeps_constant_memory_for_unbounded_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = JsonlBackend(directory)
+            self.addCleanup(backend.close)
+            for step in range(2048):
+                backend.write(
+                    {
+                        "train_step": step,
+                        "pass_rate": step / 4096.0,
+                        "mean_episode_reward": -2.0 + step / 2048.0,
+                        "total_loss": 1.0 / (step + 1),
+                    }
+                )
+
+            self.assertFalse(hasattr(backend, "_records"))
+            self.assertEqual(backend.record_count(), 2048)
+            self.assertEqual(backend.latest()["train_step"], 2047)
+            queried = backend.query(since_step=2040, limit=3)
+            self.assertEqual(
+                [record["train_step"] for record in queried],
+                [2041, 2042, 2043],
+            )
+            summary = backend.summary()
+            self.assertEqual(summary["total_steps"], 2048)
+            self.assertLess(summary["best_mean_reward"], 0.0)
+
     def test_reward_component_names_require_canonical_snake_case(self):
         self.assertEqual(
             reward_component_field_id("goal_reward"),
@@ -346,6 +522,50 @@ class MetricsContractTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     reward_component_field_id(invalid)
 
+    def test_metric_snapshot_preserves_server_sum_and_count(self):
+        snapshot = training_pb2.MetricSnapshot()
+        descriptor = snapshot.descriptors.add(
+            field_id="server.training.episode.learning_return.mean.v1",
+            label="Mean Training Agent Return",
+            scope="server_pod",
+            statistic="mean",
+            aggregation_kind=(
+                training_pb2.METRIC_AGGREGATION_KIND_WEIGHTED_MEAN
+            ),
+            window_kind=training_pb2.METRIC_WINDOW_KIND_ROLLING,
+        )
+        self.assertEqual(descriptor.field_id, snapshot.descriptors[0].field_id)
+        snapshot.values.add(
+            field_id=descriptor.field_id,
+            value=-3.5,
+            sum=-28.0,
+            count=8,
+            window_end_unix_ms=1234,
+        )
+
+        values, labels, statistics, descriptors = (
+            TrainingRuntime._metric_snapshot(snapshot)
+        )
+
+        self.assertEqual(values[descriptor.field_id], -3.5)
+        self.assertEqual(labels[descriptor.field_id], descriptor.label)
+        self.assertEqual(statistics[descriptor.field_id]["sum"], -28.0)
+        self.assertEqual(statistics[descriptor.field_id]["count"], 8)
+        self.assertEqual(
+            statistics[descriptor.field_id]["aggregation_kind"],
+            "METRIC_AGGREGATION_KIND_WEIGHTED_MEAN",
+        )
+        self.assertEqual(
+            statistics[descriptor.field_id]["window_kind"],
+            "METRIC_WINDOW_KIND_ROLLING",
+        )
+        self.assertEqual(
+            descriptors[descriptor.field_id]["owner_component"], ""
+        )
+        self.assertEqual(
+            descriptors[descriptor.field_id]["scope"], "server_pod"
+        )
+
     def test_local_sample_monitor_is_self_contained(self):
         document = DASHBOARD_PATH.read_text(encoding="utf-8")
         self.assertIn("本地训练监控", document)
@@ -355,9 +575,24 @@ class MetricsContractTest(unittest.TestCase):
         self.assertIn("metric_values", document)
         self.assertIn("Learner Pod", document)
         self.assertIn("Server Pod", document)
+        self.assertIn("const serverPresent = Boolean(actor.instance_id)", document)
+        self.assertIn("actor.client_session_recent === true", document)
+        self.assertIn("recordLimit: 4096", document)
+        self.assertIn("status.retained_record_limit", document)
+        self.assertIn(".slice(-state.recordLimit)", document)
+        self.assertNotIn("Number(actor.active_sessions || 0) > 0", document)
+        self.assertIn(
+            'serverPresent ? "1 / 1" : "0 / 1"', document
+        )
+        self.assertIn(
+            'serverPresent ? "等待 Client" : "未连接"', document
+        )
+        self.assertIn("Produced Samples", document)
+        self.assertNotIn("Environment Step", document)
+        self.assertNotIn("const byStep = new Map()", document)
         for panel in (
             "Loss",
-            "Episode Return",
+            "Agent Episode Return",
             "Reward Components",
             "Episode Success",
             "Sample Throughput",
@@ -375,19 +610,51 @@ class MetricsContractTest(unittest.TestCase):
         self.assertIn("quantile(sorted, .96)", document)
         self.assertNotIn("Total Reward", document)
         self.assertNotIn("Reward Functions", document)
-        self.assertIn("server.reward.component.geodesic_progress", document)
-        self.assertIn("server.reward.component.timeout_penalty", document)
-        self.assertIn("server.reward.component.first_visit_bonus", document)
+        self.assertNotIn("server.evaluation.", document)
         self.assertIn(
-            "server.reward.component.wasted_action_penalty", document
+            "server.training.reward.component.geodesic_progress", document
         )
-        self.assertIn("server.episode.path_ratio.mean.v1", document)
-        self.assertIn("server.episode.step.mean.v1", document)
-        self.assertIn("server.episode.unique_cells.mean.v1", document)
-        self.assertIn("server.episode.blocked_move_rate.v1", document)
-        self.assertIn("server.task.curriculum.multiplier.v1", document)
+        self.assertIn(
+            "server.training.reward.component.timeout_penalty", document
+        )
+        self.assertIn(
+            "server.training.reward.component.first_visit_bonus", document
+        )
+        self.assertIn(
+            "server.training.reward.component.wasted_action_penalty", document
+        )
+        self.assertIn(
+            "server.training.episode.learning_return.mean.v1", document
+        )
+        self.assertIn(
+            "server.training.episode.learning_return.latest_mean.v1", document
+        )
+        self.assertIn(
+            'state.axis === "episode" ? "Training Episode"', document
+        )
+        self.assertIn('value="0" aria-label="平滑比例"', document)
+        self.assertIn('const zeroBaseline = metric.dimension === "loss"', document)
+        self.assertIn("server.training.episode.path_ratio.mean.v1", document)
+        self.assertIn("server.training.episode.step.mean.v1", document)
+        self.assertIn(
+            "server.training.episode.unique_cells.mean.v1", document
+        )
+        self.assertIn(
+            "server.training.episode.blocked_move_rate.v1", document
+        )
+        self.assertIn('id="training-workload"', document)
         self.assertIn("learner.value.prediction_mean.v1", document)
         self.assertIn("learner.value.return_target_mean.v1", document)
+
+        with tempfile.TemporaryDirectory() as directory:
+            catalog_ids = {
+                item["field_id"]
+                for item in MetricsFileReader(directory).catalog()["fields"]
+            }
+        self.assertFalse(
+            any(field_id.startswith("server.evaluation.")
+                for field_id in catalog_ids)
+        )
         self.assertIn("learner.value.explained_variance.v1", document)
         self.assertIn(
             "sample.flow.producer_stale_before_ingress.total.v1",
@@ -508,6 +775,62 @@ class MetricsContractTest(unittest.TestCase):
             self.assertTrue(status["stale"])
             self.assertNotIn("run_id", summary)
             self.assertNotIn("run_id", status)
+
+    def test_metrics_reader_retains_a_bounded_monitor_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics_20260730.jsonl"
+            path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "schema_version": 3,
+                            "mode": "training",
+                            "sequence": sequence,
+                            "timestamp": time.time(),
+                        }
+                    )
+                    + "\n"
+                    for sequence in range(1, 7)
+                ),
+                encoding="utf-8",
+            )
+            reader = MetricsFileReader(directory, max_records=4)
+
+            self.assertEqual(
+                [record["sequence"] for record in reader.query()],
+                [3, 4, 5, 6],
+            )
+            self.assertEqual(reader.latest()["sequence"], 6)
+            status = reader.status()
+            self.assertEqual(status["record_count"], 4)
+            self.assertEqual(status["total_record_count"], 6)
+            self.assertEqual(status["retained_record_limit"], 4)
+
+    def test_metrics_reader_catches_up_in_bounded_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics_large_tail.jsonl"
+            path.write_text(
+                "".join(
+                    json.dumps({"sequence": sequence}) + "\n"
+                    for sequence in range(1, 101)
+                ),
+                encoding="utf-8",
+            )
+            reader = MetricsFileReader(
+                directory, max_records=4, read_chunk_bytes=64
+            )
+
+            reader.refresh()
+            self.assertGreater(reader._total_record_count, 0)
+            self.assertLess(reader._total_record_count, 100)
+            for _ in range(100):
+                reader.refresh()
+
+            self.assertEqual(reader.status()["total_record_count"], 100)
+            self.assertEqual(
+                [record["sequence"] for record in reader.query()],
+                [97, 98, 99, 100],
+            )
 
 
 if __name__ == "__main__":

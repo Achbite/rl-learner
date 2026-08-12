@@ -9,7 +9,14 @@ import torch
 import yaml
 
 from main.training_runtime import ModelPublisher, TrainingRuntime, load_config
-from src.contracts.identity import canonical_config_digest, manifest_message
+from src.contracts.identity import (
+    canonical_config_digest,
+    manifest_message,
+    training_config_digest,
+    training_config_document,
+    validate_config,
+)
+from src.metrics.metrics_backend import DisabledMetricsBackend
 from src.training.ppo_trainer import PPOTrainer
 
 
@@ -26,6 +33,9 @@ def config(root: Path, archive_interval: int = 2) -> dict:
     document["model"]["archive_interval_updates"] = archive_interval
     document["training"]["n_epochs"] = 1
     document["training"]["mini_batch_size"] = 2
+    document["identity"]["training_config_digest"] = (
+        canonical_config_digest(training_config_document(document))
+    )
     return document
 
 
@@ -116,7 +126,7 @@ class ModelCommitContractTest(unittest.TestCase):
             publisher = ModelPublisher(document)
         self.assertEqual(publisher.archive_interval_updates, 200)
 
-    def test_training_identity_digests_are_canonical(self):
+    def test_training_identity_digest_is_canonical_and_seed_specific(self):
         document = yaml.safe_load(
             (ROOT / "configs" / "learner_config.yaml").read_text(
                 encoding="utf-8"
@@ -129,57 +139,84 @@ class ModelCommitContractTest(unittest.TestCase):
             configured_semantics_digest,
         )
 
-        training_identity = {
-            "training_semantics_digest": configured_semantics_digest,
-            "policy_spec_digest": document["policy"]["policy_spec_digest"],
-            "model_lineage_id": document["identity"]["model_lineage_id"],
-            "training": {
-                key: document["training"][key]
-                for key in (
-                    "device",
-                    "seed",
-                    "learning_rate",
-                    "gamma",
-                    "gae_lambda",
-                    "clip_epsilon",
-                    "value_clip_epsilon",
-                    "entropy_coef",
-                    "value_coef",
-                    "max_grad_norm",
-                    "n_epochs",
-                    "mini_batch_size",
-                    "normalize_advantage",
-                    "max_policy_lag",
-                )
-            },
-            "model": {
-                key: document["model"][key]
-                for key in (
-                    "obs_dim",
-                    "action_dim",
-                    "hidden_dim",
-                    "bootstrap_seed",
-                    "tensor_dtype",
-                )
-            },
-            "sample": {
-                "train_batch_size": document["sample_distributor"][
-                    "train_batch_size"
-                ]
-            },
-        }
-        self.assertEqual(
-            canonical_config_digest(training_identity),
-            document["identity"]["training_config_digest"],
+        base_digest = (
+            "b8a98bd14abc5f09e57c65516ff1eae8"
+            "222b9515b058d76c34af4a88dee7551f"
         )
+        self.assertEqual(
+            document["identity"]["training_config_digest"],
+            base_digest,
+        )
+        self.assertEqual(
+            canonical_config_digest(training_config_document(document)),
+            base_digest,
+        )
+        self.assertEqual(training_config_digest(document).hex, base_digest)
+
+        seed_one = copy.deepcopy(document)
+        seed_one["identity"]["model_lineage_id"] = "maze-fixed-map-seed-1"
+        seed_one["training"]["seed"] = 1
+        seed_one["model"]["bootstrap_seed"] = 1
+        seed_one_digest = (
+            "f61cdd19203538269fc18aa5ba349d4b"
+            "877bdbc5103b763acab71300289ab2e0"
+        )
+        seed_one["identity"]["training_config_digest"] = seed_one_digest
+        self.assertEqual(
+            canonical_config_digest(training_config_document(seed_one)),
+            seed_one_digest,
+        )
+        self.assertEqual(
+            training_config_digest(seed_one).hex,
+            seed_one_digest,
+        )
+        validate_config(seed_one)
+
+        stale_seed_one = copy.deepcopy(seed_one)
+        stale_seed_one["identity"]["training_config_digest"] = base_digest
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_config(stale_seed_one)
+
+        missing_declaration = copy.deepcopy(seed_one)
+        del missing_declaration["identity"]["training_config_digest"]
+        with self.assertRaisesRegex(ValueError, "is required"):
+            validate_config(missing_declaration)
 
     def test_prepare_rejects_unclean_local_train_data(self):
         with tempfile.TemporaryDirectory() as directory:
             first = ModelPublisher(config(Path(directory)))
             first.prepare()
-            (first.metrics_dir / "old.jsonl").write_text("{}\n")
+            first.state_path.write_text("{}\n")
             with self.assertRaisesRegex(RuntimeError, "was not cleaned"):
                 ModelPublisher(config(Path(directory))).prepare()
+
+    def test_prepare_ignores_optional_metrics_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = ModelPublisher(config(Path(directory)))
+            first.prepare()
+            first.metrics_dir.mkdir(parents=True)
+            (first.metrics_dir / "old.jsonl").write_text("{}\n")
+
+            ModelPublisher(config(Path(directory))).prepare()
+
+    def test_runtime_starts_with_metrics_path_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metrics_path = root / "local-train" / "metrics"
+            metrics_path.parent.mkdir(parents=True)
+            metrics_path.write_text("metrics path is unavailable\n")
+
+            runtime = TrainingRuntime(config(root))
+            try:
+                self.assertIsInstance(
+                    runtime.metrics_backend, DisabledMetricsBackend
+                )
+                self.assertTrue(metrics_path.is_file())
+            finally:
+                runtime.metrics_backend.close()
+                runtime.actor_channel.close()
+                runtime.model_channel.close()
+                runtime.sample_channel.close()
 
     def test_manifest_binds_full_identity_and_detects_corruption(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -236,6 +273,9 @@ class ModelCommitContractTest(unittest.TestCase):
             shutil.copyfile(archive / "checkpoint.pt", external)
             child_cfg = config(root / "child")
             child_cfg["identity"]["model_lineage_id"] = "different-lineage"
+            child_cfg["identity"]["training_config_digest"] = (
+                canonical_config_digest(training_config_document(child_cfg))
+            )
             child = ModelPublisher(child_cfg)
             child.prepare()
             with self.assertRaisesRegex(RuntimeError, "incompatible"):

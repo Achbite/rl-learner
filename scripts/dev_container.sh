@@ -136,8 +136,9 @@ stop_monitor_transport() {
 
 prepare_monitor_transport() {
     local target
+    local upstream_port
     if [ ! -f "${colima_ssh_config}" ] || ! command -v ssh >/dev/null 2>&1; then
-        return
+        return 1
     fi
     if monitor_tunnel_running; then
         return
@@ -174,6 +175,14 @@ PY
         echo "Colima SSH config has no Host entry: ${colima_ssh_config}" >&2
         return 1
     fi
+    upstream_port="$(
+        docker port "${container_name}" 9005/tcp 2>/dev/null |
+            awk -F: 'NR == 1 {print $NF}'
+    )"
+    if ! [[ "${upstream_port}" =~ ^[0-9]+$ ]]; then
+        echo "MONITOR_TARGET_UNAVAILABLE: learner-dev has no metrics port mapping" >&2
+        return 1
+    fi
     ssh \
         -F "${colima_ssh_config}" \
         -o ControlMaster=yes \
@@ -182,7 +191,7 @@ PY
         -o ExitOnForwardFailure=yes \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
-        -L "127.0.0.1:${monitor_host_port}:127.0.0.1:${monitor_host_port}" \
+        -L "127.0.0.1:${monitor_host_port}:127.0.0.1:${upstream_port}" \
         -N \
         -f \
         "${target}"
@@ -281,7 +290,25 @@ build_image() {
         "${repo_dir}"
 }
 
+create_container() {
+    local contract_dir="$1"
+    docker run --detach \
+        --name "${container_name}" \
+        --network "${network_name}" \
+        --network-alias "${container_name}" \
+        --network-alias "maze-learner" \
+        --publish "127.0.0.1::9005" \
+        --volume "${repo_dir}:/workspace/rl-learner" \
+        --volume "${contract_dir}/python/common_pb2.py:/workspace/rl-learner/proto/common_pb2.py:ro" \
+        --volume "${contract_dir}/python/training_pb2.py:/workspace/rl-learner/proto/training_pb2.py:ro" \
+        --volume "${contract_dir}/python/training_pb2_grpc.py:/workspace/rl-learner/proto/training_pb2_grpc.py:ro" \
+        "${dev_image}" >/dev/null
+}
+
 ensure_container() {
+    local contract_dir
+    local legacy_binding
+    local start_error
     contract_dir="${workspace_root}/.workspace/artifacts/rl-contracts/${RL_CONTRACTS_VERSION}/${platform_dir}"
     if [ ! -f "${contract_dir}/python/common_pb2.py" ] ||
        [ ! -f "${contract_dir}/python/training_pb2.py" ]; then
@@ -295,19 +322,21 @@ ensure_container() {
         docker network create "${network_name}" >/dev/null
     fi
     if ! docker container inspect "${container_name}" >/dev/null 2>&1; then
-        docker run --detach \
-            --name "${container_name}" \
-            --network "${network_name}" \
-            --network-alias "${container_name}" \
-            --network-alias "maze-learner" \
-            --publish "127.0.0.1:9005:9005" \
-            --volume "${repo_dir}:/workspace/rl-learner" \
-            --volume "${contract_dir}/python/common_pb2.py:/workspace/rl-learner/proto/common_pb2.py:ro" \
-            --volume "${contract_dir}/python/training_pb2.py:/workspace/rl-learner/proto/training_pb2.py:ro" \
-            --volume "${contract_dir}/python/training_pb2_grpc.py:/workspace/rl-learner/proto/training_pb2_grpc.py:ro" \
-            "${dev_image}" >/dev/null
+        create_container "${contract_dir}"
     elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
-        docker start "${container_name}" >/dev/null
+        legacy_binding="$(docker port "${container_name}" 9005/tcp 2>/dev/null || true)"
+        if ! start_error="$(docker start "${container_name}" 2>&1)"; then
+            if [[ "${legacy_binding}" =~ :9005$ ]] &&
+               { [[ "${start_error}" == *"address already in use"* ]] ||
+                 [[ "${start_error}" == *"port is already allocated"* ]]; }; then
+                echo "Migrating stopped learner-dev from legacy fixed monitor port" >&2
+                docker rm "${container_name}" >/dev/null
+                create_container "${contract_dir}"
+            else
+                echo "${start_error}" >&2
+                return 1
+            fi
+        fi
     fi
 }
 
@@ -331,12 +360,19 @@ case "${action}" in
         ;;
     training)
         ensure_container
-        prepare_monitor_transport
-        trap 'stop_monitor_transport' EXIT
+        monitor_transport_ready=0
+        if prepare_monitor_transport; then
+            monitor_transport_ready=1
+        else
+            echo "Learner Monitor transport unavailable; training continues" >&2
+        fi
+        trap '[ "${monitor_transport_ready}" -eq 0 ] || stop_monitor_transport' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
-        printf 'Learner Monitor (available after startup): http://127.0.0.1:%s/\n' \
-            "${monitor_host_port}"
+        if [ "${monitor_transport_ready}" -eq 1 ]; then
+            printf 'Learner Monitor (available after startup): http://127.0.0.1:%s/\n' \
+                "${monitor_host_port}"
+        fi
         docker_exec_args=(exec -i)
         if [ -t 0 ] && [ -t 1 ]; then
             docker_exec_args+=(--tty)
@@ -348,7 +384,9 @@ case "${action}" in
         training_status=$?
         set -e
         trap - EXIT INT TERM
-        stop_monitor_transport
+        if [ "${monitor_transport_ready}" -eq 1 ]; then
+            stop_monitor_transport
+        fi
         exit "${training_status}"
         ;;
     monitor)

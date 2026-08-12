@@ -2,6 +2,7 @@
 """Serve metrics for the currently active Learner training process."""
 
 import argparse
+from collections import deque
 import copy
 import glob
 import json
@@ -59,9 +60,9 @@ def _metric_definition(
         owner_component = "rl-learner"
     elif field_id.startswith("server.episode.") or field_id.startswith(
         "server.reward."
-    ) or field_id.startswith("server.task.") or field_id.startswith(
-        "server.evaluation."
-    ):
+    ) or field_id.startswith(
+        "server.training."
+    ) or field_id.startswith("server.task."):
         owner_component = "maze-task-adapter"
     elif field_id.startswith("server.") or field_id.startswith(
         "sample.flow.produced"
@@ -136,43 +137,6 @@ _STATIC_METRIC_DEFINITIONS = (
         ("learner", "trained_samples"), ("trained_samples",),
     ),
     _metric_definition(
-        "server.environment_step.v1", "Environment Step", "training_depth",
-        "environment_step", "step", "server", "latest", "gauge",
-        ("actor", "metric_values", "server.environment_step.v1"),
-        ("actor", "environment_step"),
-    ),
-    _metric_definition(
-        "server.task.curriculum.multiplier.v1", "Curriculum",
-        "training_depth", "curriculum_multiplier", "×", "server",
-        "latest", "gauge",
-        ("actor", "metric_values",
-         "server.task.curriculum.multiplier.v1"),
-    ),
-    _metric_definition(
-        "server.task.stage_produced_samples.v1", "Stage Samples",
-        "training_depth", "sample_count", "samples", "server_stage",
-        "total", "counter", ("actor", "metric_values",
-                               "server.task.stage_produced_samples.v1"),
-    ),
-    _metric_definition(
-        "server.task.stage_sample_budget.v1", "Stage Sample Budget",
-        "training_depth", "sample_count", "samples", "server_stage",
-        "latest", "gauge", ("actor", "metric_values",
-                              "server.task.stage_sample_budget.v1"),
-    ),
-    _metric_definition(
-        "server.task.next_evaluation_trained_samples.v1", "Next Evaluation",
-        "training_depth", "sample_count", "samples", "server_task",
-        "latest", "gauge", ("actor", "metric_values",
-                              "server.task.next_evaluation_trained_samples.v1"),
-    ),
-    _metric_definition(
-        "server.evaluation.episode_in_round.v1", "Evaluation Episode",
-        "training_depth", "episode_count", "episode", "evaluation_round",
-        "latest", "gauge", ("actor", "metric_values",
-                              "server.evaluation.episode_in_round.v1"),
-    ),
-    _metric_definition(
         "server.episode.max_steps.current.v1", "Episode Max Steps",
         "training_depth", "environment_step", "step", "server",
         "latest", "gauge",
@@ -200,6 +164,29 @@ _STATIC_METRIC_DEFINITIONS = (
         ("mean_episode_reward",),
     ),
     _metric_definition(
+        "server.training.episode.learning_return.mean.v1",
+        "Mean Training Agent Return", "episode_return", "episode_return",
+        "reward", "training_agent_episode_window", "mean", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.learning_return.mean.v1"),
+        ("actor", "episodes", "mean_agent_return"),
+    ),
+    _metric_definition(
+        "server.training.episode.learning_return.latest_mean.v1",
+        "Latest Training Agent Return", "episode_return", "episode_return",
+        "reward", "latest_training_environment_episode", "latest", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.learning_return.latest_mean.v1"),
+        ("actor", "episodes", "latest_agent_return"),
+    ),
+    _metric_definition(
+        "server.training.episode.completed.total.v1",
+        "Completed Training Episodes", "training_depth", "episode_count",
+        "episodes", "server", "total", "counter",
+        ("actor", "metric_values",
+         "server.training.episode.completed.total.v1"),
+    ),
+    _metric_definition(
         "server.episode.learning_return.min.v1", "Min Learning Return",
         "episode_return", "episode_return", "reward", "agent_episode_window",
         "min", "gauge", ("actor", "episodes", "min_agent_return"),
@@ -214,6 +201,30 @@ _STATIC_METRIC_DEFINITIONS = (
         "episode_success", "percentage", "%", "agent_episode_window",
         "mean", "gauge", ("actor", "episodes", "agent_success_rate"),
         ("pass_rate",), scale=100.0,
+    ),
+    _metric_definition(
+        "server.training.episode.success.agent_rate.v1",
+        "Training Agent Success", "episode_success", "percentage", "%",
+        "training_agent_episode_window", "mean", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.success.agent_rate.v1"),
+        ("actor", "episodes", "agent_success_rate"), scale=100.0,
+    ),
+    _metric_definition(
+        "server.training.episode.success.any_rate.v1",
+        "Training Any Success", "episode_success", "percentage", "%",
+        "training_environment_episode_window", "mean", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.success.any_rate.v1"),
+        ("actor", "episodes", "any_success_rate"), scale=100.0,
+    ),
+    _metric_definition(
+        "server.training.episode.success.all_rate.v1",
+        "Training All Success", "episode_success", "percentage", "%",
+        "training_environment_episode_window", "mean", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.success.all_rate.v1"),
+        ("actor", "episodes", "all_success_rate"), scale=100.0,
     ),
     _metric_definition(
         "server.episode.success.any_rate.v1", "Any Success",
@@ -253,37 +264,32 @@ _STATIC_METRIC_DEFINITIONS = (
         scale=100.0,
     ),
     _metric_definition(
-        "server.evaluation.argmax_round_1_success_rate.v1",
-        "Argmax Round 1 Success", "episode_success", "percentage", "%",
-        "evaluation_agent_episodes", "mean", "gauge",
+        "server.training.episode.path_ratio.mean.v1",
+        "Training Path Ratio", "episode_success", "ratio", "1",
+        "successful_training_agent_episode_window", "mean", "gauge",
         ("actor", "metric_values",
-         "server.evaluation.argmax_round_1_success_rate.v1"), scale=100.0,
+         "server.training.episode.path_ratio.mean.v1"),
     ),
     _metric_definition(
-        "server.evaluation.argmax_round_2_success_rate.v1",
-        "Argmax Round 2 Success", "episode_success", "percentage", "%",
-        "evaluation_agent_episodes", "mean", "gauge",
+        "server.training.episode.step.mean.v1", "Training Episode Step",
+        "episode_success", "environment_step", "step",
+        "training_agent_episode_window", "mean", "gauge",
         ("actor", "metric_values",
-         "server.evaluation.argmax_round_2_success_rate.v1"), scale=100.0,
+         "server.training.episode.step.mean.v1"),
     ),
     _metric_definition(
-        "server.evaluation.stochastic_success_rate.v1",
-        "Stochastic Success", "episode_success", "percentage", "%",
-        "diagnostic_agent_episodes", "mean", "gauge",
+        "server.training.episode.unique_cells.mean.v1",
+        "Training Unique Cells", "episode_success", "cell_count", "cells",
+        "training_agent_episode_window", "mean", "gauge",
         ("actor", "metric_values",
-         "server.evaluation.stochastic_success_rate.v1"), scale=100.0,
+         "server.training.episode.unique_cells.mean.v1"),
     ),
     _metric_definition(
-        "server.evaluation.path_ratio_median.v1", "Argmax Path Ratio Median",
-        "episode_success", "ratio", "1", "successful_evaluation_episodes",
-        "median", "gauge", ("actor", "metric_values",
-                              "server.evaluation.path_ratio_median.v1"),
-    ),
-    _metric_definition(
-        "server.evaluation.path_ratio_p95.v1", "Argmax Path Ratio p95",
-        "episode_success", "ratio", "1", "successful_evaluation_episodes",
-        "p95", "gauge", ("actor", "metric_values",
-                           "server.evaluation.path_ratio_p95.v1"),
+        "server.training.episode.blocked_move_rate.v1",
+        "Training Blocked Move Rate", "episode_success", "percentage", "%",
+        "training_transition_window", "mean", "gauge",
+        ("actor", "metric_values",
+         "server.training.episode.blocked_move_rate.v1"), scale=100.0,
     ),
     _metric_definition(
         "sample.throughput.produced_per_second.v1", "Produced / sec",
@@ -449,9 +455,22 @@ def reward_component_field_id(name: str) -> str:
     return f"server.reward.component.{name}.transition_mean.v1"
 
 
+def training_reward_component_field_id(name: str, statistic: str) -> str:
+    if not isinstance(name, str) or not _REWARD_COMPONENT_NAME.fullmatch(name):
+        raise ValueError("reward component name must be canonical snake_case")
+    if statistic not in {
+        "episode_mean",
+        "transition_mean",
+        "latest_episode_mean",
+    }:
+        raise ValueError("unsupported training reward component statistic")
+    return f"server.training.reward.component.{name}.{statistic}.v1"
+
+
 def _reward_component_definition(name: str):
+    field_id = reward_component_field_id(name)
     return _metric_definition(
-        reward_component_field_id(name),
+        field_id,
         " ".join(part.capitalize() for part in name.split("_")),
         "reward_components",
         "transition_reward",
@@ -459,7 +478,36 @@ def _reward_component_definition(name: str):
         "server_transition_window",
         "mean",
         "gauge",
-        ("actor", "episodes", "reward_components", name),
+        ("actor", "metric_values", field_id),
+        ("actor", "episodes", "transition_reward_components", name),
+    )
+
+
+def _training_reward_component_definition(name: str, statistic: str):
+    field_id = training_reward_component_field_id(name, statistic)
+    label = " ".join(part.capitalize() for part in name.split("_"))
+    if statistic == "episode_mean":
+        return _metric_definition(
+            field_id, f"{label} / Agent Episode", "reward_components",
+            "episode_reward", "reward/agent episode",
+            "training_agent_episode_window", "mean", "gauge",
+            ("actor", "metric_values", field_id),
+            ("actor", "episodes", "reward_components", name),
+        )
+    if statistic == "latest_episode_mean":
+        return _metric_definition(
+            field_id, f"Latest {label} / Agent Episode", "reward_components",
+            "episode_reward", "reward/agent episode",
+            "latest_training_environment_episode", "latest", "gauge",
+            ("actor", "metric_values", field_id),
+            ("actor", "episodes", "latest_reward_components", name),
+        )
+    return _metric_definition(
+        field_id, f"{label} / Transition", "reward_components",
+        "transition_reward", "reward/transition",
+        "training_transition_window", "mean", "gauge",
+        ("actor", "metric_values", field_id),
+        ("actor", "episodes", "transition_reward_components", name),
     )
 
 
@@ -495,6 +543,14 @@ def project_metric_values(record, definitions):
         )
         for definition in definitions
     }
+    statistics = _nested(record, ("actor", "metric_statistics"))
+    projected["metric_statistics"] = (
+        copy.deepcopy(statistics) if isinstance(statistics, dict) else {}
+    )
+    descriptors = _nested(record, ("actor", "metric_descriptors"))
+    projected["metric_descriptors"] = (
+        copy.deepcopy(descriptors) if isinstance(descriptors, dict) else {}
+    )
     return projected
 
 
@@ -507,7 +563,14 @@ class MetricsFileReader:
         runtime_mode: str = "",
         service_instance_id: str = "",
         started_at: float | None = None,
+        max_records: int = 4096,
+        read_chunk_bytes: int = 256 * 1024,
+        max_pending_bytes: int = 1024 * 1024,
     ):
+        if max_records <= 0:
+            raise ValueError("max_records must be positive")
+        if read_chunk_bytes <= 0 or max_pending_bytes <= 0:
+            raise ValueError("metrics read bounds must be positive")
         self._metrics_dir = os.path.abspath(metrics_dir)
         self._metrics_source_id = metrics_source_id or (
             f"local-training-{uuid.uuid4().hex}"
@@ -520,7 +583,11 @@ class MetricsFileReader:
             time.time() if started_at is None else float(started_at)
         )
         self._lock = threading.Lock()
-        self._records = []
+        self._max_records = int(max_records)
+        self._read_chunk_bytes = int(read_chunk_bytes)
+        self._max_pending_bytes = int(max_pending_bytes)
+        self._records = deque(maxlen=self._max_records)
+        self._total_record_count = 0
         self._files = {}
         self._corrupt_lines = 0
         self._last_scan_time = 0.0
@@ -536,7 +603,13 @@ class MetricsFileReader:
                     os.path.join(self._metrics_dir, "metrics_*.jsonl")
                 ):
                     self._files.setdefault(
-                        path, {"offset": 0, "pending": b"", "corrupt": 0}
+                        path,
+                        {
+                            "offset": 0,
+                            "pending": b"",
+                            "discarding_oversize_line": False,
+                            "corrupt": 0,
+                        },
                     )
             for path, state in list(self._files.items()):
                 self._read_file(path, state)
@@ -547,14 +620,28 @@ class MetricsFileReader:
             if file_size < state["offset"]:
                 state["offset"] = 0
                 state["pending"] = b""
+                state["discarding_oversize_line"] = False
             if file_size == state["offset"]:
                 return
             with open(path, "rb") as stream:
                 stream.seek(state["offset"])
-                data = state["pending"] + stream.read()
+                chunk = stream.read(self._read_chunk_bytes)
                 state["offset"] = stream.tell()
+            data = chunk
+            if state.get("discarding_oversize_line"):
+                newline = data.find(b"\n")
+                if newline < 0:
+                    return
+                data = data[newline + 1 :]
+                state["discarding_oversize_line"] = False
+            data = state["pending"] + data
             lines = data.split(b"\n")
             state["pending"] = lines.pop()
+            if len(state["pending"]) > self._max_pending_bytes:
+                state["pending"] = b""
+                state["discarding_oversize_line"] = True
+                state["corrupt"] += 1
+                self._corrupt_lines += 1
             for raw_line in lines:
                 if not raw_line.strip():
                     continue
@@ -562,6 +649,7 @@ class MetricsFileReader:
                     self._records.append(
                         json.loads(raw_line.decode("utf-8"))
                     )
+                    self._total_record_count += 1
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
                     state["corrupt"] += 1
                     self._corrupt_lines += 1
@@ -591,21 +679,35 @@ class MetricsFileReader:
         with self._lock:
             reward_names = set(_KNOWN_REWARD_COMPONENTS)
             for record in self._records:
-                components = _nested(
-                    record, ("actor", "episodes", "reward_components")
-                )
-                if not isinstance(components, dict):
-                    continue
-                reward_names.update(
-                    name
-                    for name in components
-                    if isinstance(name, str)
-                    and _REWARD_COMPONENT_NAME.fullmatch(name)
-                )
+                for component_kind in (
+                    "reward_components",
+                    "transition_reward_components",
+                    "latest_reward_components",
+                ):
+                    components = _nested(
+                        record, ("actor", "episodes", component_kind)
+                    )
+                    if not isinstance(components, dict):
+                        continue
+                    reward_names.update(
+                        name
+                        for name in components
+                        if isinstance(name, str)
+                        and _REWARD_COMPONENT_NAME.fullmatch(name)
+                    )
         definitions = list(_STATIC_METRIC_DEFINITIONS)
         definitions.extend(
             _reward_component_definition(name)
             for name in sorted(reward_names)
+        )
+        definitions.extend(
+            _training_reward_component_definition(name, statistic)
+            for name in sorted(reward_names)
+            for statistic in (
+                "episode_mean",
+                "latest_episode_mean",
+                "transition_mean",
+            )
         )
         return definitions
 
@@ -644,6 +746,8 @@ class MetricsFileReader:
                 "metrics_dir": self._metrics_dir,
                 "mode": latest.get("mode") or self._runtime_mode,
                 "record_count": len(self._records),
+                "total_record_count": self._total_record_count,
+                "retained_record_limit": self._max_records,
                 "latest_sequence": latest.get(
                     "sequence", latest.get("train_step", 0)
                 ),
