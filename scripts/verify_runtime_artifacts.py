@@ -54,6 +54,21 @@ def verify_contract(root: Path, version: str, platform: str) -> dict[str, Any]:
     ):
         raise SystemExit("Contract artifact identity is invalid")
     verify_files(root, manifest)
+    schema = manifest.get("metric_schemas", {}).get("maze.metrics.v2")
+    catalog_path = root / "schemas/maze.metrics.v2.json"
+    digest_path = root / "schemas/maze.metrics.v2.sha256"
+    if not catalog_path.is_file() or not digest_path.is_file():
+        raise SystemExit("Contract metric schema artifact is missing")
+    digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
+    if digest_path.read_text(encoding="utf-8").strip() != digest:
+        raise SystemExit("Contract metric schema digest is invalid")
+    if schema != {
+        "canonical_digest": {"algorithm": "sha256", "hex": digest},
+        "digest_path": "schemas/maze.metrics.v2.sha256",
+        "path": "schemas/maze.metrics.v2.json",
+        "schema_version": 2,
+    }:
+        raise SystemExit("Contract metric schema manifest binding is invalid")
     return manifest
 
 

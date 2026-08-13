@@ -1,5 +1,5 @@
 import copy
-import shutil
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +8,15 @@ from unittest import mock
 import torch
 import yaml
 
-from main.training_runtime import ModelPublisher, TrainingRuntime, load_config
+from main.training_runtime import (
+    ModelPublisher,
+    TrainingRuntime,
+    load_config,
+    read_json,
+)
 from src.contracts.identity import (
     canonical_config_digest,
+    finalize_manifest_digest,
     manifest_message,
     training_config_digest,
     training_config_document,
@@ -88,10 +94,27 @@ def publish_update(trainer, publisher, behavior) -> dict:
     )
 
 
+class LightweightTrainer:
+    def __init__(self, version: int = 0):
+        self.model_version = version
+
+    def export_onnx(self, path: str) -> None:
+        Path(path).write_bytes(f"onnx-v{self.model_version}".encode())
+
+    def save_checkpoint(self, path: str, metadata: dict) -> None:
+        torch.save(
+            {
+                "model_version": self.model_version,
+                "metadata": copy.deepcopy(metadata),
+            },
+            path,
+        )
+
+
 class ModelCommitContractTest(unittest.TestCase):
     def test_config_is_complete_and_old_environment_alias_is_ignored(self):
         document = load_config(str(ROOT / "configs" / "learner_config.yaml"))
-        self.assertEqual(document["contract"]["package_version"], "0.10.0")
+        self.assertEqual(document["contract"]["package_version"], "0.11.0")
         self.assertEqual(document["model"]["obs_dim"], 17)
         self.assertEqual(
             document["training_semantics"]["reward_schema"]["schema_id"],
@@ -187,7 +210,7 @@ class ModelCommitContractTest(unittest.TestCase):
             first = ModelPublisher(config(Path(directory)))
             first.prepare()
             first.state_path.write_text("{}\n")
-            with self.assertRaisesRegex(RuntimeError, "was not cleaned"):
+            with self.assertRaisesRegex(RuntimeError, "incomplete transaction"):
                 ModelPublisher(config(Path(directory))).prepare()
 
     def test_prepare_ignores_optional_metrics_history(self):
@@ -230,7 +253,7 @@ class ModelCommitContractTest(unittest.TestCase):
                 behavior_model=None,
                 batch_ids=[],
             )
-            self.assertEqual(manifest["contract"]["package_version"], "0.10.0")
+            self.assertEqual(manifest["contract"]["package_version"], "0.11.0")
             self.assertEqual(manifest["observation_schema"]["schema_id"], "maze.observation.v3")
             self.assertEqual(manifest["input_shape"], [1, 17])
             wire = manifest_message(TrainingRuntime._manifest_for_wire(manifest))
@@ -240,46 +263,215 @@ class ModelCommitContractTest(unittest.TestCase):
                 stream.write(b"corrupt")
             self.assertIsNone(publisher.complete_manifest(0))
 
-    def test_archive_retention_and_checkpoint_identity(self):
+    def test_canonical_publication_retains_recent_101_and_permanent_intervals(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cfg = config(root)
-            trainer = PPOTrainer(cfg)
             publisher = ModelPublisher(cfg)
             publisher.prepare()
-            first = publisher.publish_runtime(
-                trainer,
-                train_update_id="bootstrap-v0",
+            source_trainer = PPOTrainer(cfg)
+            manifest = publisher.publish_runtime(
+                source_trainer,
+                train_update_id="update-v0",
                 behavior_model=None,
                 batch_ids=[],
+                train_updates=0,
+                trained_samples=0,
             )
-            publisher.archive_version(0, "bootstrap")
-            second = publish_update(trainer, publisher, first["identity"])
-            third = publish_update(trainer, publisher, second["identity"])
-            fourth = publish_update(trainer, publisher, third["identity"])
-            publisher.archive_version(3, "interval")
-            publisher.prune_runtime(3)
-            self.assertFalse(publisher.model_path(0).exists())
-            self.assertTrue(publisher.model_path(1).exists())
-            self.assertTrue(publisher.model_path(2).exists())
-            self.assertTrue(publisher.model_path(3).exists())
-            archive = publisher.archive_path(3)
+            wire_document = yaml.safe_load(
+                publisher.manifest_path(0).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(wire_document), ModelPublisher.WIRE_MANIFEST_KEYS
+            )
+            self.assertNotIn("train_update_id", wire_document)
+            self.assertEqual(manifest["retention"]["class"], "rolling")
+            trainer = LightweightTrainer()
+            for version in range(1, 103):
+                trainer.model_version = version
+                publisher.publish_runtime(
+                    trainer,
+                    train_update_id=f"update-v{version}",
+                    behavior_model=None,
+                    batch_ids=[],
+                    train_updates=version,
+                    trained_samples=version,
+                )
+            publisher.mark_permanent(0)
+            with mock.patch.object(
+                publisher,
+                "complete_manifest",
+                wraps=publisher.complete_manifest,
+            ) as validator:
+                self.assertEqual(publisher.prune_publications(101), [])
+            validator.assert_not_called()
+            self.assertTrue(publisher.archive_path(0).is_dir())
+            with mock.patch.object(
+                publisher,
+                "complete_manifest",
+                wraps=publisher.complete_manifest,
+            ) as validator:
+                self.assertEqual(publisher.prune_publications(102), [1])
+            self.assertEqual(
+                [call.args[0] for call in validator.call_args_list], [1]
+            )
+            self.assertTrue(publisher.archive_path(0).is_dir())
+            self.assertFalse(publisher.archive_path(1).exists())
+            self.assertEqual(
+                [
+                    item["identity"]["model_version"]
+                    for item in publisher.complete_manifests()
+                    if item["retention"]["class"] == "rolling"
+                ],
+                list(range(2, 103)),
+            )
+            archive = publisher.archive_path(102)
             self.assertEqual(
                 {path.name for path in archive.iterdir()},
-                {"SaveModel.onnx", "checkpoint.pt", "manifest.json"},
+                {
+                    "SaveModel.onnx",
+                    "checkpoint.pt",
+                    "manifest.json",
+                    "metadata.json",
+                },
             )
 
-            external = root / "external-checkpoint.pt"
-            shutil.copyfile(archive / "checkpoint.pt", external)
-            child_cfg = config(root / "child")
-            child_cfg["identity"]["model_lineage_id"] = "different-lineage"
-            child_cfg["identity"]["training_config_digest"] = (
-                canonical_config_digest(training_config_document(child_cfg))
+    def test_version_name_is_minimum_width_six_without_wraparound(self):
+        self.assertEqual(ModelPublisher.version_name(0), "000000")
+        self.assertEqual(ModelPublisher.version_name(999999), "999999")
+        self.assertEqual(ModelPublisher.version_name(1000000), "1000000")
+        self.assertEqual(
+            ModelPublisher.version_name((1 << 64) - 1),
+            "18446744073709551615",
+        )
+        for value in (True, -1, 1 << 64, 1.0, "1"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ModelPublisher.version_name(value)
+
+    def test_failed_export_leaves_no_visible_or_private_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            publisher = ModelPublisher(config(Path(directory)))
+            publisher.prepare()
+            trainer = LightweightTrainer()
+            trainer.export_onnx = mock.Mock(
+                side_effect=RuntimeError("injected export failure")
             )
-            child = ModelPublisher(child_cfg)
-            child.prepare()
-            with self.assertRaisesRegex(RuntimeError, "incompatible"):
-                child.load_initial_checkpoint(PPOTrainer(child_cfg), str(external))
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                publisher.publish_runtime(
+                    trainer,
+                    train_update_id="bootstrap-v0",
+                    behavior_model=None,
+                    batch_ids=[],
+                )
+            self.assertFalse(publisher.archive_path(0).exists())
+            self.assertEqual(list(publisher.archive_dir.iterdir()), [])
+
+    def test_prepare_recovers_only_known_private_archive_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = ModelPublisher(config(root))
+            publisher.archive_dir.mkdir(parents=True)
+            for name in (
+                ".publication-000001-crash.tmp",
+                ".prune-000002-crash",
+                ".rollback-delete-000003-crash",
+            ):
+                path = publisher.archive_dir / name
+                path.mkdir()
+                (path / "partial").write_bytes(b"partial")
+            publisher.prepare()
+            self.assertEqual(list(publisher.archive_dir.iterdir()), [])
+
+            unknown = publisher.archive_dir / ".unowned-entry"
+            unknown.mkdir()
+            second = ModelPublisher(config(root))
+            with self.assertRaisesRegex(RuntimeError, "requires review"):
+                second.prepare()
+            self.assertTrue(unknown.is_dir())
+
+    def test_state_write_failure_hides_publication_and_keeps_staged_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            publisher = ModelPublisher(config(Path(directory)))
+            publisher.prepare()
+            trainer = LightweightTrainer(1)
+            checkpoint = publisher.commit_optimizer_checkpoint(
+                trainer,
+                train_update_id="update-v1",
+                behavior_model={"model_version": 0},
+                batch_ids=["batch-v1"],
+                stats={"policy_loss": 0.0},
+                sample_count=2,
+                train_updates=1,
+                trained_samples=2,
+            )
+            from main import training_runtime
+
+            original_write = training_runtime.atomic_write_json
+
+            def fail_state(path, document):
+                if Path(path) == publisher.state_path:
+                    raise OSError("injected state write failure")
+                return original_write(path, document)
+
+            with mock.patch(
+                "main.training_runtime.atomic_write_json",
+                side_effect=fail_state,
+            ):
+                with self.assertRaisesRegex(OSError, "state write failure"):
+                    publisher.publish_runtime(
+                        trainer,
+                        train_update_id="update-v1",
+                        behavior_model={"model_version": 0},
+                        batch_ids=["batch-v1"],
+                        stats={"policy_loss": 0.0},
+                        sample_count=2,
+                        train_updates=1,
+                        trained_samples=2,
+                        checkpoint_precommitted=True,
+                    )
+            self.assertFalse(publisher.archive_path(1).exists())
+            self.assertFalse(publisher.state_path.exists())
+            self.assertTrue(checkpoint.is_file())
+            self.assertEqual(
+                [path for path in publisher.archive_dir.iterdir()], []
+            )
+
+    def test_complete_manifest_rejects_mutated_wire_identity_and_shape(self):
+        mutations = (
+            lambda document: document["identity"].__setitem__(
+                "model_lineage_id", "conflicting-lineage"
+            ),
+            lambda document: document.__setitem__(
+                "training_config_digest", "f" * 64
+            ),
+            lambda document: document.__setitem__("input_shape", [1, 99]),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                with tempfile.TemporaryDirectory() as directory:
+                    publisher = ModelPublisher(config(Path(directory)))
+                    publisher.prepare()
+                    publisher.publish_runtime(
+                        LightweightTrainer(),
+                        train_update_id="bootstrap-v0",
+                        behavior_model=None,
+                        batch_ids=[],
+                    )
+                    manifest_path = publisher.manifest_path(0)
+                    document = read_json(manifest_path)
+                    mutate(document)
+                    document = finalize_manifest_digest(document)
+                    manifest_path.write_text(
+                        json.dumps(document, sort_keys=True), encoding="utf-8"
+                    )
+                    metadata_path = publisher.metadata_path(0)
+                    metadata = read_json(metadata_path)
+                    metadata["model_identity"] = document["identity"]
+                    metadata_path.write_text(
+                        json.dumps(metadata, sort_keys=True), encoding="utf-8"
+                    )
+                    self.assertIsNone(publisher.complete_manifest(0))
 
     def test_checkpoint_restores_optimizer_and_rng(self):
         with tempfile.TemporaryDirectory() as directory:

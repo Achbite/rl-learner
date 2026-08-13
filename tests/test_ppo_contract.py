@@ -413,6 +413,62 @@ class PpoUpdateTest(unittest.TestCase):
         ):
             self.assertTrue(math.isfinite(stats[key]), key)
 
+        raw = trainer.raw_metric_sum_counts()
+        self.assertEqual(
+            set(raw),
+            {
+                "approx_kl",
+                "clip_fraction",
+                "entropy",
+                "gradient_norm",
+                "policy_lag",
+                "policy_loss",
+                "return_target",
+                "total_loss",
+                "value_loss",
+                "value_prediction",
+            },
+        )
+        sample_count = 2
+        optimizer_step_count = 1
+        for field_id in (
+            "approx_kl",
+            "clip_fraction",
+            "entropy",
+            "policy_loss",
+            "total_loss",
+            "value_loss",
+        ):
+            self.assertEqual(raw[field_id]["count"], sample_count)
+            self.assertTrue(math.isfinite(raw[field_id]["sum"]))
+        for field_id in (
+            "policy_lag",
+            "return_target",
+            "value_prediction",
+        ):
+            self.assertEqual(raw[field_id]["count"], sample_count)
+        self.assertEqual(raw["gradient_norm"]["count"], optimizer_step_count)
+        self.assertAlmostEqual(
+            raw["return_target"]["sum"],
+            sum(sample["td_return"] for sample in self._samples(trainer)),
+            places=5,
+        )
+
+    def test_uint64_model_version_exhaustion_prevents_optimizer_mutation(self):
+        trainer = PPOTrainer(config())
+        trainer._model_version = trainer.MAX_MODEL_VERSION
+        model_before = copy.deepcopy(trainer.model.state_dict())
+        optimizer_before = copy.deepcopy(trainer._optimizer.state_dict())
+        with self.assertRaisesRegex(RuntimeError, "uint64 publication space"):
+            trainer.train_on_batch(
+                self._samples(trainer),
+                behavior_model_version=trainer.MAX_MODEL_VERSION,
+            )
+        self.assertEqual(trainer.model_version, trainer.MAX_MODEL_VERSION)
+        for key, value in model_before.items():
+            self.assertTrue(torch.equal(value, trainer.model.state_dict()[key]))
+        self.assertEqual(optimizer_before, trainer._optimizer.state_dict())
+
     def test_policy_lag_and_non_finite_input_fail_closed(self):
         trainer = PPOTrainer(config())
         trainer.train_on_batch(self._samples(trainer), behavior_model_version=0)

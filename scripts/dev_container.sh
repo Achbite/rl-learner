@@ -302,12 +302,91 @@ create_container() {
         --volume "${contract_dir}/python/common_pb2.py:/workspace/rl-learner/proto/common_pb2.py:ro" \
         --volume "${contract_dir}/python/training_pb2.py:/workspace/rl-learner/proto/training_pb2.py:ro" \
         --volume "${contract_dir}/python/training_pb2_grpc.py:/workspace/rl-learner/proto/training_pb2_grpc.py:ro" \
+        --volume "${contract_dir}/schemas:/workspace/rl-learner/schemas:ro" \
         "${dev_image}" >/dev/null
+}
+
+container_mount_source() {
+    local destination="$1"
+    docker inspect \
+        --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}" \
+        "${container_name}"
+}
+
+container_uses_contract_artifact() {
+    local contract_dir="$1"
+    local relative
+    for relative in common_pb2.py training_pb2.py training_pb2_grpc.py; do
+        if [ "$(container_mount_source "/workspace/rl-learner/proto/${relative}")" != \
+             "${contract_dir}/python/${relative}" ]; then
+            return 1
+        fi
+    done
+    if [ "$(container_mount_source "/workspace/rl-learner/schemas")" != \
+         "${contract_dir}/schemas" ]; then
+        return 1
+    fi
+}
+
+container_has_training_processes() {
+    local process_status
+    [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" = "true" ] ||
+        return 1
+    set +e
+    docker exec "${container_name}" sh -lc \
+        "pgrep -f '[m]ain.training_runtime|[r]un.sh training|[m]etrics_server.py|[m]aze_sample_distributor|[m]aze_model_distributor' >/dev/null"
+    process_status=$?
+    set -e
+    if [ "${process_status}" -eq 0 ]; then
+        return 0
+    fi
+    if [ "${process_status}" -eq 1 ]; then
+        return 1
+    fi
+    echo "Unable to inspect learner-dev training processes" >&2
+    return 2
+}
+
+verify_contract_mount_permissions() {
+    local contract_dir="$1"
+    python3 - \
+        "${contract_dir}/python/common_pb2.py" \
+        "${contract_dir}/python/training_pb2.py" \
+        "${contract_dir}/python/training_pb2_grpc.py" \
+        "${contract_dir}/schemas/maze.metrics.v2.json" \
+        "${contract_dir}/schemas/maze.metrics.v2.sha256" <<'PY'
+import os
+import stat
+import sys
+
+for raw in sys.argv[1:]:
+    mode = os.stat(raw).st_mode
+    if not stat.S_ISREG(mode) or not mode & stat.S_IROTH:
+        raise SystemExit(f"Contract artifact is not container-readable: {raw}")
+PY
+}
+
+verify_training_runtime_artifacts() {
+    local contract_dir
+    contract_dir="${workspace_root}/.workspace/artifacts/rl-contracts/${RL_CONTRACTS_VERSION}/${platform_dir}"
+    if ! python3 "${repo_dir}/scripts/verify_runtime_artifacts.py" \
+        --contract-dir "${contract_dir}" \
+        --sample-pool-dir "${repo_dir}/sample-pool" \
+        --model-distributor-dir "${repo_dir}/model-distributor" \
+        --contract-version "${RL_CONTRACTS_VERSION}" \
+        --sample-pool-version "${RL_SAMPLE_POOL_VERSION}" \
+        --model-distributor-version "${RL_MODEL_DISTRIBUTOR_VERSION}" \
+        --platform "${RL_RUNTIME_ARTIFACT_PLATFORM}"; then
+        echo "Training runtime artifacts do not match artifact_versions.env" >&2
+        echo "Build reviewed artifacts, then run: bash scripts/sync_runtime_artifacts.sh" >&2
+        return 1
+    fi
 }
 
 ensure_container() {
     local contract_dir
     local legacy_binding
+    local process_state
     local start_error
     contract_dir="${workspace_root}/.workspace/artifacts/rl-contracts/${RL_CONTRACTS_VERSION}/${platform_dir}"
     if [ ! -f "${contract_dir}/python/common_pb2.py" ] ||
@@ -315,6 +394,7 @@ ensure_container() {
         echo "Contract artifact is missing. Run ../rl-contracts/build_artifact.sh" >&2
         exit 1
     fi
+    verify_contract_mount_permissions "${contract_dir}"
     if ! docker image inspect "${dev_image}" >/dev/null 2>&1; then
         build_image
     fi
@@ -322,6 +402,19 @@ ensure_container() {
         docker network create "${network_name}" >/dev/null
     fi
     if ! docker container inspect "${container_name}" >/dev/null 2>&1; then
+        create_container "${contract_dir}"
+    elif ! container_uses_contract_artifact "${contract_dir}"; then
+        process_state=0
+        container_has_training_processes || process_state=$?
+        if [ "${process_state}" -eq 0 ]; then
+            echo "learner-dev uses a stale contract artifact while training processes are active" >&2
+            echo "Stop the active training chain before recreating learner-dev" >&2
+            exit 1
+        elif [ "${process_state}" -ne 1 ]; then
+            exit 1
+        fi
+        echo "Migrating learner-dev to contract artifact ${RL_CONTRACTS_VERSION}" >&2
+        docker rm --force "${container_name}" >/dev/null
         create_container "${contract_dir}"
     elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
         legacy_binding="$(docker port "${container_name}" 9005/tcp 2>/dev/null || true)"
@@ -360,6 +453,7 @@ case "${action}" in
         ;;
     training)
         ensure_container
+        verify_training_runtime_artifacts
         monitor_transport_ready=0
         if prepare_monitor_transport; then
             monitor_transport_ready=1

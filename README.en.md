@@ -1,167 +1,113 @@
 # RL Learner
 
-English | [简体中文](README.md)
+[简体中文](README.md) | English
 
-RL Learner is a containerized PPO training service. By default, one Learner
-container runs Sample Pool, Model Distributor, Training Runtime, and the
-read-only metrics service.
+The Learner container runs PPO, Sample Pool, Model Distributor, and the optional monitor. Start the full three-component chain from [rl-framework](../rl-framework/README.en.md).
 
-| Service | Port | Purpose |
-| --- | ---: | --- |
-| Sample Pool | `9100` | Ingest, lease, and dispose of training samples |
-| Model Distributor | `9200` | Register and distribute models and receive load acknowledgements |
-| Learner Monitor | `9005` | Display training status and serve the read-only metrics API |
+## 1. Prepare artifacts
 
-## Requirements
-
-- Docker; Colima is recommended on macOS.
-- A checkout inside the RL-Training-Framework workspace, next to
-  `rl-contracts`, `rl-sample-pool`, and `rl-model-distributor`.
-- Matching Contracts, Sample Pool, and Model Distributor artifacts.
-
-## Prepare Artifacts
+From the directory containing all repositories, run:
 
 ```bash
-(cd ../rl-contracts && bash build_artifact.sh)
-(cd ../rl-sample-pool && bash build_artifact.sh)
-(cd ../rl-model-distributor && bash build_artifact.sh)
-bash scripts/sync_runtime_artifacts.sh
+(cd rl-contracts && bash build_artifact.sh)
+(cd rl-sample-pool && bash build_artifact.sh)
+(cd rl-model-distributor && bash build_artifact.sh)
+(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-`artifact_versions.env` pins the Contracts, Sample Pool, Model Distributor,
-and target platform. The sync command verifies the versions, platform, clean
-savepoints, Contracts identity, and every file checksum before and after
-copying. It never resolves `latest` or rewrites the workspace artifact store.
-
-Build the runtime image:
+Build the Learner image. This command also creates the matching smoke model:
 
 ```bash
-LEARNER_IMAGE_TAG=training-001 bash build_image.sh
+RL_LEARNER_IMAGE_TAG=training-001 bash build_image.sh
 ```
 
-## Local Training
+## 2. Component development environment
 
-### Recommended Startup
+```bash
+# Build the development image from the training-001 runtime image
+LEARNER_IMAGE_TAG=training-001 make dev-image
 
-Run from a host terminal:
+# Enter the source-mounted container
+make shell
+
+# Run the Python compile check
+make build
+
+# Run tests
+make test
+```
+
+## 3. Start Learner-side services
+
+A new Run clears the Learner-owned `models/local-train` and starts at model version zero:
+
+```bash
+bash scripts/dev_container.sh training --new-run
+```
+
+To continue the same Run after a normal stop, omit `--new-run`:
 
 ```bash
 bash scripts/dev_container.sh training
 ```
 
-All training processes and dependencies run inside the `learner-dev` container.
-The host launcher only creates the development container, invokes
-`run.sh training` in that container, and manages its own Colima forwarding for
-port `9005` when required. It removes only that forwarding when training exits
-or receives a signal.
+This starts only Learner-side services and waits when no AIServer or Client is connected. Use Framework for full training.
 
-Open the monitor after startup:
+The launcher prints the monitor URL for that invocation. Port `9005` is optional observability; a monitor or port failure does not stop PPO.
+
+## 4. Start a new Run from an existing model
+
+Place the complete savepoint outside `models/local-train` at a path visible inside the container, for example:
 
 ```text
-http://127.0.0.1:9005/
+models/import/000200/
+  SaveModel.onnx
+  checkpoint.pt
+  manifest.json
+  metadata.json
 ```
 
-The page reads the current training instance's read-only metrics every second
-and uses separate panels for Loss, Episode Return, Reward Components, Episode
-Success, Sample Throughput, Sample Flow, Latency, and PPO Stability.
-
-Each fresh training run clears the Learner-owned `models/local-train` working
-directory.
-
-### Interactive Container
-
-To run commands manually inside the development container:
-
-```bash
-make shell
-```
-
-Start training after entering the container:
-
-```bash
-bash ./run.sh training
-```
-
-`run.sh` manages only the in-container workload. To view this manually started
-training run from the host browser, create and verify the monitor forwarding in
-another host terminal:
-
-```bash
-bash scripts/dev_container.sh monitor
-```
-
-Stop that forwarding after the manual training run ends:
-
-```bash
-bash scripts/dev_container.sh monitor-stop
-```
-
-## Monitor Endpoints
-
-| Path | Content |
-| --- | --- |
-| `/` | A `302` redirect to `/monitor` |
-| `/monitor` | Local Learner training monitor |
-| `/api` | API index |
-| `/api/status` | Current service and training identity plus freshness |
-| `/api/metrics/catalog` | Versioned metric field catalog |
-| `/api/metrics/latest` | Latest metrics record |
-| `/api/metrics` | Paginated metrics records |
-| `/api/metrics/summary` | Current training summary |
-
-`/api/metrics` and `/api/metrics/latest` preserve the original nested record
-and add a `metric_values` projection keyed by `field_id` to the response copy.
-Use the catalog for labels, dimensions, units, scopes, and statistics. This does
-not rewrite the on-disk JSONL stream.
-
-When the launcher finds an unknown listener on host port `9005`, it reports
-`PORT_IDENTITY_CONFLICT` or `MONITOR_TARGET_UNAVAILABLE` and never terminates
-the unknown process.
-
-## Start From a Checkpoint
-
-The checkpoint must be outside `models/local-train` and readable from inside the
-container:
+Start the Run:
 
 ```bash
 bash scripts/dev_container.sh training \
-  --initial-checkpoint /workspace/rl-learner/models/checkpoints/000200/checkpoint.pt
+  --new-run \
+  --initial-model-dir /workspace/rl-learner/models/import/000200
 ```
 
-Long-term savepoints use a fixed layout:
+This inherits only model weights and provenance. The new lineage starts model version, optimizer, RNG, update count, and sample count from zero.
+
+## 5. Archive and resume
+
+Every complete publication uses one layout:
 
 ```text
 models/local-train/archive/000200/
   SaveModel.onnx
   checkpoint.pt
   manifest.json
+  metadata.json
 ```
 
-## Complete Local Training
+A normal stop preserves the archive and runtime state. A later start without `--new-run` resumes the same Run. Only explicit `--new-run` removes Learner-local Run data.
 
-Use Framework to start Learner, AIServer, and Client:
+## 6. Ports
+
+| Port | Service |
+| ---: | --- |
+| `9100` | Sample Pool |
+| `9200` | Model Distributor |
+| `9005` | Optional Learner Monitor |
+
+Monitor endpoints: `/monitor`, `/api/status`, `/api/metrics/catalog`, `/api/metrics/latest`, and `/api/metrics`.
+
+## 7. Remove the development container
 
 ```bash
-../rl-framework/framework local-test --profile training --json
+make dev-clean
 ```
 
-## Common Commands
-
-| Command | Purpose |
-| --- | --- |
-| `make shell` | Enter the source-mounted development container |
-| `make test` | Run Learner tests inside the development container |
-| `make build` | Run the Python compile smoke check inside the development container |
-| `make dev-image` | Build the Learner development image |
-| `make dev-clean` | Stop the owned forwarding and remove `learner-dev` |
-| `bash scripts/dev_container.sh monitor` | Create and verify host monitor forwarding for manual training |
-| `bash scripts/dev_container.sh monitor-stop` | Stop only the forwarding owned by the Learner launcher |
-
-## Tests
-
-```bash
-make test
-```
+This removes `learner-dev` and launcher-owned forwarding only. It never terminates unknown host processes.
 
 ## License
 

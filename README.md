@@ -2,157 +2,112 @@
 
 简体中文 | [English](README.en.md)
 
-RL Learner 是容器化 PPO 训练服务。默认训练工作负载在同一 Learner 容器内启动
-Sample Pool、Model Distributor、Training Runtime 和只读指标服务。
+Learner 容器内运行 PPO、Sample Pool、Model Distributor 和可选监控。完整三端链路请从 [rl-framework](../rl-framework/README.md) 启动。
 
-| 服务 | 端口 | 用途 |
-| --- | ---: | --- |
-| Sample Pool | `9100` | 接收、租约和处置训练样本 |
-| Model Distributor | `9200` | 注册、分发模型并接收加载 ACK |
-| Learner Monitor | `9005` | 展示训练状态并提供只读指标 API |
+## 1. 准备制品
 
-## 运行要求
-
-- Docker；macOS 推荐使用 Colima。
-- 仓库位于 RL-Training-Framework 工作区中，与 `rl-contracts`、
-  `rl-sample-pool` 和 `rl-model-distributor` 同级。
-- 已生成匹配版本的 Contracts、Sample Pool 和 Model Distributor 制品。
-
-## 准备制品
+在八仓同级目录中依次执行：
 
 ```bash
-(cd ../rl-contracts && bash build_artifact.sh)
-(cd ../rl-sample-pool && bash build_artifact.sh)
-(cd ../rl-model-distributor && bash build_artifact.sh)
-bash scripts/sync_runtime_artifacts.sh
+(cd rl-contracts && bash build_artifact.sh)
+(cd rl-sample-pool && bash build_artifact.sh)
+(cd rl-model-distributor && bash build_artifact.sh)
+(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-`artifact_versions.env` 固定选择 Contracts、Sample Pool、Model Distributor 及目标平台。
-同步入口会在复制前后校验版本、平台、clean savepoint、Contracts 身份和全部文件的
-SHA-256；不读取 `latest`，也不会改写工作区 artifact store。
-
-构建运行镜像：
+构建 Learner 镜像；该命令同时生成匹配版本的 smoke model：
 
 ```bash
-LEARNER_IMAGE_TAG=training-001 bash build_image.sh
+RL_LEARNER_IMAGE_TAG=training-001 bash build_image.sh
 ```
 
-## 本地训练
+## 2. 组件开发环境
 
-### 推荐启动方式
+```bash
+# 从已经构建的 training-001 运行镜像构建开发镜像
+LEARNER_IMAGE_TAG=training-001 make dev-image
 
-在宿主终端执行：
+# 进入源码挂载容器
+make shell
+
+# Python 编译检查
+make build
+
+# 运行测试
+make test
+```
+
+## 3. 启动 Learner 侧服务
+
+新 Run 会清空 Learner 自己的 `models/local-train`，从模型版本 0 开始：
+
+```bash
+bash scripts/dev_container.sh training --new-run
+```
+
+正常停止后继续同一个 Run 时不要传 `--new-run`：
 
 ```bash
 bash scripts/dev_container.sh training
 ```
 
-训练进程和依赖全部运行在 `learner-dev` 容器内。宿主 launcher 只负责创建开发容器、
-执行容器内的 `run.sh training`，以及在需要时管理本轮拥有的 Colima `9005` 转发。
-训练退出或收到信号后，launcher 会精确清理自己的转发。
+这只启动 Learner 侧服务；没有 AIServer 和 Client 时会等待链路。完整训练请使用 Framework。
 
-启动后打开：
+launcher 会打印本次可用的监控 URL。`9005` 只属于可选观测，端口或监控失败不会终止 PPO。
+
+## 4. 从已有模型开始新 Run
+
+将完整保存点放在 `models/local-train` 之外、容器可读取的位置，例如：
 
 ```text
-http://127.0.0.1:9005/
+models/import/000200/
+  SaveModel.onnx
+  checkpoint.pt
+  manifest.json
+  metadata.json
 ```
 
-页面每秒读取当前训练实例的只读指标，分面展示 Loss、Episode Return、
-Reward Components、Episode Success、Sample Throughput、Sample Flow、Latency 和
-PPO Stability 曲线。
-
-每次 fresh training 都会清空 Learner 专属的 `models/local-train` 工作目录。
-
-### 交互式容器
-
-需要在开发容器内手工运行命令时：
-
-```bash
-make shell
-```
-
-进入容器后启动训练：
-
-```bash
-bash ./run.sh training
-```
-
-`run.sh` 只管理容器内工作负载。若需要从宿主浏览器访问这次手工训练，请在另一个
-宿主终端创建并核验监控转发：
-
-```bash
-bash scripts/dev_container.sh monitor
-```
-
-手工训练结束后停止该转发：
-
-```bash
-bash scripts/dev_container.sh monitor-stop
-```
-
-## 监控接口
-
-| 路径 | 内容 |
-| --- | --- |
-| `/` | `302` 跳转至 `/monitor` |
-| `/monitor` | Learner 本地训练监控页面 |
-| `/api` | API 索引 |
-| `/api/status` | 当前服务、训练实例和 freshness |
-| `/api/metrics/catalog` | 版本化指标字段目录 |
-| `/api/metrics/latest` | 最新指标记录 |
-| `/api/metrics` | 分页指标记录 |
-| `/api/metrics/summary` | 当前训练摘要 |
-
-`/api/metrics` 和 `/api/metrics/latest` 保留原始嵌套记录，并在响应副本中增加按
-`field_id` 索引的 `metric_values`。字段的 label、dimension、unit、scope 和统计口径
-以 catalog 为准；磁盘上的 JSONL 不会因此改写。
-
-launcher 遇到未知的宿主 `9005` listener 时只报告
-`PORT_IDENTITY_CONFLICT` 或 `MONITOR_TARGET_UNAVAILABLE`，不会终止未知进程。
-
-## 从 Checkpoint 启动
-
-Checkpoint 必须位于 `models/local-train` 之外，并且路径必须能从容器内读取：
+启动：
 
 ```bash
 bash scripts/dev_container.sh training \
-  --initial-checkpoint /workspace/rl-learner/models/checkpoints/000200/checkpoint.pt
+  --new-run \
+  --initial-model-dir /workspace/rl-learner/models/import/000200
 ```
 
-长期保存点采用固定布局：
+该入口只继承模型权重和来源信息；新 lineage 的模型版本、优化器、RNG、更新数和样本计数从 0 开始。
+
+## 5. 归档与恢复
+
+每次完整发布使用同一布局：
 
 ```text
 models/local-train/archive/000200/
   SaveModel.onnx
   checkpoint.pt
   manifest.json
+  metadata.json
 ```
 
-## 完整本地训练
+正常停止保留归档和运行状态；不带 `--new-run` 的下一次启动恢复同一个 Run。只有显式 `--new-run` 才清理 Learner 本地 Run 数据。
 
-从 Framework 启动 Learner、AIServer 和 Client：
+## 6. 端口
+
+| 端口 | 服务 |
+| ---: | --- |
+| `9100` | Sample Pool |
+| `9200` | Model Distributor |
+| `9005` | 可选 Learner Monitor |
+
+监控 API：`/monitor`、`/api/status`、`/api/metrics/catalog`、`/api/metrics/latest`、`/api/metrics`。
+
+## 7. 清理开发容器
 
 ```bash
-../rl-framework/framework local-test --profile training --json
+make dev-clean
 ```
 
-## 常用命令
-
-| 命令 | 用途 |
-| --- | --- |
-| `make shell` | 进入源码挂载的开发容器 |
-| `make test` | 在开发容器内运行 Learner 测试 |
-| `make build` | 在开发容器内执行 Python compile smoke |
-| `make dev-image` | 构建 Learner 开发镜像 |
-| `make dev-clean` | 停止自有转发并删除 `learner-dev` 容器 |
-| `bash scripts/dev_container.sh monitor` | 为手工训练创建并核验宿主监控转发 |
-| `bash scripts/dev_container.sh monitor-stop` | 仅停止 Learner launcher 自有转发 |
-
-## 测试
-
-```bash
-make test
-```
+该命令删除 `learner-dev` 和 launcher 自己创建的转发，不删除未知宿主进程。
 
 ## License
 

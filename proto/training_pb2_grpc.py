@@ -97,6 +97,130 @@ class AIServerTrainingStatusService:
             _registered_method=True)
 
 
+class MetricEventServiceStub:
+    """Implemented independently by each metric-event owner (AIServer and Learner).
+    A retry with the same cursor returns the same batch identity and digest until
+    it is acknowledged or an explicit gap proves the requested event unavailable.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.GetMetricBatch = channel.unary_unary(
+                '/rl.training.v1.MetricEventService/GetMetricBatch',
+                request_serializer=training__pb2.GetMetricBatchReq.SerializeToString,
+                response_deserializer=training__pb2.GetMetricBatchRsp.FromString,
+                _registered_method=True)
+        self.AckMetricBatch = channel.unary_unary(
+                '/rl.training.v1.MetricEventService/AckMetricBatch',
+                request_serializer=training__pb2.AckMetricBatchReq.SerializeToString,
+                response_deserializer=training__pb2.AckMetricBatchRsp.FromString,
+                _registered_method=True)
+
+
+class MetricEventServiceServicer:
+    """Implemented independently by each metric-event owner (AIServer and Learner).
+    A retry with the same cursor returns the same batch identity and digest until
+    it is acknowledged or an explicit gap proves the requested event unavailable.
+    """
+
+    def GetMetricBatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AckMetricBatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_MetricEventServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'GetMetricBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMetricBatch,
+                    request_deserializer=training__pb2.GetMetricBatchReq.FromString,
+                    response_serializer=training__pb2.GetMetricBatchRsp.SerializeToString,
+            ),
+            'AckMetricBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.AckMetricBatch,
+                    request_deserializer=training__pb2.AckMetricBatchReq.FromString,
+                    response_serializer=training__pb2.AckMetricBatchRsp.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'rl.training.v1.MetricEventService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('rl.training.v1.MetricEventService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class MetricEventService:
+    """Implemented independently by each metric-event owner (AIServer and Learner).
+    A retry with the same cursor returns the same batch identity and digest until
+    it is acknowledged or an explicit gap proves the requested event unavailable.
+    """
+
+    @staticmethod
+    def GetMetricBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.MetricEventService/GetMetricBatch',
+            training__pb2.GetMetricBatchReq.SerializeToString,
+            training__pb2.GetMetricBatchRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AckMetricBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.MetricEventService/AckMetricBatch',
+            training__pb2.AckMetricBatchReq.SerializeToString,
+            training__pb2.AckMetricBatchRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
 class LearnerServiceStub:
     """Missing associated documentation comment in .proto file."""
 

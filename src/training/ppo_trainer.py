@@ -8,6 +8,7 @@ PPO 训练器
 
 import copy
 import os
+from collections.abc import Mapping
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -151,8 +152,8 @@ class PPOTrainer:
 
         # ---- 模型版本号 ----
         self._model_version = 0
-        self._checkpoint_source_model_version: int | None = None
-        self._publication_version_reserved = False
+        self._model_weights_inherited = False
+        self._last_raw_metric_sum_counts: dict[str, dict[str, float | int]] = {}
 
         self._logger.info(
             "PPOTrainer 初始化完成: obs_dim=%d, action_dim=%d, hidden=%d, device=%s",
@@ -326,7 +327,12 @@ class PPOTrainer:
             )
         policy_lag = max(policy_lags, default=0)
         if not samples:
+            self._last_raw_metric_sum_counts = {}
             return self._empty_stats(policy_lag)
+        if self._model_version >= self.MAX_MODEL_VERSION:
+            raise RuntimeError(
+                "model version exhausted the uint64 publication space"
+            )
 
         # ---- 1. 转换为 Tensor ----
         obs = torch.tensor([s["observation"] for s in samples], dtype=torch.float32, device=self._device)
@@ -363,6 +369,13 @@ class PPOTrainer:
         total_combined_loss = 0.0
         maximum_importance_ratio = 0.0
         total_updates = 0
+        raw_sample_evaluation_count = 0
+        raw_policy_loss_sum = 0.0
+        raw_value_loss_sum = 0.0
+        raw_entropy_sum = 0.0
+        raw_clip_fraction_sum = 0.0
+        raw_approx_kl_sum = 0.0
+        raw_total_loss_sum = 0.0
         value_pred_mean = 0.0
         return_target_mean = 0.0
         explained_variance = 0.0
@@ -453,6 +466,15 @@ class PPOTrainer:
                             maximum_importance_ratio, ratio.max().item()
                         )
 
+                    mini_batch_count = int(mb_indices.numel())
+                    raw_sample_evaluation_count += mini_batch_count
+                    raw_policy_loss_sum += policy_loss.item() * mini_batch_count
+                    raw_value_loss_sum += value_loss.item() * mini_batch_count
+                    raw_entropy_sum += entropy.mean().item() * mini_batch_count
+                    raw_clip_fraction_sum += clip_fraction * mini_batch_count
+                    raw_approx_kl_sum += approx_kl * mini_batch_count
+                    raw_total_loss_sum += total_loss.item() * mini_batch_count
+
                     total_policy_loss += policy_loss.item()
                     total_value_loss += value_loss.item()
                     total_entropy += entropy.mean().item()
@@ -509,6 +531,59 @@ class PPOTrainer:
 
         self._model_version += 1
 
+        self._last_raw_metric_sum_counts = {
+            "approx_kl": {
+                "sum": raw_approx_kl_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "clip_fraction": {
+                "sum": raw_clip_fraction_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "entropy": {
+                "sum": raw_entropy_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "gradient_norm": {
+                "sum": total_gradient_norm,
+                "count": total_updates,
+            },
+            "policy_lag": {
+                "sum": float(sum(policy_lags)),
+                "count": n_samples,
+            },
+            "policy_loss": {
+                "sum": raw_policy_loss_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "return_target": {
+                "sum": float(td_returns.sum().item()),
+                "count": n_samples,
+            },
+            "total_loss": {
+                "sum": raw_total_loss_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "value_loss": {
+                "sum": raw_value_loss_sum,
+                "count": raw_sample_evaluation_count,
+            },
+            "value_prediction": {
+                "sum": float(committed_values.sum().item()),
+                "count": n_samples,
+            },
+        }
+        if any(
+            int(value["count"]) <= 0
+            or not np.isfinite(float(value["sum"]))
+            for value in self._last_raw_metric_sum_counts.values()
+        ):
+            self._logger.error(
+                "PPO raw metric sum/count is invalid; metric fact disabled for "
+                "this committed update"
+            )
+            self._last_raw_metric_sum_counts = {}
+
         stats = {
             "policy_loss": round(total_policy_loss / total_updates, 6),
             "value_loss": round(total_value_loss / total_updates, 6),
@@ -551,6 +626,7 @@ class PPOTrainer:
         """
         os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
+        was_training = bool(self._model.training)
         self._model.eval()
         dummy_input = torch.zeros(1, self._obs_dim, device=self._device)
 
@@ -567,10 +643,21 @@ class PPOTrainer:
 
         # PyTorch 2.6+ 默认走 dynamo 导出路径，简单网络使用 TorchScript 导出即可
         try:
-            torch.onnx.export(self._model, dummy_input, export_path, dynamo=False, **export_kwargs)
-        except TypeError:
-            # PyTorch < 2.6 不支持 dynamo 参数
-            torch.onnx.export(self._model, dummy_input, export_path, **export_kwargs)
+            try:
+                torch.onnx.export(
+                    self._model,
+                    dummy_input,
+                    export_path,
+                    dynamo=False,
+                    **export_kwargs,
+                )
+            except TypeError:
+                # PyTorch < 2.6 不支持 dynamo 参数
+                torch.onnx.export(
+                    self._model, dummy_input, export_path, **export_kwargs
+                )
+        finally:
+            self._model.train(was_training)
 
         self._logger.info("ONNX 模型已导出: %s (version=%d)", export_path, self._model_version)
 
@@ -582,6 +669,7 @@ class PPOTrainer:
             "model_state_dict": self._model.state_dict(),
             "optimizer_state_dict": self._optimizer.state_dict(),
             "model_version": self._model_version,
+            "model_training": bool(self._model.training),
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
             "metadata": metadata or {},
@@ -602,7 +690,8 @@ class PPOTrainer:
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._model_version = int(checkpoint.get("model_version", 0))
-        self._checkpoint_source_model_version = self._model_version
+        self._model_weights_inherited = False
+        self._model.train(bool(checkpoint.get("model_training", True)))
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_rng_state"])
         if "numpy_rng_state" in checkpoint:
@@ -610,36 +699,51 @@ class PPOTrainer:
         self._logger.info("Checkpoint 已加载: %s (version=%d)", path, self._model_version)
         return True
 
-    def reserve_initial_checkpoint_publication_version(
-        self, expected_source_version: int
-    ) -> int:
-        if isinstance(expected_source_version, bool) or not isinstance(
-            expected_source_version, int
-        ):
-            raise ValueError("checkpoint source model version must be an integer")
-        if self._publication_version_reserved:
-            raise RuntimeError(
-                "initial checkpoint publication version was already reserved"
-            )
-        if self._checkpoint_source_model_version is None:
-            raise RuntimeError(
-                "initial checkpoint publication requires a loaded checkpoint"
-            )
+    def load_model_weights(self, path: str) -> bool:
+        """Load only model parameters into a fresh training lineage."""
         if (
-            expected_source_version != self._checkpoint_source_model_version
-            or self._model_version != expected_source_version
+            self._model_version != 0
+            or self._optimizer.state
+            or self._model_weights_inherited
         ):
             raise RuntimeError(
-                "initial checkpoint publication source version mismatch"
+                "model weights can only be inherited by a fresh trainer"
             )
-        if not 0 <= expected_source_version < self.MAX_MODEL_VERSION:
-            raise OverflowError(
-                "initial checkpoint publication version exceeds uint64"
+        if not os.path.isfile(path):
+            self._logger.warning("Checkpoint 不存在: %s", path)
+            return False
+        try:
+            checkpoint = torch.load(
+                path, map_location=self._device, weights_only=False
             )
-        target_version = expected_source_version + 1
-        self._model_version = target_version
-        self._publication_version_reserved = True
-        return target_version
+        except TypeError:
+            checkpoint = torch.load(path, map_location=self._device)
+        if not isinstance(checkpoint, Mapping):
+            raise RuntimeError("inherited checkpoint is not a mapping")
+        source_state = checkpoint.get("model_state_dict")
+        if not isinstance(source_state, Mapping):
+            raise RuntimeError("inherited checkpoint has no model state")
+        target_state = self._model.state_dict()
+        if set(source_state) != set(target_state):
+            raise RuntimeError("inherited model parameter names do not match")
+        for name, target in target_state.items():
+            source = source_state[name]
+            if (
+                not isinstance(source, torch.Tensor)
+                or source.shape != target.shape
+                or source.dtype != target.dtype
+            ):
+                raise RuntimeError(
+                    f"inherited model parameter is incompatible: {name}"
+                )
+        self._model.load_state_dict(source_state, strict=True)
+        self._model_weights_inherited = True
+        # The optimizer, RNG, counters and publication identity intentionally
+        # remain those of this newly constructed trainer.
+        self._logger.info(
+            "Checkpoint 模型权重已继承: %s (new lineage version=0)", path
+        )
+        return True
 
     # ---- 属性访问 ----
     @property
@@ -663,6 +767,10 @@ class PPOTrainer:
     @property
     def max_policy_lag(self) -> int:
         return self._max_policy_lag
+
+    def raw_metric_sum_counts(self) -> dict[str, dict[str, float | int]]:
+        """Return raw mergeable statistics from the last committed update."""
+        return copy.deepcopy(self._last_raw_metric_sum_counts)
 
     # ---- 内部工具 ----
     def _empty_stats(self, policy_lag: int = 0) -> Dict[str, float]:

@@ -32,8 +32,12 @@ class RunLauncherTest(unittest.TestCase):
         self.assertIn("RL_LOCAL_TRAIN_ROOT", document)
         self.assertIn("RL_SAMPLE_POOL_PORT", document)
         self.assertIn("RL_MODEL_DISTRIBUTOR_PORT", document)
+        self.assertIn("RL_INITIAL_MODEL_DIR", document)
+        self.assertIn("--initial-model-dir", document)
+        self.assertIn("--new-run", document)
         self.assertIn("-m main.training_runtime", document)
         self.assertNotIn("MAZE_", document)
+        self.assertNotIn("RL_INITIAL_CHECKPOINT", document)
 
     def test_launcher_preserves_owned_lifecycle_boundaries(self):
         document = (ROOT / "run.sh").read_text(encoding="utf-8")
@@ -45,6 +49,12 @@ class RunLauncherTest(unittest.TestCase):
         self.assertIn('training_child_status="${child_status}"', document)
         self.assertNotIn('wait "${process}"\n            exit $?', document)
         self.assertIn("expected_local_train_root", document)
+        self.assertIn('if [ "${new_run}" -eq 1 ]; then', document)
+        self.assertIn(
+            'find "${local_train_root}" -mindepth 1 -maxdepth 1',
+            document,
+        )
+        self.assertNotIn("! -name metrics", document)
         self.assertNotIn("docker rm", document)
 
     def test_quiesce_does_not_publish_success_for_failed_training_shutdown(self):

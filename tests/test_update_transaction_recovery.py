@@ -83,6 +83,18 @@ def model_status(contract=None, authority=None):
     )
 
 
+def model_manifest_response(manifest, authority=None):
+    response = training_pb2.GetModelManifestRsp(
+        ret_code=0,
+        distributor=authority or model_authority(),
+    )
+    response.manifest.CopyFrom(manifest)
+    version = int(manifest.identity.model_version)
+    response.available_floor_model_version = version
+    response.latest_available_model_version = version
+    return response
+
+
 def sample_authority(
     instance_id: str = "sample-distributor-transaction-test",
     lifecycle_epoch: int = 1,
@@ -147,7 +159,6 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
         runtime._run_start_trained_samples = 0
         runtime.last_stats = {}
         runtime.model_manifests = {0: bootstrap}
-        runtime._last_archive_version = 0
         runtime._metrics_lock = threading.RLock()
         runtime._committed_learner_metrics = {}
         runtime._metrics_context = {}
@@ -323,7 +334,6 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
             runtime.publisher.publish_runtime = mock.Mock(
                 return_value=bootstrap
             )
-            runtime.publisher.archive_version = mock.Mock()
             runtime._wait_initial_model_loaded = mock.Mock()
             runtime._commit_learner_metrics = mock.Mock()
             runtime.model_stub.RegisterModel = mock.Mock(
@@ -342,16 +352,11 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
                         ret_code=-1,
                         distributor=model_authority(),
                     )
-                response = training_pb2.GetModelManifestRsp(
-                    ret_code=0,
-                    distributor=model_authority(),
-                )
-                response.manifest.CopyFrom(
+                return model_manifest_response(
                     manifest_message(
                         TrainingRuntime._manifest_for_wire(bootstrap)
-                    )
+                    ),
                 )
-                return response
 
             runtime.model_stub.GetModelManifest = mock.Mock(
                 side_effect=exact_lookup
@@ -365,9 +370,6 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
             )
             runtime._wait_initial_model_loaded.assert_called_once_with(
                 bootstrap
-            )
-            runtime.publisher.archive_version.assert_called_once_with(
-                0, "fresh"
             )
             self.assertEqual(runtime.initial_model_version, 0)
             self.assertEqual(runtime.model_manifests[0], bootstrap)
@@ -513,11 +515,7 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
                                 register_documents[0]
                             )
                         )
-                        return SimpleNamespace(
-                            ret_code=0,
-                            manifest=expected,
-                            distributor=changed,
-                        )
+                        return model_manifest_response(expected, changed)
 
                     if case == "direct_success":
                         runtime.model_stub.RegisterModel = mock.Mock(
@@ -726,11 +724,7 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
                                 register_documents[0]
                             )
                         )
-                        return SimpleNamespace(
-                            ret_code=0,
-                            manifest=expected,
-                            distributor=model_authority(),
-                        )
+                        return model_manifest_response(expected)
 
                     runtime._register = mock.Mock(
                         side_effect=fail_first_register
@@ -809,11 +803,7 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
                         register_documents[-1]
                     )
                 )
-                return SimpleNamespace(
-                    ret_code=0,
-                    manifest=expected,
-                    distributor=model_authority(),
-                )
+                return model_manifest_response(expected)
 
             runtime._register = lose_register_response
             runtime.model_stub.GetModelManifest = get_exact_manifest
@@ -1098,6 +1088,73 @@ class UpdateTransactionRecoveryTest(unittest.TestCase):
             self.assertEqual(runtime.train_updates, 1)
             self.assertIsNotNone(runtime.publisher.complete_manifest(1))
             self.assert_trainer_matches_checkpoint(runtime, 1)
+
+    def test_train_update_fact_is_emitted_after_register_and_sample_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, bootstrap = self.runtime(Path(directory))
+            runtime._validate_delivery = lambda response, allow_partial=False: {
+                "model_lineage_id": bootstrap["identity"]["model_lineage_id"],
+                "minimum_model_version": 0,
+                "maximum_model_version": 0,
+                "models": [dict(bootstrap["identity"])],
+            }
+            order = []
+            emitted = []
+
+            def register(_manifest):
+                order.append("register")
+                return model_authority()
+
+            def ack(*_args, **_kwargs):
+                order.append("ack")
+
+            def append(fact, committed_at_unix_ms):
+                order.append("fact")
+                emitted.append((copy.deepcopy(fact), committed_at_unix_ms))
+                receipt = read_json(
+                    runtime.publisher.receipt_path("train-update-00000001")
+                )
+                self.assertEqual(receipt["state"], "ACKED")
+                self.assertEqual(runtime.train_updates, 1)
+                self.assertEqual(runtime.trained_samples, 2)
+
+            runtime._register = register
+            runtime._ack = ack
+            runtime.metric_event_writer = SimpleNamespace(append=append)
+            runtime.metric_event_store = None
+            with mock.patch(
+                "main.training_runtime.LeaseRenewer",
+                return_value=FakeLeaseRenewer(),
+            ):
+                runtime._train_delivery(self.response())
+
+            self.assertEqual(order, ["register", "ack", "fact"])
+            self.assertEqual(len(emitted), 1)
+            fact, committed_at_unix_ms = emitted[0]
+            self.assertEqual(fact.train_update_id, "train-update-00000001")
+            self.assertEqual(fact.train_update_sequence, 1)
+            self.assertEqual(fact.delivery_id, "delivery-transaction-1")
+            self.assertEqual(fact.actual_batch_size, 2)
+            self.assertEqual(fact.cumulative_trained_samples, 2)
+            self.assertEqual(fact.behavior_model_version_min, 0)
+            self.assertEqual(fact.behavior_model_version_max, 0)
+            self.assertEqual(fact.published_model.model_version, 1)
+            self.assertGreater(committed_at_unix_ms, 0)
+            self.assertEqual(
+                {statistic.field_id for statistic in fact.ppo_statistics},
+                {
+                    "approx_kl",
+                    "clip_fraction",
+                    "entropy",
+                    "gradient_norm",
+                    "policy_lag",
+                    "policy_loss",
+                    "return_target",
+                    "total_loss",
+                    "value_loss",
+                    "value_prediction",
+                },
+            )
             runtime._nack.assert_not_called()
             self.assertEqual(
                 list(runtime.publisher.checkpoint_dir.glob(".*.rollback.pt")),

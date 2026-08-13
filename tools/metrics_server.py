@@ -121,19 +121,26 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "learner.model_step.v1", "Model Step", "training_depth",
         "model_step", "step", "learner", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values",
+         "latest_model_version"),
         ("learner", "model_version"), ("model", "latest_version"),
         ("model_version",),
     ),
     _metric_definition(
         "learner.train_update.total.v1", "Train Update", "training_depth",
         "train_update", "update", "learner", "total", "counter",
+        ("metric_event_views", "train_updates", "latest", "values",
+         "latest_train_update_sequence"),
         ("learner", "run_train_updates"), ("learner", "train_updates"),
         ("train_step",),
     ),
     _metric_definition(
         "learner.trained_samples.total.v1", "Trained Samples",
         "training_depth", "sample_count", "samples", "learner", "total",
-        "counter", ("learner", "run_trained_samples"),
+        "counter",
+        ("metric_event_views", "train_updates", "latest", "values",
+         "latest_cumulative_trained_samples"),
+        ("learner", "run_trained_samples"),
         ("learner", "trained_samples"), ("trained_samples",),
     ),
     _metric_definition(
@@ -144,29 +151,39 @@ _STATIC_METRIC_DEFINITIONS = (
     ),
     _metric_definition(
         "learner.loss.policy.v1", "Policy Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge", ("learner", "policy_loss"),
+        "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "policy_loss", "mean"), ("learner", "policy_loss"),
         ("policy_loss",),
     ),
     _metric_definition(
         "learner.loss.value.v1", "Value Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge", ("learner", "value_loss"),
+        "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "value_loss", "mean"), ("learner", "value_loss"),
         ("value_loss",),
     ),
     _metric_definition(
         "learner.loss.total.v1", "Total Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge", ("learner", "total_loss"),
+        "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "total_loss", "mean"), ("learner", "total_loss"),
         ("total_loss",),
     ),
     _metric_definition(
         "server.episode.learning_return.mean.v1", "Mean Learning Return",
         "episode_return", "episode_return", "reward", "agent_episode_window",
-        "mean", "gauge", ("actor", "episodes", "mean_agent_return"),
+        "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_agent_return"), ("actor", "episodes", "mean_agent_return"),
         ("mean_episode_reward",),
     ),
     _metric_definition(
         "server.training.episode.learning_return.mean.v1",
         "Mean Training Agent Return", "episode_return", "episode_return",
         "reward", "training_agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_agent_return"),
         ("actor", "metric_values",
          "server.training.episode.learning_return.mean.v1"),
         ("actor", "episodes", "mean_agent_return"),
@@ -175,6 +192,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.learning_return.latest_mean.v1",
         "Latest Training Agent Return", "episode_return", "episode_return",
         "reward", "latest_training_environment_episode", "latest", "gauge",
+        ("metric_event_views", "episodes", "latest", "values",
+         "mean_agent_return"),
         ("actor", "metric_values",
          "server.training.episode.learning_return.latest_mean.v1"),
         ("actor", "episodes", "latest_agent_return"),
@@ -183,29 +202,39 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.completed.total.v1",
         "Completed Training Episodes", "training_depth", "episode_count",
         "episodes", "server", "total", "counter",
+        ("metric_event_views", "episodes", "windows", "all", "raw",
+         "environment_episode_count"),
         ("actor", "metric_values",
          "server.training.episode.completed.total.v1"),
     ),
     _metric_definition(
         "server.episode.learning_return.min.v1", "Min Learning Return",
         "episode_return", "episode_return", "reward", "agent_episode_window",
-        "min", "gauge", ("actor", "episodes", "min_agent_return"),
+        "min", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "min_agent_return"), ("actor", "episodes", "min_agent_return"),
     ),
     _metric_definition(
         "server.episode.learning_return.max.v1", "Max Learning Return",
         "episode_return", "episode_return", "reward", "agent_episode_window",
-        "max", "gauge", ("actor", "episodes", "max_agent_return"),
+        "max", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "max_agent_return"), ("actor", "episodes", "max_agent_return"),
     ),
     _metric_definition(
         "server.episode.success.agent_rate.v1", "Agent Success",
         "episode_success", "percentage", "%", "agent_episode_window",
-        "mean", "gauge", ("actor", "episodes", "agent_success_rate"),
+        "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "agent_success_rate"), ("actor", "episodes", "agent_success_rate"),
         ("pass_rate",), scale=100.0,
     ),
     _metric_definition(
         "server.training.episode.success.agent_rate.v1",
         "Training Agent Success", "episode_success", "percentage", "%",
         "training_agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "agent_success_rate"),
         ("actor", "metric_values",
          "server.training.episode.success.agent_rate.v1"),
         ("actor", "episodes", "agent_success_rate"), scale=100.0,
@@ -214,6 +243,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.success.any_rate.v1",
         "Training Any Success", "episode_success", "percentage", "%",
         "training_environment_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "any_success_rate"),
         ("actor", "metric_values",
          "server.training.episode.success.any_rate.v1"),
         ("actor", "episodes", "any_success_rate"), scale=100.0,
@@ -222,6 +253,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.success.all_rate.v1",
         "Training All Success", "episode_success", "percentage", "%",
         "training_environment_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "all_success_rate"),
         ("actor", "metric_values",
          "server.training.episode.success.all_rate.v1"),
         ("actor", "episodes", "all_success_rate"), scale=100.0,
@@ -229,37 +262,49 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "server.episode.success.any_rate.v1", "Any Success",
         "episode_success", "percentage", "%", "environment_episode_window",
-        "mean", "gauge", ("actor", "episodes", "any_success_rate"),
+        "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "any_success_rate"), ("actor", "episodes", "any_success_rate"),
         scale=100.0,
     ),
     _metric_definition(
         "server.episode.success.all_rate.v1", "All Success",
         "episode_success", "percentage", "%", "environment_episode_window",
-        "mean", "gauge", ("actor", "episodes", "all_success_rate"),
+        "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "all_success_rate"), ("actor", "episodes", "all_success_rate"),
         scale=100.0,
     ),
     _metric_definition(
         "server.episode.path_ratio.mean.v1", "Path Ratio",
         "episode_success", "ratio", "1", "successful_agent_episode_window",
         "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "path_ratio_mean"),
         ("actor", "metric_values", "server.episode.path_ratio.mean.v1"),
     ),
     _metric_definition(
         "server.episode.step.mean.v1", "Episode Step",
         "episode_success", "environment_step", "step",
         "agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_episode_step"),
         ("actor", "metric_values", "server.episode.step.mean.v1"),
     ),
     _metric_definition(
         "server.episode.unique_cells.mean.v1", "Unique Cells",
         "episode_success", "cell_count", "cells", "agent_episode_window",
         "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_unique_cells"),
         ("actor", "metric_values", "server.episode.unique_cells.mean.v1"),
     ),
     _metric_definition(
         "server.episode.blocked_move_rate.v1", "Blocked Move Rate",
         "episode_success", "percentage", "%", "agent_episode_window",
         "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "blocked_move_rate"),
         ("actor", "metric_values", "server.episode.blocked_move_rate.v1"),
         scale=100.0,
     ),
@@ -267,6 +312,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.path_ratio.mean.v1",
         "Training Path Ratio", "episode_success", "ratio", "1",
         "successful_training_agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "path_ratio_mean"),
         ("actor", "metric_values",
          "server.training.episode.path_ratio.mean.v1"),
     ),
@@ -274,6 +321,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.step.mean.v1", "Training Episode Step",
         "episode_success", "environment_step", "step",
         "training_agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_episode_step"),
         ("actor", "metric_values",
          "server.training.episode.step.mean.v1"),
     ),
@@ -281,6 +330,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.unique_cells.mean.v1",
         "Training Unique Cells", "episode_success", "cell_count", "cells",
         "training_agent_episode_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "mean_unique_cells"),
         ("actor", "metric_values",
          "server.training.episode.unique_cells.mean.v1"),
     ),
@@ -288,6 +339,8 @@ _STATIC_METRIC_DEFINITIONS = (
         "server.training.episode.blocked_move_rate.v1",
         "Training Blocked Move Rate", "episode_success", "percentage", "%",
         "training_transition_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "blocked_move_rate"),
         ("actor", "metric_values",
          "server.training.episode.blocked_move_rate.v1"), scale=100.0,
     ),
@@ -400,21 +453,29 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "learner.ppo.entropy.v1", "Policy Entropy", "ppo_stability",
         "entropy", "1", "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "entropy", "mean"),
         ("learner", "entropy"), ("entropy",),
     ),
     _metric_definition(
         "learner.ppo.approx_kl.v1", "Approx. KL", "ppo_stability",
         "divergence", "1", "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "approx_kl", "mean"),
         ("learner", "approx_kl"), ("approx_kl",),
     ),
     _metric_definition(
         "learner.ppo.clip_fraction.v1", "Clip Fraction", "ppo_stability",
         "percentage", "%", "train_update", "mean", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "clip_fraction", "mean"),
         ("learner", "clip_fraction"), ("clip_fraction",), scale=100.0,
     ),
     _metric_definition(
         "learner.ppo.gradient_norm.v1", "Gradient Norm", "ppo_stability",
         "norm", "1", "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "gradient_norm", "mean"),
         ("learner", "gradient_norm"), ("gradient_norm",),
     ),
     _metric_definition(
@@ -426,18 +487,26 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "learner.ppo.policy_lag.v1", "Policy Lag", "ppo_stability",
         "model_step", "version", "train_update", "latest", "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "policy_lag", "mean"),
         ("learner", "policy_lag"), ("policy_lag",),
     ),
     _metric_definition(
         "learner.value.prediction_mean.v1", "Value Prediction Mean",
         "ppo_stability", "value", "reward", "train_update", "mean",
-        "gauge", ("learner", "value_pred_mean"),
+        "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "value_prediction", "mean"),
+        ("learner", "value_pred_mean"),
         ("value_pred_mean",),
     ),
     _metric_definition(
         "learner.value.return_target_mean.v1", "Return Target Mean",
         "ppo_stability", "value", "reward", "train_update", "mean",
-        "gauge", ("learner", "return_target_mean"),
+        "gauge",
+        ("metric_event_views", "train_updates", "latest", "values", "ppo",
+         "return_target", "mean"),
+        ("learner", "return_target_mean"),
         ("return_target_mean",),
     ),
     _metric_definition(
@@ -478,6 +547,8 @@ def _reward_component_definition(name: str):
         "server_transition_window",
         "mean",
         "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "reward_components", name, "transition_mean"),
         ("actor", "metric_values", field_id),
         ("actor", "episodes", "transition_reward_components", name),
     )
@@ -491,6 +562,8 @@ def _training_reward_component_definition(name: str, statistic: str):
             field_id, f"{label} / Agent Episode", "reward_components",
             "episode_reward", "reward/agent episode",
             "training_agent_episode_window", "mean", "gauge",
+            ("metric_event_views", "episodes", "windows", "100", "values",
+             "reward_components", name, "episode_mean"),
             ("actor", "metric_values", field_id),
             ("actor", "episodes", "reward_components", name),
         )
@@ -499,6 +572,8 @@ def _training_reward_component_definition(name: str, statistic: str):
             field_id, f"Latest {label} / Agent Episode", "reward_components",
             "episode_reward", "reward/agent episode",
             "latest_training_environment_episode", "latest", "gauge",
+            ("metric_event_views", "episodes", "latest", "values",
+             "reward_components", name, "episode_mean"),
             ("actor", "metric_values", field_id),
             ("actor", "episodes", "latest_reward_components", name),
         )
@@ -506,6 +581,8 @@ def _training_reward_component_definition(name: str, statistic: str):
         field_id, f"{label} / Transition", "reward_components",
         "transition_reward", "reward/transition",
         "training_transition_window", "mean", "gauge",
+        ("metric_event_views", "episodes", "windows", "100", "values",
+         "reward_components", name, "transition_mean"),
         ("actor", "metric_values", field_id),
         ("actor", "episodes", "transition_reward_components", name),
     )
@@ -527,19 +604,38 @@ def _finite_number(value):
     return number if math.isfinite(number) else None
 
 
-def _project_metric_value(record, definition):
+_EVENT_WINDOWS = {"25", "100", "5s", "1m", "1h", "24h", "all"}
+
+
+def _project_metric_value(record, definition, event_window="100"):
+    if event_window not in _EVENT_WINDOWS:
+        raise ValueError("unsupported metric event window")
+    event_views = record.get("metric_event_views")
+    event_views_authoritative = (
+        isinstance(event_views, dict)
+        and event_views.get("status") != "unavailable"
+    )
     for path in definition["paths"]:
-        value = _finite_number(_nested(record, path))
+        selected_path = path
+        if (
+            len(path) >= 5
+            and path[:3] == ("metric_event_views", "episodes", "windows")
+            and path[3] == "100"
+        ):
+            selected_path = (*path[:3], event_window, *path[4:])
+        value = _finite_number(_nested(record, selected_path))
         if value is not None:
             return value * definition["scale"]
+        if path and path[0] == "metric_event_views" and event_views_authoritative:
+            return None
     return None
 
 
-def project_metric_values(record, definitions):
+def project_metric_values(record, definitions, event_window="100"):
     projected = copy.deepcopy(record)
     projected["metric_values"] = {
         definition["descriptor"]["field_id"]: _project_metric_value(
-            record, definition
+            record, definition, event_window
         )
         for definition in definitions
     }
@@ -826,6 +922,9 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 limit = int(params.get("limit", ["0"])[0])
                 if after_sequence < 0 or limit < 0:
                     raise ValueError
+                event_window = params.get("window", ["100"])[0]
+                if event_window not in _EVENT_WINDOWS:
+                    raise ValueError
             except ValueError:
                 self._json_response(
                     {"schema_version": 1, "error": "invalid query cursor"},
@@ -838,8 +937,11 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 {
                     "schema_version": 1,
                     "stream": "current",
+                    "event_window": event_window,
                     "records": [
-                        project_metric_values(record, definitions)
+                        project_metric_values(
+                            record, definitions, event_window
+                        )
                         for record in records
                     ],
                     "total": len(records),
@@ -850,12 +952,22 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
         elif path == "/api/metrics/latest":
             latest = metrics_reader.latest()
             definitions = metrics_reader.metric_definitions()
+            event_window = params.get("window", ["100"])[0]
+            if event_window not in _EVENT_WINDOWS:
+                self._json_response(
+                    {"schema_version": 1, "error": "invalid event window"},
+                    status=400,
+                )
+                return
             self._json_response(
                 {
                     "schema_version": 1,
                     "stream": "current",
+                    "event_window": event_window,
                     "record": (
-                        project_metric_values(latest, definitions)
+                        project_metric_values(
+                            latest, definitions, event_window
+                        )
                         if latest
                         else {}
                     ),

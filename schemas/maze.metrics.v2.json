@@ -1,0 +1,127 @@
+{
+  "catalog_schema": "rl.metric-field-catalog.v1",
+  "fields": [
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "transition",
+      "dimension": "reward",
+      "fact": "agent_episode",
+      "field_id": "first_visit_bonus",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "transition",
+      "dimension": "reward",
+      "fact": "agent_episode",
+      "field_id": "geodesic_progress",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "transition",
+      "dimension": "reward",
+      "fact": "agent_episode",
+      "field_id": "goal_reward",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "transition",
+      "dimension": "reward",
+      "fact": "agent_episode",
+      "field_id": "timeout_penalty",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "transition",
+      "dimension": "reward",
+      "fact": "agent_episode",
+      "field_id": "wasted_action_penalty",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "divergence",
+      "fact": "train_update",
+      "field_id": "approx_kl",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "fraction",
+      "fact": "train_update",
+      "field_id": "clip_fraction",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "entropy",
+      "fact": "train_update",
+      "field_id": "entropy",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "optimizer_step",
+      "dimension": "norm",
+      "fact": "train_update",
+      "field_id": "gradient_norm",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample",
+      "dimension": "model_version_distance",
+      "fact": "train_update",
+      "field_id": "policy_lag",
+      "unit": "model_version"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "loss",
+      "fact": "train_update",
+      "field_id": "policy_loss",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample",
+      "dimension": "reward",
+      "fact": "train_update",
+      "field_id": "return_target",
+      "unit": "reward"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "loss",
+      "fact": "train_update",
+      "field_id": "total_loss",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample_evaluation",
+      "dimension": "loss",
+      "fact": "train_update",
+      "field_id": "value_loss",
+      "unit": "1"
+    },
+    {
+      "aggregation": "raw_sum_count",
+      "count_unit": "sample",
+      "dimension": "reward",
+      "fact": "train_update",
+      "field_id": "value_prediction",
+      "unit": "reward"
+    }
+  ],
+  "schema_id": "maze.metrics.v2",
+  "schema_version": 2
+}

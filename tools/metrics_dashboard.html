@@ -316,12 +316,23 @@
 
   <section class="toolbar" aria-label="曲线控制">
     <div class="toolbar-group">
-      <span class="toolbar-label">范围</span>
+      <span class="toolbar-label">显示点</span>
       <div class="segmented" aria-label="可见数据点范围">
         <button class="segment" type="button" data-range="20" aria-pressed="false">20 点</button>
         <button class="segment" type="button" data-range="48" aria-pressed="true">48 点</button>
         <button class="segment" type="button" data-range="all" aria-pressed="false">全部</button>
       </div>
+      <label class="toggle">指标窗口
+        <select id="metric-window" class="select" aria-label="真实指标聚合窗口">
+          <option value="25">最近 25 局</option>
+          <option value="100" selected>最近 100 局</option>
+          <option value="5s">5 秒</option>
+          <option value="1m">1 分钟</option>
+          <option value="1h">1 小时</option>
+          <option value="24h">24 小时</option>
+          <option value="all">本 Run 全部</option>
+        </select>
+      </label>
       <label class="toggle">平滑 <input id="smoothing" class="smoothing" type="range" min="0" max="90" value="0" aria-label="平滑比例"> <output id="smoothing-output">0.00</output></label>
     </div>
     <div class="toolbar-group">
@@ -436,6 +447,7 @@
     cursor: 0,
     sourceId: "",
     range: 48,
+    metricWindow: "100",
     smoothing: 0,
     axis: "model",
     ignoreOutliers: true,
@@ -1058,7 +1070,8 @@
       if (sourceChanged) resetStream(status.metrics_source_id);
       await refreshCatalog(sourceChanged || registry.size === 0);
       const metricsResponse = await fetch(
-        `/api/metrics?after_sequence=${encodeURIComponent(state.cursor)}`,
+        `/api/metrics?after_sequence=${encodeURIComponent(state.cursor)}` +
+        `&window=${encodeURIComponent(state.metricWindow)}`,
         {cache: "no-store"}
       );
       if (!metricsResponse.ok) {
@@ -1103,6 +1116,14 @@
     state.smoothing = Number(event.target.value) / 100;
     byId("smoothing-output").textContent = state.smoothing.toFixed(2);
     renderAllPanels();
+  });
+  byId("metric-window").addEventListener("change", event => {
+    state.metricWindow = event.target.value;
+    state.records = [];
+    state.cursor = 0;
+    state.domains.clear();
+    renderAllPanels();
+    poll();
   });
   byId("outliers").addEventListener("change", event => {
     state.ignoreOutliers = event.target.checked;

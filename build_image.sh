@@ -62,6 +62,7 @@ rsync -a \
     --exclude='__pycache__/' \
     "${repo_dir}/" "${context_dir}/"
 cp -R "${contract_dir}/python" "${context_dir}/_deps/contracts/python"
+cp -R "${contract_dir}/schemas" "${context_dir}/_deps/contracts/schemas"
 cp "${sample_pool_dir}/bin/maze_sample_distributor" \
     "${context_dir}/_deps/sample-pool/bin/maze_sample_distributor"
 cp "${sample_pool_dir}/config/distributor_config.yaml" \

@@ -1,4 +1,4 @@
-"""Task-neutral leased-sample PPO runtime for rl-contracts 0.10.0."""
+"""Task-neutral leased-sample PPO runtime for rl-contracts 0.11.0."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import resource
 import shutil
 import signal
@@ -39,6 +40,15 @@ from src.contracts.identity import (
     validate_config,
 )
 from src.log.logger import setup_logger
+from src.metrics.metric_events import (
+    AIServerMetricRelay,
+    LocalMetricProjector,
+    LocalTrainUpdateMetricWriter,
+    MetricEventContractError,
+    MetricSchemaCatalog,
+    RawMetricBatchStore,
+    default_metric_schema_directory,
+)
 from src.metrics.metrics_backend import DisabledMetricsBackend, create_backend
 from src.training.ppo_trainer import PPOTrainer
 
@@ -92,12 +102,16 @@ def sha256_file(path: Path) -> str:
 def atomic_write_json(path: Path, document: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(document, stream, ensure_ascii=False, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def read_json(path: Path) -> dict:
@@ -180,9 +194,43 @@ def training_chain_status(
 
 
 class ModelPublisher:
-    ARCHIVE_MODEL_FILE = "SaveModel.onnx"
-    ARCHIVE_CHECKPOINT_FILE = "checkpoint.pt"
-    ARCHIVE_MANIFEST_FILE = "manifest.json"
+    MODEL_FILE = "SaveModel.onnx"
+    CHECKPOINT_FILE = "checkpoint.pt"
+    MANIFEST_FILE = "manifest.json"
+    METADATA_FILE = "metadata.json"
+    MIN_ROLLING_PUBLICATIONS = 101
+    MAX_MODEL_VERSION = (1 << 64) - 1
+    PROVENANCE_KEYS = (
+        "initial_model_directory",
+        "initial_model_checkpoint_digest",
+        "initial_model_lineage_id",
+        "initial_model_version",
+        "initial_model_artifact_digest",
+        "initial_model_manifest_digest",
+        "initial_training_config_digest",
+    )
+    WIRE_MANIFEST_KEYS = {
+        "manifest_schema_version",
+        "contract",
+        "identity",
+        "observation_schema",
+        "action_schema",
+        "model_architecture_id",
+        "tensor_dtype",
+        "input_shape",
+        "action_shape",
+        "value_shape",
+        "artifact_uri",
+        "model_file",
+        "size_bytes",
+        "seed",
+        "train_updates",
+        "trained_samples",
+        "training_config_digest",
+        "training_semantics",
+        "published_at_unix_ms",
+        "ready",
+    }
 
     def __init__(self, config: dict):
         validate_config(config)
@@ -201,7 +249,6 @@ class ModelPublisher:
             os.environ.get("RL_LOCAL_TRAIN_ROOT", configured_root)
         ).resolve()
         self.runtime_dir = self.local_train_root / "runtime"
-        self.published_dir = self.runtime_dir / "serving"
         self.checkpoint_dir = self.runtime_dir / "checkpoints"
         self.update_dir = self.runtime_dir / "receipts"
         self.state_path = self.runtime_dir / "state.json"
@@ -213,59 +260,261 @@ class ModelPublisher:
                 str(model["archive_interval_updates"]),
             )
         )
-        self.archive_on_graceful_shutdown = bool(
-            model["archive_on_graceful_shutdown"]
-        )
-        self.serving_retention_versions = int(
-            model["serving_retention_versions"]
+        self.publication_retention_versions = int(
+            model["publication_retention_versions"]
         )
         if self.archive_interval_updates <= 0:
             raise ValueError("archive_interval_updates must be positive")
-        if self.serving_retention_versions < 2:
-            raise ValueError("serving_retention_versions must be at least 2")
-        self.initial_checkpoint_identity: dict = {}
+        if (
+            self.publication_retention_versions
+            < self.MIN_ROLLING_PUBLICATIONS
+        ):
+            raise ValueError(
+                "publication_retention_versions must be at least 101"
+            )
+        self.initial_model_provenance: dict = {}
+        self._resume_state: dict | None = None
+        self._resume_manifests: list[dict] = []
         self._prepared = False
 
-    def prepare(self) -> None:
+    def prepare(self) -> str:
         for directory in (
-            self.published_dir,
             self.checkpoint_dir,
             self.archive_dir,
             self.update_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
-        occupied = [
-            path
-            for path in (
-                self.state_path,
-                *self.published_dir.glob("*"),
-                *self.checkpoint_dir.glob("*"),
-                *self.update_dir.glob("*"),
-                *self.archive_dir.glob("*"),
-            )
-            if path.exists()
-        ]
-        if occupied:
+        self._recover_private_archive_directories()
+        self._validate_storage_layout()
+        has_state = self.state_path.exists() or self.state_path.is_symlink()
+        has_checkpoint = any(self.checkpoint_dir.iterdir())
+        has_receipt = any(self.update_dir.iterdir())
+        has_archive = any(self.archive_dir.iterdir())
+        if not any((has_state, has_checkpoint, has_receipt, has_archive)):
+            self._prepared = True
+            return "fresh"
+        if not has_state or has_checkpoint or not has_archive:
             raise RuntimeError(
-                "local-train was not cleaned before Learner startup: "
-                + ", ".join(str(path) for path in occupied[:5])
+                "local-train cannot be resumed from an incomplete transaction"
             )
+        self._resume_state, self._resume_manifests = (
+            self._validate_stopped_run_for_resume()
+        )
+        self.initial_model_provenance = {
+            key: self._resume_manifests[-1][key]
+            for key in self.PROVENANCE_KEYS
+            if key in self._resume_manifests[-1]
+        }
         self._prepared = True
+        return "resume"
+
+    def _validate_storage_layout(self) -> None:
+        allowed_root_entries = {"runtime", "archive", "metrics"}
+        for path in self.local_train_root.iterdir():
+            if path.name not in allowed_root_entries:
+                raise RuntimeError(
+                    f"unknown local-train entry requires review: {path}"
+                )
+        if self.runtime_dir.is_symlink() or not self.runtime_dir.is_dir():
+            raise RuntimeError("runtime storage must be a regular directory")
+        if self.archive_dir.is_symlink() or not self.archive_dir.is_dir():
+            raise RuntimeError("archive storage must be a regular directory")
+        runtime_entries = {path.name: path for path in self.runtime_dir.iterdir()}
+        if set(runtime_entries) - {"state.json", "checkpoints", "receipts"}:
+            raise RuntimeError("runtime storage contains unknown entries")
+        for name, expected in (
+            ("checkpoints", self.checkpoint_dir),
+            ("receipts", self.update_dir),
+        ):
+            path = runtime_entries.get(name, expected)
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(f"runtime {name} must be a regular directory")
+        if self.state_path.is_symlink():
+            raise RuntimeError("runtime state must not be a symbolic link")
+
+    def _validate_stopped_run_for_resume(self) -> tuple[dict, list[dict]]:
+        if not self.state_path.is_file():
+            raise RuntimeError("same-run resume requires runtime/state.json")
+        archive_entries = tuple(self.archive_dir.iterdir())
+        manifests: list[dict] = []
+        for path in archive_entries:
+            if path.is_symlink() or not path.is_dir() or not path.name.isdigit():
+                raise RuntimeError(
+                    f"archive contains a non-canonical publication: {path}"
+                )
+            try:
+                version = int(path.name)
+                if path.name != self.version_name(version):
+                    raise ValueError
+            except ValueError as error:
+                raise RuntimeError(
+                    f"archive contains a non-canonical publication: {path}"
+                ) from error
+            manifest = self.complete_manifest(version)
+            if manifest is None:
+                raise RuntimeError(
+                    f"archive publication is incomplete or corrupt: {path}"
+                )
+            manifests.append(manifest)
+        manifests.sort(key=lambda item: int(item["identity"]["model_version"]))
+        if not manifests:
+            raise RuntimeError("same-run resume requires a complete publication")
+
+        receipts: dict[str, dict] = {}
+        for path in self.update_dir.iterdir():
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or re.fullmatch(r"train-update-\d{8}\.json", path.name) is None
+            ):
+                raise RuntimeError(
+                    f"update receipt is not canonical: {path}"
+                )
+            try:
+                receipt = read_json(path)
+            except (OSError, ValueError, TypeError) as error:
+                raise RuntimeError(f"update receipt is unreadable: {path}") from error
+            update_id = path.stem
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("schema_version") != 1
+                or receipt.get("train_update_id") != update_id
+                or receipt.get("state") not in ("ACKED", "ROLLED_BACK")
+            ):
+                raise RuntimeError(
+                    f"update receipt is not settled for resume: {path}"
+                )
+            receipts[update_id] = receipt
+
+        try:
+            state = read_json(self.state_path)
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError("runtime state is unreadable") from error
+        latest = manifests[-1]
+        version = int(latest["identity"]["model_version"])
+        if (
+            not isinstance(state, dict)
+            or state.get("schema_version") != 1
+            or state.get("latest_model") != latest["identity"]
+            or state.get("latest_manifest") != str(self.manifest_path(version))
+            or state.get("latest_checkpoint") != str(self.checkpoint_path(version))
+            or state.get("train_updates") != latest.get("train_updates")
+            or state.get("trained_samples") != latest.get("trained_samples")
+            or int(state.get("train_updates", -1)) != version
+            or int(state.get("trained_samples", -1)) < 0
+        ):
+            raise RuntimeError("runtime state does not match the latest publication")
+        for key in self.PROVENANCE_KEYS:
+            if state.get(key) != latest.get(key):
+                raise RuntimeError(
+                    "runtime state and publication provenance do not match"
+                )
+        if version > 0:
+            update_id = str(latest.get("train_update_id", ""))
+            receipt = receipts.get(update_id)
+            if (
+                receipt is None
+                or receipt.get("state") != "ACKED"
+                or receipt.get("model") != latest["identity"]
+                or receipt.get("train_updates") != latest.get("train_updates")
+                or receipt.get("trained_samples") != latest.get("trained_samples")
+            ):
+                raise RuntimeError(
+                    "latest publication has no exact ACKED update receipt"
+                )
+        return state, manifests
+
+    @classmethod
+    def version_name(cls, version: int) -> str:
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 0
+            or version > cls.MAX_MODEL_VERSION
+        ):
+            raise ValueError("model version must be a uint64 integer")
+        return f"{version:06d}"
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _is_canonical_publication_path(
+        self, path: Path, version: int
+    ) -> bool:
+        return (
+            path.parent == self.archive_dir
+            and path.name == self.version_name(version)
+            and not path.is_symlink()
+        )
+
+    def _private_archive_directory_version(self, path: Path) -> int | None:
+        if path.parent != self.archive_dir or path.is_symlink():
+            return None
+        for prefix in (
+            ".publication-",
+            ".prune-",
+            ".rollback-delete-",
+        ):
+            if not path.name.startswith(prefix):
+                continue
+            remainder = path.name[len(prefix) :]
+            token, separator, _suffix = remainder.partition("-")
+            if not separator or not token.isdigit():
+                return None
+            version = int(token)
+            try:
+                if token != self.version_name(version):
+                    return None
+            except ValueError:
+                return None
+            return version
+        return None
+
+    def _recover_private_archive_directories(self) -> None:
+        for path in tuple(self.archive_dir.iterdir()):
+            if not path.name.startswith("."):
+                continue
+            if self._private_archive_directory_version(path) is None:
+                raise RuntimeError(
+                    f"unknown private archive entry requires review: {path}"
+                )
+            if not path.is_dir():
+                raise RuntimeError(
+                    f"private archive entry is not a directory: {path}"
+                )
+            shutil.rmtree(path)
+        self._fsync_directory(self.archive_dir)
+
+    def _temporary_publication_path(self, version: int) -> Path:
+        return self.archive_dir / (
+            f".publication-{self.version_name(version)}-"
+            f"{os.getpid()}-{time.time_ns()}.tmp"
+        )
+
+    def staged_checkpoint_path(self, version: int) -> Path:
+        return self.checkpoint_dir / (
+            f"publication-{self.version_name(version)}.checkpoint.pt"
+        )
 
     def model_path(self, version: int) -> Path:
-        return self.published_dir / f"model_v{version:06d}.onnx"
+        return self.archive_path(version) / self.MODEL_FILE
 
     def manifest_path(self, version: int) -> Path:
-        return self.published_dir / f"manifest_v{version:06d}.json"
+        return self.archive_path(version) / self.MANIFEST_FILE
 
     def checkpoint_path(self, version: int) -> Path:
-        return self.checkpoint_dir / f"checkpoint_v{version:06d}.pt"
+        return self.archive_path(version) / self.CHECKPOINT_FILE
 
     def archive_path(self, version: int) -> Path:
-        return self.archive_dir / f"{version:06d}"
+        return self.archive_dir / self.version_name(version)
 
-    def archive_manifest_path(self, version: int) -> Path:
-        return self.archive_path(version) / self.ARCHIVE_MANIFEST_FILE
+    def metadata_path(self, version: int) -> Path:
+        return self.archive_path(version) / self.METADATA_FILE
 
     def receipt_path(self, train_update_id: str) -> Path:
         return self.update_dir / f"{train_update_id}.json"
@@ -277,20 +526,50 @@ class ModelPublisher:
         except TypeError:
             return torch.load(path, map_location="cpu")
 
-    def load_initial_checkpoint(
-        self, trainer: PPOTrainer, checkpoint_value: str
+    def load_initial_model_directory(
+        self, trainer: PPOTrainer, directory_value: str
     ) -> dict:
-        checkpoint_path = Path(checkpoint_value).resolve()
-        if not checkpoint_path.is_file():
+        requested = Path(directory_value).expanduser()
+        if requested.is_symlink():
+            raise RuntimeError("initial model directory must not be a symlink")
+        try:
+            directory = requested.resolve(strict=True)
+        except OSError as error:
             raise RuntimeError(
-                f"initial checkpoint does not exist: {checkpoint_path}"
-            )
-        if checkpoint_path == self.local_train_root or (
-            self.local_train_root in checkpoint_path.parents
+                f"initial model directory does not exist: {requested}"
+            ) from error
+        if not directory.is_dir():
+            raise RuntimeError("initial model source must be a directory")
+        if directory == self.local_train_root or (
+            self.local_train_root in directory.parents
         ):
-            raise RuntimeError("initial checkpoint must be outside local-train")
-        checkpoint = self._load_checkpoint(checkpoint_path)
-        required = {
+            raise RuntimeError(
+                "initial model directory must be outside local-train"
+            )
+        entries = {path.name: path for path in directory.iterdir()}
+        required_files = {
+            self.MODEL_FILE,
+            self.CHECKPOINT_FILE,
+            self.MANIFEST_FILE,
+            self.METADATA_FILE,
+        }
+        if set(entries) != required_files or any(
+            path.is_symlink() or not path.is_file() for path in entries.values()
+        ):
+            raise RuntimeError(
+                "initial model directory must contain exactly the canonical "
+                "four-file publication"
+            )
+        model_path = entries[self.MODEL_FILE]
+        checkpoint_path = entries[self.CHECKPOINT_FILE]
+        try:
+            document = read_json(entries[self.MANIFEST_FILE])
+            local_metadata = read_json(entries[self.METADATA_FILE])
+            checkpoint = self._load_checkpoint(checkpoint_path)
+            expected_manifest = finalize_manifest_digest(document)
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError) as error:
+            raise RuntimeError("initial model publication is unreadable") from error
+        required_checkpoint = {
             "model_state_dict",
             "optimizer_state_dict",
             "model_version",
@@ -298,28 +577,93 @@ class ModelPublisher:
             "numpy_rng_state",
             "metadata",
         }
-        if not required.issubset(checkpoint):
-            raise RuntimeError("initial checkpoint is incomplete")
-        metadata = checkpoint["metadata"]
+        checkpoint_metadata = checkpoint.get("metadata", {})
+        identity = document.get("identity", {})
+        version = identity.get("model_version")
         if (
-            metadata.get("model_lineage_id") != self.lineage_id
-            or metadata.get("observation_schema")
+            set(document) != self.WIRE_MANIFEST_KEYS
+            or document.get("contract") != contract_document(self.contract)
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or not 0 <= version <= self.MAX_MODEL_VERSION
+            or identity.get("artifact_digest") != sha256_file(model_path)
+            or identity.get("manifest_digest")
+            != expected_manifest["identity"]["manifest_digest"]
+            or document.get("model_file") != self.MODEL_FILE
+            or document.get("size_bytes") != model_path.stat().st_size
+            or document.get("observation_schema")
             != schema_document(self.semantics.observation_schema)
-            or metadata.get("training_config_digest")
-            != self.training_digest.hex
+            or document.get("action_schema")
+            != schema_document(self.semantics.action_schema)
+            or document.get("model_architecture_id")
+            != self.semantics.model_architecture_id
+            or document.get("tensor_dtype") != self.tensor_dtype
+            or document.get("input_shape") != [1, self.obs_dim]
+            or document.get("action_shape") != [1, self.action_dim]
+            or document.get("value_shape") != [1, 1]
+            or not document.get("ready")
+            or not required_checkpoint.issubset(checkpoint)
+            or checkpoint.get("model_version") != version
+            or not isinstance(local_metadata, dict)
+            or local_metadata.get("schema_version") != 1
+            or local_metadata.get("model_identity") != identity
+            or local_metadata.get("checkpoint_file") != self.CHECKPOINT_FILE
+            or local_metadata.get("checkpoint_metadata") != checkpoint_metadata
+            or local_metadata.get("train_updates")
+            != document.get("train_updates")
+            or local_metadata.get("trained_samples")
+            != document.get("trained_samples")
+            or checkpoint_metadata.get("model_lineage_id")
+            != identity.get("model_lineage_id")
+            or checkpoint_metadata.get("observation_schema")
+            != document.get("observation_schema")
+            or checkpoint_metadata.get("action_schema")
+            != document.get("action_schema")
+            or checkpoint_metadata.get("model_architecture_id")
+            != document.get("model_architecture_id")
+            or checkpoint_metadata.get("tensor_dtype")
+            != document.get("tensor_dtype")
+            or checkpoint_metadata.get("training_config_digest")
+            != document.get("training_config_digest")
+            or checkpoint_metadata.get("train_updates")
+            != document.get("train_updates")
+            or checkpoint_metadata.get("trained_samples")
+            != document.get("trained_samples")
         ):
-            raise RuntimeError("initial checkpoint identity is incompatible")
-        if not trainer.load_checkpoint(str(checkpoint_path)):
-            raise RuntimeError("initial checkpoint could not be loaded")
-        self.initial_checkpoint_identity = {
-            "initial_checkpoint": str(checkpoint_path),
-            "initial_checkpoint_digest": sha256_file(checkpoint_path),
-            "initial_model_version": int(checkpoint["model_version"]),
+            raise RuntimeError("initial model publication is incompatible")
+        if not trainer.load_model_weights(str(checkpoint_path)):
+            raise RuntimeError("initial model weights could not be loaded")
+        self.initial_model_provenance = {
+            "initial_model_directory": str(directory),
+            "initial_model_checkpoint_digest": sha256_file(checkpoint_path),
+            "initial_model_lineage_id": str(identity["model_lineage_id"]),
+            "initial_model_version": int(version),
+            "initial_model_artifact_digest": str(identity["artifact_digest"]),
+            "initial_model_manifest_digest": str(identity["manifest_digest"]),
+            "initial_training_config_digest": str(
+                document["training_config_digest"]
+            ),
         }
+        return dict(self.initial_model_provenance)
+
+    def restore_stopped_run(self, trainer: PPOTrainer) -> dict:
+        if (
+            not self._prepared
+            or self._resume_state is None
+            or not self._resume_manifests
+        ):
+            raise RuntimeError("same-run resume storage was not prepared")
+        latest = self._resume_manifests[-1]
+        version = int(latest["identity"]["model_version"])
+        if not trainer.load_checkpoint(str(self.checkpoint_path(version))):
+            raise RuntimeError("same-run checkpoint could not be loaded")
+        if trainer.model_version != version:
+            raise RuntimeError("same-run checkpoint restored the wrong version")
         return {
-            "train_updates": int(metadata["train_updates"]),
-            "trained_samples": int(metadata["trained_samples"]),
-            **self.initial_checkpoint_identity,
+            "train_updates": int(self._resume_state["train_updates"]),
+            "trained_samples": int(self._resume_state["trained_samples"]),
+            "manifests": copy.deepcopy(self._resume_manifests),
+            **self.initial_model_provenance,
         }
 
     def _checkpoint_metadata(
@@ -346,8 +690,10 @@ class ModelPublisher:
                 self.semantics.observation_schema
             ),
             "action_schema": schema_document(self.semantics.action_schema),
+            "model_architecture_id": self.semantics.model_architecture_id,
+            "tensor_dtype": self.tensor_dtype,
             "training_config_digest": self.training_digest.hex,
-            **self.initial_checkpoint_identity,
+            **self.initial_model_provenance,
         }
 
     def commit_optimizer_checkpoint(
@@ -364,7 +710,7 @@ class ModelPublisher:
     ) -> Path:
         if not self._prepared:
             raise RuntimeError("model publisher is not prepared")
-        path = self.checkpoint_path(trainer.model_version)
+        path = self.staged_checkpoint_path(trainer.model_version)
         metadata = self._checkpoint_metadata(
             train_update_id=train_update_id,
             behavior_model=behavior_model,
@@ -383,12 +729,19 @@ class ModelPublisher:
             ):
                 raise RuntimeError(f"checkpoint identity conflicts: {path}")
             return path
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        trainer.save_checkpoint(str(temporary), metadata=metadata)
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        return path
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}-{time.time_ns()}.tmp"
+        )
+        try:
+            trainer.save_checkpoint(str(temporary), metadata=metadata)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            self._fsync_directory(self.checkpoint_dir)
+            return path
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def publish_runtime(
         self,
@@ -406,176 +759,319 @@ class ModelPublisher:
         if not self._prepared:
             raise RuntimeError("model publisher is not prepared")
         version = trainer.model_version
-        model_path = self.model_path(version)
-        checkpoint_path = self.checkpoint_path(version)
-        manifest_path = self.manifest_path(version)
-        if manifest_path.exists() or model_path.exists():
-            raise RuntimeError(f"runtime model version already exists: {version}")
-        temporary_model = model_path.with_name(
-            f".{model_path.name}.{os.getpid()}.tmp"
-        )
-        temporary_checkpoint = checkpoint_path.with_name(
-            f".{checkpoint_path.name}.{os.getpid()}.tmp"
-        )
-        trainer.export_onnx(str(temporary_model))
-        metadata = self._checkpoint_metadata(
-            train_update_id=train_update_id,
-            behavior_model=behavior_model,
-            batch_ids=batch_ids,
-            stats=stats or {},
-            sample_count=sample_count,
-            train_updates=train_updates,
-            trained_samples=trained_samples,
-        )
-        if checkpoint_precommitted:
-            checkpoint = self._load_checkpoint(checkpoint_path)
-            if (
-                checkpoint.get("model_version") != version
-                or checkpoint.get("metadata", {}).get("train_update_id")
-                != train_update_id
-            ):
-                raise RuntimeError("precommitted checkpoint identity mismatch")
-        else:
-            trainer.save_checkpoint(str(temporary_checkpoint), metadata=metadata)
-        for path in (
-            [temporary_model]
-            if checkpoint_precommitted
-            else [temporary_model, temporary_checkpoint]
-        ):
-            with path.open("rb") as stream:
-                os.fsync(stream.fileno())
-        if not checkpoint_precommitted:
-            os.replace(temporary_checkpoint, checkpoint_path)
-        os.replace(temporary_model, model_path)
-        artifact_digest = sha256_file(model_path)
-        document = {
-            "manifest_schema_version": 1,
-            "contract": contract_document(self.contract),
-            "identity": {
-                "model_lineage_id": self.lineage_id,
-                "model_version": version,
-                "artifact_digest": artifact_digest,
-                "manifest_digest": "0" * 64,
-            },
-            "observation_schema": schema_document(
-                self.semantics.observation_schema
-            ),
-            "action_schema": schema_document(self.semantics.action_schema),
-            "model_architecture_id": self.semantics.model_architecture_id,
-            "tensor_dtype": self.tensor_dtype,
-            "input_shape": [1, self.obs_dim],
-            "action_shape": [1, self.action_dim],
-            "value_shape": [1, 1],
-            "artifact_uri": model_path.as_uri(),
-            "model_file": model_path.name,
-            "size_bytes": model_path.stat().st_size,
-            "seed": self.seed,
-            "train_updates": int(train_updates),
-            "trained_samples": int(trained_samples),
-            "training_config_digest": self.training_digest.hex,
-            "training_semantics": semantics_document(self.semantics),
-            "published_at_unix_ms": int(time.time() * 1000),
-            "ready": True,
-        }
-        document = finalize_manifest_digest(document)
-        runtime_document = {
-            **document,
-            "checkpoint_file": checkpoint_path.name,
-            "train_update_id": train_update_id,
-            "behavior_model": behavior_model or {},
-            "batch_ids": list(batch_ids),
-            **self.initial_checkpoint_identity,
-        }
-        atomic_write_json(manifest_path, runtime_document)
-        atomic_write_json(
-            self.state_path,
-            {
-                "schema_version": 1,
-                "latest_model": runtime_document["identity"],
-                "latest_manifest": str(manifest_path),
-                "latest_checkpoint": str(checkpoint_path),
+        target = self.archive_path(version)
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f"model publication already exists: {target}")
+        temporary = self._temporary_publication_path(version)
+        temporary.mkdir(parents=False, exist_ok=False)
+        temporary_model = temporary / self.MODEL_FILE
+        temporary_checkpoint = temporary / self.CHECKPOINT_FILE
+        temporary_manifest = temporary / self.MANIFEST_FILE
+        temporary_metadata = temporary / self.METADATA_FILE
+        staged_checkpoint = self.staged_checkpoint_path(version)
+        published = False
+        try:
+            trainer.export_onnx(str(temporary_model))
+            metadata = self._checkpoint_metadata(
+                train_update_id=train_update_id,
+                behavior_model=behavior_model,
+                batch_ids=batch_ids,
+                stats=stats or {},
+                sample_count=sample_count,
+                train_updates=train_updates,
+                trained_samples=trained_samples,
+            )
+            if checkpoint_precommitted:
+                if staged_checkpoint.is_symlink() or not staged_checkpoint.is_file():
+                    raise RuntimeError(
+                        f"precommitted checkpoint is unavailable: {staged_checkpoint}"
+                    )
+                checkpoint = self._load_checkpoint(staged_checkpoint)
+                if (
+                    checkpoint.get("model_version") != version
+                    or checkpoint.get("metadata") != metadata
+                ):
+                    raise RuntimeError(
+                        "precommitted checkpoint identity mismatch"
+                    )
+                shutil.copyfile(staged_checkpoint, temporary_checkpoint)
+            else:
+                trainer.save_checkpoint(
+                    str(temporary_checkpoint), metadata=metadata
+                )
+            for path in (temporary_model, temporary_checkpoint):
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            artifact_digest = sha256_file(temporary_model)
+            final_model_path = self.model_path(version)
+            document = {
+                "manifest_schema_version": 1,
+                "contract": contract_document(self.contract),
+                "identity": {
+                    "model_lineage_id": self.lineage_id,
+                    "model_version": version,
+                    "artifact_digest": artifact_digest,
+                    "manifest_digest": "0" * 64,
+                },
+                "observation_schema": schema_document(
+                    self.semantics.observation_schema
+                ),
+                "action_schema": schema_document(
+                    self.semantics.action_schema
+                ),
+                "model_architecture_id": self.semantics.model_architecture_id,
+                "tensor_dtype": self.tensor_dtype,
+                "input_shape": [1, self.obs_dim],
+                "action_shape": [1, self.action_dim],
+                "value_shape": [1, 1],
+                "artifact_uri": final_model_path.as_uri(),
+                "model_file": self.MODEL_FILE,
+                "size_bytes": temporary_model.stat().st_size,
+                "seed": self.seed,
                 "train_updates": int(train_updates),
                 "trained_samples": int(trained_samples),
-                "updated_at_unix_ms": int(time.time() * 1000),
-                **self.initial_checkpoint_identity,
-            },
-        )
-        return runtime_document
+                "training_config_digest": self.training_digest.hex,
+                "training_semantics": semantics_document(self.semantics),
+                "published_at_unix_ms": int(time.time() * 1000),
+                "ready": True,
+            }
+            document = finalize_manifest_digest(document)
+            local_metadata = {
+                "schema_version": 1,
+                "model_identity": document["identity"],
+                "train_update_id": train_update_id,
+                "behavior_model": behavior_model or {},
+                "batch_ids": list(batch_ids),
+                "stats": dict(stats or {}),
+                "sample_count": int(sample_count),
+                "train_updates": int(train_updates),
+                "trained_samples": int(trained_samples),
+                "checkpoint_file": self.CHECKPOINT_FILE,
+                "checkpoint_metadata": metadata,
+                **self.initial_model_provenance,
+                "retention": {
+                    "class": "rolling",
+                    "reason": "",
+                    "marked_at_unix_ms": 0,
+                },
+            }
+            runtime_document = {
+                **document,
+                "checkpoint_file": self.CHECKPOINT_FILE,
+                "train_update_id": train_update_id,
+                "behavior_model": behavior_model or {},
+                "batch_ids": list(batch_ids),
+                "retention": local_metadata["retention"],
+                **self.initial_model_provenance,
+            }
+            atomic_write_json(temporary_manifest, document)
+            atomic_write_json(temporary_metadata, local_metadata)
+            for path in (
+                temporary_model,
+                temporary_checkpoint,
+                temporary_manifest,
+                temporary_metadata,
+            ):
+                if path.is_symlink() or not path.is_file():
+                    raise RuntimeError(
+                        f"publication file is not a regular file: {path}"
+                    )
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            self._fsync_directory(temporary)
+            os.replace(temporary, target)
+            published = True
+            self._fsync_directory(self.archive_dir)
+            atomic_write_json(
+                self.state_path,
+                {
+                    "schema_version": 1,
+                    "latest_model": runtime_document["identity"],
+                    "latest_manifest": str(self.manifest_path(version)),
+                    "latest_checkpoint": str(self.checkpoint_path(version)),
+                    "train_updates": int(train_updates),
+                    "trained_samples": int(trained_samples),
+                    "updated_at_unix_ms": int(time.time() * 1000),
+                    **self.initial_model_provenance,
+                },
+            )
+            if checkpoint_precommitted:
+                staged_checkpoint.unlink()
+                self._fsync_directory(self.checkpoint_dir)
+            return runtime_document
+        except Exception:
+            if published:
+                self.remove_publication_for_rollback(version)
+            elif temporary.exists():
+                if self._private_archive_directory_version(temporary) is None:
+                    raise RuntimeError(
+                        f"refusing to remove unverified temporary path: {temporary}"
+                    )
+                shutil.rmtree(temporary)
+                self._fsync_directory(self.archive_dir)
+            raise
 
     def complete_manifest(
         self, version: int, train_update_id: str | None = None
     ) -> dict | None:
+        publication = self.archive_path(version)
         path = self.manifest_path(version)
         model_path = self.model_path(version)
         checkpoint_path = self.checkpoint_path(version)
-        if not (path.is_file() and model_path.is_file() and checkpoint_path.is_file()):
+        metadata_path = self.metadata_path(version)
+        if (
+            not self._is_canonical_publication_path(publication, version)
+            or not publication.is_dir()
+        ):
+            return None
+        try:
+            entries = {entry.name: entry for entry in publication.iterdir()}
+        except OSError:
+            return None
+        required = {
+            self.MODEL_FILE,
+            self.CHECKPOINT_FILE,
+            self.MANIFEST_FILE,
+            self.METADATA_FILE,
+        }
+        if set(entries) != required or any(
+            entry.is_symlink() or not entry.is_file()
+            for entry in entries.values()
+        ):
             return None
         try:
             document = read_json(path)
+            local_metadata = read_json(metadata_path)
             checkpoint = self._load_checkpoint(checkpoint_path)
-            canonical = {
-                key: document[key]
-                for key in (
-                    "manifest_schema_version",
-                    "contract",
-                    "identity",
-                    "observation_schema",
-                    "action_schema",
-                    "model_architecture_id",
-                    "tensor_dtype",
-                    "input_shape",
-                    "action_shape",
-                    "value_shape",
-                    "artifact_uri",
-                    "model_file",
-                    "size_bytes",
-                    "seed",
-                    "train_updates",
-                    "trained_samples",
-                    "training_config_digest",
-                    "training_semantics",
-                    "published_at_unix_ms",
-                    "ready",
-                )
-            }
-            expected = finalize_manifest_digest(canonical)
-        except (OSError, ValueError, KeyError, RuntimeError):
+            if set(document) != self.WIRE_MANIFEST_KEYS:
+                return None
+            expected = finalize_manifest_digest(document)
+            artifact_digest = sha256_file(model_path)
+            model_size = model_path.stat().st_size
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError):
             return None
         metadata = checkpoint.get("metadata", {})
+        if not isinstance(local_metadata, dict):
+            return None
+        retention = local_metadata.get("retention", {})
+        if not isinstance(retention, dict):
+            return None
         if (
             document.get("contract") != contract_document(self.contract)
+            or document.get("identity", {}).get("model_lineage_id")
+            != self.lineage_id
             or document.get("identity", {}).get("model_version") != version
             or document.get("identity", {}).get("artifact_digest")
-            != sha256_file(model_path)
+            != artifact_digest
             or document.get("identity", {}).get("manifest_digest")
             != expected["identity"]["manifest_digest"]
-            or document.get("model_file") != model_path.name
-            or document.get("size_bytes") != model_path.stat().st_size
+            or document.get("artifact_uri") != model_path.as_uri()
+            or document.get("model_file") != self.MODEL_FILE
+            or document.get("size_bytes") != model_size
             or document.get("training_semantics")
             != semantics_document(self.semantics)
+            or document.get("observation_schema")
+            != schema_document(self.semantics.observation_schema)
+            or document.get("action_schema")
+            != schema_document(self.semantics.action_schema)
+            or document.get("model_architecture_id")
+            != self.semantics.model_architecture_id
+            or document.get("tensor_dtype") != self.tensor_dtype
+            or document.get("input_shape") != [1, self.obs_dim]
+            or document.get("action_shape") != [1, self.action_dim]
+            or document.get("value_shape") != [1, 1]
+            or document.get("seed") != self.seed
+            or document.get("training_config_digest")
+            != self.training_digest.hex
             or not document.get("ready")
             or checkpoint.get("model_version") != version
             or metadata.get("train_update_id")
-            != document.get("train_update_id")
+            != local_metadata.get("train_update_id")
+            or metadata != local_metadata.get("checkpoint_metadata")
+            or local_metadata.get("schema_version") != 1
+            or local_metadata.get("model_identity") != document.get("identity")
+            or local_metadata.get("checkpoint_file") != self.CHECKPOINT_FILE
+            or local_metadata.get("train_updates")
+            != document.get("train_updates")
+            or local_metadata.get("trained_samples")
+            != document.get("trained_samples")
+            or local_metadata.get("behavior_model")
+            != metadata.get("behavior_model")
+            or local_metadata.get("batch_ids") != metadata.get("batch_ids")
+            or local_metadata.get("stats") != metadata.get("stats")
+            or local_metadata.get("sample_count")
+            != metadata.get("sample_count")
+            or local_metadata.get("train_updates")
+            != metadata.get("train_updates")
+            or local_metadata.get("trained_samples")
+            != metadata.get("trained_samples")
+            or metadata.get("model_lineage_id") != self.lineage_id
+            or metadata.get("observation_schema")
+            != schema_document(self.semantics.observation_schema)
+            or metadata.get("action_schema")
+            != schema_document(self.semantics.action_schema)
+            or metadata.get("model_architecture_id")
+            != self.semantics.model_architecture_id
+            or metadata.get("tensor_dtype") != self.tensor_dtype
+            or metadata.get("training_config_digest")
+            != self.training_digest.hex
+            or any(
+                local_metadata.get(key) != metadata.get(key)
+                for key in self.PROVENANCE_KEYS
+            )
+            or retention.get("class") not in ("rolling", "permanent")
+            or (
+                retention.get("class") == "permanent"
+                and retention.get("reason") != "interval"
+            )
+            or (
+                retention.get("class") == "rolling"
+                and (
+                    retention.get("reason") not in (None, "")
+                    or retention.get("marked_at_unix_ms", 0) != 0
+                )
+            )
             or (
                 train_update_id is not None
-                and document.get("train_update_id") != train_update_id
+                and local_metadata.get("train_update_id") != train_update_id
             )
         ):
             return None
-        return document
+        return {
+            **document,
+            "checkpoint_file": self.CHECKPOINT_FILE,
+            "train_update_id": local_metadata["train_update_id"],
+            "behavior_model": local_metadata.get("behavior_model", {}),
+            "batch_ids": local_metadata.get("batch_ids", []),
+            "retention": retention,
+            **{
+                key: local_metadata[key]
+                for key in self.PROVENANCE_KEYS
+                if key in local_metadata
+            },
+        }
 
     def complete_manifests(self) -> list[dict]:
         result: list[dict] = []
-        for path in sorted(self.published_dir.glob("manifest_v*.json")):
-            try:
-                version = int(path.stem.removeprefix("manifest_v"))
-            except ValueError:
-                continue
+        for version, _path in self._canonical_version_directories():
             document = self.complete_manifest(version)
             if document:
                 result.append(document)
         return result
+
+    def _canonical_version_directories(self) -> list[tuple[int, Path]]:
+        candidates: list[tuple[int, Path]] = []
+        for path in self.archive_dir.iterdir():
+            if not path.is_dir() or path.is_symlink() or not path.name.isdigit():
+                continue
+            try:
+                version = int(path.name)
+                if path.name != self.version_name(version):
+                    continue
+            except ValueError:
+                continue
+            candidates.append((version, path))
+        return sorted(candidates, key=lambda item: item[0])
 
     def latest_complete_checkpoint(self) -> Path | None:
         manifests = self.complete_manifests()
@@ -584,71 +1080,126 @@ class ModelPublisher:
         version = int(manifests[-1]["identity"]["model_version"])
         return self.checkpoint_path(version)
 
-    def should_archive(self, run_train_updates: int) -> bool:
+    def should_mark_permanent(self, run_train_updates: int) -> bool:
         return (
             run_train_updates > 0
             and run_train_updates % self.archive_interval_updates == 0
         )
 
-    def archive_version(self, version: int, reason: str) -> dict:
+    def mark_permanent(self, version: int, reason: str = "interval") -> dict:
+        if reason != "interval":
+            raise ValueError("only fixed interval publications are permanent")
         manifest = self.complete_manifest(version)
         if manifest is None:
-            raise RuntimeError(f"cannot archive incomplete model v{version}")
-        target = self.archive_path(version)
-        artifact_digest = manifest["identity"]["artifact_digest"]
-        if target.exists():
-            existing = read_json(self.archive_manifest_path(version))
-            if (
-                existing.get("runtime_manifest_identity")
-                != manifest["identity"]
-                or sha256_file(target / self.ARCHIVE_MODEL_FILE)
-                != artifact_digest
-            ):
-                raise RuntimeError(f"archive identity conflicts: {target}")
-            return existing
-        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        temporary.mkdir(parents=False, exist_ok=False)
-        try:
-            shutil.copyfile(
-                self.model_path(version), temporary / self.ARCHIVE_MODEL_FILE
-            )
-            shutil.copyfile(
-                self.checkpoint_path(version),
-                temporary / self.ARCHIVE_CHECKPOINT_FILE,
-            )
-            archive_manifest = {
-                "schema_version": 1,
-                "runtime_manifest_identity": manifest["identity"],
-                "runtime_manifest_digest": manifest["identity"][
-                    "manifest_digest"
-                ],
-                "model_file": self.ARCHIVE_MODEL_FILE,
-                "checkpoint_file": self.ARCHIVE_CHECKPOINT_FILE,
-                "artifact_digest": artifact_digest,
-                "archive_reason": reason,
-                "archived_at_unix_ms": int(time.time() * 1000),
-            }
-            atomic_write_json(
-                temporary / self.ARCHIVE_MANIFEST_FILE, archive_manifest
-            )
-            os.replace(temporary, target)
-            return archive_manifest
-        except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
+            raise RuntimeError(f"cannot mark incomplete model v{version}")
+        path = self.metadata_path(version)
+        local_metadata = read_json(path)
+        retention = local_metadata.get("retention", {})
+        if retention.get("class") == "permanent":
+            if retention.get("reason") != reason:
+                raise RuntimeError(
+                    f"permanent retention reason conflicts: {path}"
+                )
+            return manifest
+        if retention.get("class") != "rolling":
+            raise RuntimeError(f"invalid retention metadata: {path}")
+        local_metadata["retention"] = {
+            "class": "permanent",
+            "reason": reason,
+            "marked_at_unix_ms": int(time.time() * 1000),
+        }
+        atomic_write_json(path, local_metadata)
+        self._fsync_directory(self.archive_path(version))
+        updated = self.complete_manifest(version)
+        if updated is None:
+            raise RuntimeError(f"permanent publication failed validation: {path}")
+        return updated
 
-    def prune_runtime(self, current_version: int) -> None:
-        minimum = current_version - self.serving_retention_versions + 1
-        for manifest in self.complete_manifests():
-            version = int(manifest["identity"]["model_version"])
-            if version >= minimum:
+    def remove_publication_for_rollback(self, version: int) -> None:
+        target = self.archive_path(version)
+        if not target.exists():
+            return
+        manifest = self.complete_manifest(version)
+        if (
+            manifest is None
+            or manifest.get("retention", {}).get("class") != "rolling"
+            or not self._is_canonical_publication_path(target, version)
+        ):
+            raise RuntimeError(
+                f"refusing to rollback unverified publication: {target}"
+            )
+        quarantine = self.archive_dir / (
+            f".rollback-delete-{self.version_name(version)}-"
+            f"{os.getpid()}-{time.time_ns()}"
+        )
+        os.replace(target, quarantine)
+        self._fsync_directory(self.archive_dir)
+        shutil.rmtree(quarantine)
+        self._fsync_directory(self.archive_dir)
+
+    def prune_publications(
+        self, current_version: int, protected_versions: Iterable[int] = ()
+    ) -> list[int]:
+        current = int(current_version)
+        self.version_name(current)
+        minimum = max(
+            0,
+            current - self.publication_retention_versions + 1,
+        )
+        protected = {int(version) for version in protected_versions}
+        protected.add(current)
+        removed: list[int] = []
+        for version, target in self._canonical_version_directories():
+            if version >= minimum or version in protected:
                 continue
-            for path in (
-                self.manifest_path(version),
-                self.model_path(version),
-                self.checkpoint_path(version),
+            try:
+                local_metadata = read_json(self.metadata_path(version))
+            except (OSError, ValueError, TypeError) as error:
+                raise RuntimeError(
+                    f"cannot read retention metadata before pruning: {target}"
+                ) from error
+            if not isinstance(local_metadata, dict):
+                raise RuntimeError(
+                    f"invalid retention metadata before pruning: {target}"
+                )
+            retention = local_metadata.get("retention")
+            if not isinstance(retention, dict):
+                raise RuntimeError(
+                    f"invalid retention metadata before pruning: {target}"
+                )
+            if retention.get("class") == "permanent":
+                if retention.get("reason") != "interval":
+                    raise RuntimeError(
+                        f"invalid permanent retention metadata: {target}"
+                    )
+                continue
+            if retention.get("class") != "rolling":
+                raise RuntimeError(
+                    f"invalid rolling retention metadata: {target}"
+                )
+            verified = self.complete_manifest(version)
+            if (
+                verified is None
+                or verified.get("retention", {}).get("class") != "rolling"
+                or not self._is_canonical_publication_path(target, version)
             ):
-                path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"refusing to prune unverified publication: {target}"
+                )
+            quarantine = self.archive_dir / (
+                f".prune-{self.version_name(version)}-"
+                f"{os.getpid()}-{time.time_ns()}"
+            )
+            os.replace(target, quarantine)
+            self._fsync_directory(self.archive_dir)
+            if self._private_archive_directory_version(quarantine) != version:
+                raise RuntimeError(
+                    f"prune quarantine identity mismatch: {quarantine}"
+                )
+            shutil.rmtree(quarantine)
+            self._fsync_directory(self.archive_dir)
+            removed.append(version)
+        return removed
 
 
 class LeaseRenewer:
@@ -729,7 +1280,7 @@ class TrainingRuntime:
     DEMAND_RELEASE_RETRY_TIMEOUT_SEC = 5.0
     SHUTDOWN_RECONCILE_MARGIN_SEC = 5.0
 
-    def __init__(self, config: dict, initial_checkpoint: str = ""):
+    def __init__(self, config: dict, initial_model_dir: str = ""):
         validate_config(config)
         self.config = config
         self.logger = setup_logger("TrainingRuntime")
@@ -740,10 +1291,10 @@ class TrainingRuntime:
         self.publisher = ModelPublisher(config)
         if (
             self.trainer.max_policy_lag + 1
-            > self.publisher.serving_retention_versions
+            > self.publisher.publication_retention_versions
         ):
             raise ValueError(
-                "max_policy_lag requires more retained serving versions"
+                "max_policy_lag requires more retained model publications"
             )
 
         learner_name = os.environ.get("RL_LEARNER_INSTANCE", "learner-0")
@@ -757,7 +1308,6 @@ class TrainingRuntime:
         self.initial_model_version = 0
         self.last_stats: dict = {}
         self.model_manifests: dict[int, dict] = {}
-        self._last_archive_version: int | None = None
         self._metrics_context = {
             "behavior_model": {},
             "actual_batch_size": 0,
@@ -785,27 +1335,42 @@ class TrainingRuntime:
         self._last_resource_time = time.monotonic()
         self._last_process_cpu = time.process_time()
 
-        self.publisher.prepare()
-        configured_checkpoint = str(config["model"]["initial_checkpoint"] or "")
-        checkpoint = (
-            initial_checkpoint
-            or os.environ.get("RL_INITIAL_CHECKPOINT", "")
-            or configured_checkpoint
+        storage_mode = self.publisher.prepare()
+        configured_model_dir = str(
+            config["model"]["initial_model_dir"] or ""
         )
-        self._startup_mode = "fresh"
-        if checkpoint:
-            self._startup_mode = "initial-checkpoint"
-            restored = self.publisher.load_initial_checkpoint(
-                self.trainer, checkpoint
-            )
+        model_directory = (
+            initial_model_dir
+            or os.environ.get("RL_INITIAL_MODEL_DIR", "")
+            or configured_model_dir
+        )
+        if storage_mode == "resume":
+            if model_directory:
+                raise RuntimeError(
+                    "same-run resume cannot also inherit an initial model"
+                )
+            self._startup_mode = "same-run-resume"
+            restored = self.publisher.restore_stopped_run(self.trainer)
             self.train_updates = int(restored["train_updates"])
             self.trained_samples = int(restored["trained_samples"])
-            source_version = int(restored["initial_model_version"])
-            self.trainer.reserve_initial_checkpoint_publication_version(
-                source_version
+            minimum_version = max(
+                0, self.trainer.model_version - self.trainer.max_policy_lag
             )
-        self._run_start_train_updates = self.train_updates
-        self._run_start_trained_samples = self.trained_samples
+            self.model_manifests = {
+                int(document["identity"]["model_version"]): document
+                for document in restored["manifests"]
+                if int(document["identity"]["model_version"])
+                >= minimum_version
+            }
+        elif model_directory:
+            self._startup_mode = "inherited-weights"
+            self.publisher.load_initial_model_directory(
+                self.trainer, model_directory
+            )
+        else:
+            self._startup_mode = "fresh"
+        self._run_start_train_updates = 0
+        self._run_start_trained_samples = 0
 
         sample = config["sample_distributor"]
         sample_host = os.environ.get(
@@ -889,11 +1454,20 @@ class TrainingRuntime:
         self.actor_stub = training_pb2_grpc.AIServerTrainingStatusServiceStub(
             self.actor_channel
         )
+        self.metric_event_stub = training_pb2_grpc.MetricEventServiceStub(
+            self.actor_channel
+        )
 
         dashboard = config["dashboard"]
         self.metrics_backend = self._create_metrics_backend(
             str(dashboard["backend"]), str(self.publisher.metrics_dir)
         )
+        self.metric_event_store: RawMetricBatchStore | None = None
+        self.metric_event_writer: LocalTrainUpdateMetricWriter | None = None
+        self.metric_event_relay: AIServerMetricRelay | None = None
+        self.metric_event_projector: LocalMetricProjector | None = None
+        self._metric_event_disabled_reason = ""
+        self._initialize_metric_events()
 
     def _create_metrics_backend(self, backend_type: str, metrics_dir: str):
         try:
@@ -905,6 +1479,120 @@ class TrainingRuntime:
                 error,
             )
             return DisabledMetricsBackend(str(error))
+
+    def _initialize_metric_events(self) -> None:
+        store: RawMetricBatchStore | None = None
+        try:
+            catalog = MetricSchemaCatalog.load(
+                default_metric_schema_directory()
+            )
+            store = RawMetricBatchStore(
+                self.publisher.metrics_dir / "metric-events.sqlite3",
+                self.contract,
+                catalog,
+            )
+            writer = LocalTrainUpdateMetricWriter(
+                store,
+                self.learner_service,
+                initial_train_update_sequence=self.train_updates,
+            )
+            relay = AIServerMetricRelay(
+                store=store,
+                contract=self.contract,
+                consumer=self.learner_service,
+                status_stub=self.actor_stub,
+                event_stub=self.metric_event_stub,
+                logger=self.logger,
+            )
+            projector = LocalMetricProjector(store)
+        except (OSError, MetricEventContractError, RuntimeError) as error:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            self._metric_event_disabled_reason = str(error)
+            self.logger.error(
+                "immutable metric-event persistence unavailable; PPO training "
+                "continues with this source marked unavailable: %s",
+                error,
+            )
+            return
+        self.metric_event_store = store
+        self.metric_event_writer = writer
+        self.metric_event_relay = relay
+        self.metric_event_projector = projector
+
+    def _start_metric_events(self) -> None:
+        relay = getattr(self, "metric_event_relay", None)
+        if relay is None:
+            return
+        try:
+            relay.start()
+        except Exception as error:
+            self._metric_event_disabled_reason = str(error)
+            self.logger.error("metric-event relay start failed: %s", error)
+
+    def _stop_metric_events(self) -> None:
+        writer = getattr(self, "metric_event_writer", None)
+        store = getattr(self, "metric_event_store", None)
+        relay = getattr(self, "metric_event_relay", None)
+        if writer is not None:
+            try:
+                writer.finalize()
+            except Exception as error:
+                self.logger.error(
+                    "Learner metric-event finalization failed: %s", error
+                )
+                if store is not None:
+                    try:
+                        store.mark_incomplete(
+                            self.learner_service,
+                            "learner_source_finalization_failed",
+                        )
+                    except Exception:
+                        pass
+        if relay is not None:
+            relay.close()
+        if store is not None:
+            try:
+                store.close()
+            except Exception as error:
+                self.logger.error("metric-event store close failed: %s", error)
+
+    def _metric_event_snapshot(self) -> dict:
+        store = getattr(self, "metric_event_store", None)
+        if store is None:
+            return {
+                "enabled": False,
+                "incomplete": True,
+                "reason": getattr(
+                    self, "_metric_event_disabled_reason", "uninitialized"
+                ),
+            }
+        try:
+            return store.snapshot()
+        except Exception as error:
+            return {
+                "enabled": False,
+                "incomplete": True,
+                "reason": str(error),
+            }
+
+    def _metric_event_view_snapshot(self) -> dict:
+        projector = getattr(self, "metric_event_projector", None)
+        if projector is None:
+            return {
+                "status": "unavailable",
+                "reason": getattr(
+                    self, "_metric_event_disabled_reason", "uninitialized"
+                ),
+            }
+        try:
+            return projector.snapshot()
+        except Exception as error:
+            self.logger.error("metric-event projection failed: %s", error)
+            return {"status": "incomplete", "reason": str(error)}
 
     @staticmethod
     def _manifest_for_wire(document: dict) -> dict:
@@ -1017,12 +1705,78 @@ class TrainingRuntime:
                 "model distributor authority could not be pinned: "
                 "distributor is not ready for the exact contract"
             )
+        self._validate_model_status_available_range(status)
         try:
             return self._model_distributor_authority(status.distributor)
         except (AttributeError, RuntimeError) as error:
             raise RuntimeError(
                 f"model distributor authority could not be pinned: {error}"
             ) from error
+
+    @staticmethod
+    def _has_field(message, name: str) -> bool:
+        try:
+            return bool(message.HasField(name))
+        except (AttributeError, ValueError):
+            return False
+
+    @classmethod
+    def _validate_model_manifest_available_range(
+        cls,
+        response,
+        manifest_version: int,
+        *,
+        latest_selector: bool,
+    ) -> tuple[int, int]:
+        if not cls._has_field(
+            response, "available_floor_model_version"
+        ) or not cls._has_field(response, "latest_available_model_version"):
+            raise RuntimeError(
+                "model manifest response is missing the 0.11 available range"
+            )
+        floor = int(response.available_floor_model_version)
+        latest = int(response.latest_available_model_version)
+        if (
+            floor < 0
+            or floor > latest
+            or not floor <= int(manifest_version) <= latest
+            or (latest_selector and int(manifest_version) != latest)
+        ):
+            raise RuntimeError(
+                "model manifest response has an incoherent available range"
+            )
+        return floor, latest
+
+    @classmethod
+    def _validate_model_status_available_range(cls, status) -> tuple[int, int] | None:
+        has_latest_model = cls._has_field(status, "latest_model")
+        has_floor = cls._has_field(
+            status, "available_floor_model_version"
+        )
+        has_latest = cls._has_field(
+            status, "latest_available_model_version"
+        )
+        if not has_latest_model:
+            if has_floor or has_latest:
+                raise RuntimeError(
+                    "model status exposes a range without a latest model"
+                )
+            return None
+        if not has_floor or not has_latest:
+            raise RuntimeError(
+                "model status is missing the 0.11 available range"
+            )
+        floor = int(status.available_floor_model_version)
+        latest = int(status.latest_available_model_version)
+        if (
+            floor < 0
+            or floor > latest
+            or latest != int(status.latest_model.model_version)
+        ):
+            raise RuntimeError(
+                "model status has an incoherent available range"
+            )
+        return floor, latest
 
     def _lookup_initial_model_manifest(
         self,
@@ -1087,6 +1841,11 @@ class TrainingRuntime:
             )
         manifest = response.manifest
         identity = manifest.identity
+        self._validate_model_manifest_available_range(
+            response,
+            int(identity.model_version),
+            latest_selector=latest,
+        )
         if (
             not manifest.ready
             or not _same_message(manifest.contract, self.contract)
@@ -1162,24 +1921,6 @@ class TrainingRuntime:
                     "registered manifest"
                 )
             return False, latest_authority
-
-        if self._startup_mode == "initial-checkpoint" and latest is not None:
-            source_version = int(
-                self.publisher.initial_checkpoint_identity[
-                    "initial_model_version"
-                ]
-            )
-            if latest_version == source_version and (
-                latest.identity.artifact_digest.hex
-                != expected.identity.artifact_digest.hex
-                or int(latest.train_updates) != int(expected.train_updates)
-                or int(latest.trained_samples)
-                != int(expected.trained_samples)
-            ):
-                raise RuntimeError(
-                    "checkpoint source conflicts with the surviving "
-                    "registered publication"
-                )
 
         target, target_authority = self._lookup_initial_model_manifest(
             pinned_authority=pinned_authority,
@@ -1273,6 +2014,16 @@ class TrainingRuntime:
             raise _UpdateCommitOutcomeUncertain(
                 "model distributor returned a conflicting exact identity"
             )
+        try:
+            self._validate_model_manifest_available_range(
+                response,
+                int(response.manifest.identity.model_version),
+                latest_selector=False,
+            )
+        except RuntimeError as error:
+            raise _UpdateCommitOutcomeUncertain(
+                "exact model lookup returned an incoherent available range"
+            ) from error
         return True, response_authority
 
     def _register_idempotently(
@@ -1368,23 +2119,32 @@ class TrainingRuntime:
 
     def _initialize_models(self) -> None:
         version = self.trainer.model_version
+        self.initial_model_version = 0
         update_id = (
-            f"initial-checkpoint-republish-v{version}"
-            if self._startup_mode == "initial-checkpoint"
+            "inherited-bootstrap-v0"
+            if self._startup_mode == "inherited-weights"
             else "bootstrap-v0"
         )
         pinned_authority = self._pin_model_distributor_authority()
         pinned_authority = self._assert_initial_latest_not_newer(
             version, pinned_authority
         )
-        document = self.publisher.publish_runtime(
-            self.trainer,
-            train_update_id=update_id,
-            behavior_model=None,
-            batch_ids=[],
-            train_updates=self.train_updates,
-            trained_samples=self.trained_samples,
-        )
+        if self._startup_mode == "same-run-resume":
+            document = self.publisher.complete_manifest(version)
+            if document is None:
+                raise RuntimeError(
+                    "same-run latest publication became unavailable"
+                )
+            update_id = str(document["train_update_id"])
+        else:
+            document = self.publisher.publish_runtime(
+                self.trainer,
+                train_update_id=update_id,
+                behavior_model=None,
+                batch_ids=[],
+                train_updates=self.train_updates,
+                trained_samples=self.trained_samples,
+            )
         register_required, pinned_authority = (
             self._initial_model_requires_registration(
                 document, pinned_authority
@@ -1397,10 +2157,7 @@ class TrainingRuntime:
                 pinned_authority,
             )
         self.model_manifests[version] = document
-        self.initial_model_version = version
         self._wait_initial_model_loaded(document)
-        self.publisher.archive_version(version, self._startup_mode)
-        self._last_archive_version = version
         self._commit_learner_metrics(
             document,
             behavior_model={},
@@ -2458,15 +3215,14 @@ class TrainingRuntime:
             raise RuntimeError(
                 f"update rollback checkpoint already exists: {rollback_path}"
             )
-        candidate_paths = (
-            self.publisher.checkpoint_path(target_version),
-            self.publisher.model_path(target_version),
-            self.publisher.manifest_path(target_version),
+        publication_path = self.publisher.archive_path(target_version)
+        staged_checkpoint_path = self.publisher.staged_checkpoint_path(
+            target_version
         )
+        candidate_paths = (publication_path, staged_checkpoint_path)
         temporary_paths = tuple(
             path.with_name(f".{path.name}.{os.getpid()}.tmp")
             for path in (
-                *candidate_paths,
                 self.publisher.state_path,
                 self.publisher.receipt_path(update_id),
             )
@@ -2475,6 +3231,8 @@ class TrainingRuntime:
         context = {
             "base_version": base_version,
             "target_version": target_version,
+            "publication_path": publication_path,
+            "staged_checkpoint_path": staged_checkpoint_path,
             "rollback_path": rollback_path,
             "model_training": bool(self.trainer.model.training),
             "cuda_rng_state": (
@@ -2528,8 +3286,18 @@ class TrainingRuntime:
             raise RuntimeError("pre-update model version was not restored")
 
         for path, existed in context["tracked_paths"].items():
-            if not existed:
-                path.unlink(missing_ok=True)
+            if existed or not path.exists():
+                continue
+            if path == context["publication_path"]:
+                self.publisher.remove_publication_for_rollback(
+                    int(context["target_version"])
+                )
+            elif path.is_dir() or path.is_symlink():
+                raise RuntimeError(
+                    f"refusing to remove unexpected rollback path: {path}"
+                )
+            else:
+                path.unlink()
         if context["state_exists"]:
             atomic_write_json(
                 self.publisher.state_path,
@@ -2586,6 +3354,7 @@ class TrainingRuntime:
         transaction_complete = False
         manifest: dict | None = None
         stats: dict = {}
+        raw_metric_sum_counts: dict[str, dict[str, float | int]] = {}
         training_samples: list[dict] = []
         target_updates = self.train_updates
         target_samples = self.trained_samples
@@ -2598,6 +3367,11 @@ class TrainingRuntime:
                 ) from error
             training_samples = self._training_samples(response.batches)
             stats = self.trainer.train_on_batch(training_samples)
+            raw_metric_reader = getattr(
+                self.trainer, "raw_metric_sum_counts", None
+            )
+            if callable(raw_metric_reader):
+                raw_metric_sum_counts = raw_metric_reader()
             training_succeeded = True
             if renewer.error:
                 raise RuntimeError(f"sample lease lost: {renewer.error}")
@@ -2693,14 +3467,37 @@ class TrainingRuntime:
                     stats=stats,
                 )
                 transaction_complete = True
-            if self.publisher.should_archive(
-                target_updates - self._run_start_train_updates
+            self._record_train_update_fact_best_effort(
+                update_id=update_id,
+                delivery_id=response.delivery_id,
+                manifest=manifest,
+                behavior_identity=behavior_identity,
+                train_updates=target_updates,
+                trained_samples=target_samples,
+                actual_batch_size=len(training_samples),
+                raw_metric_sum_counts=raw_metric_sum_counts,
+            )
+            if self.publisher.should_mark_permanent(
+                target_updates
             ):
-                self.publisher.archive_version(
+                self.publisher.mark_permanent(
                     self.trainer.model_version, "interval"
                 )
-                self._last_archive_version = self.trainer.model_version
-            self.publisher.prune_runtime(self.trainer.model_version)
+            minimum_protected = max(
+                0,
+                int(self.trainer.model_version)
+                - int(self.trainer.max_policy_lag),
+            )
+            self.publisher.prune_publications(
+                self.trainer.model_version,
+                protected_versions=range(
+                    minimum_protected,
+                    int(self.trainer.model_version) + 1,
+                ),
+            )
+            for version in tuple(self.model_manifests):
+                if version < minimum_protected:
+                    self.model_manifests.pop(version, None)
         except Exception as error:
             failed_state = str(receipt.get("state", "LEASED"))
             if training_succeeded and not model_registered:
@@ -3118,6 +3915,9 @@ class TrainingRuntime:
             )
             if not _same_message(status.contract, self.contract):
                 raise RuntimeError("model distributor contract identity mismatch")
+            available_range = self._validate_model_status_available_range(
+                status
+            )
             return {
                 "ready": bool(status.ready),
                 "instance_id": status.distributor.instance_id,
@@ -3133,6 +3933,12 @@ class TrainingRuntime:
                     status.latest_ack_status
                 ),
                 "latest_ack_aiserver": status.latest_ack_aiserver.instance_id,
+                "available_floor_model_version": (
+                    None if available_range is None else available_range[0]
+                ),
+                "latest_available_model_version": (
+                    None if available_range is None else available_range[1]
+                ),
                 "last_error": status.last_error,
                 "timestamp": int(status.timestamp_unix_ms) / 1000.0,
             }
@@ -3221,6 +4027,80 @@ class TrainingRuntime:
                 "error": "",
             }
 
+    def _record_train_update_fact_best_effort(
+        self,
+        *,
+        update_id: str,
+        delivery_id: str,
+        manifest: dict | None,
+        behavior_identity: dict,
+        train_updates: int,
+        trained_samples: int,
+        actual_batch_size: int,
+        raw_metric_sum_counts: dict[str, dict[str, float | int]],
+    ) -> None:
+        writer = getattr(self, "metric_event_writer", None)
+        if writer is None or manifest is None:
+            return
+        try:
+            statistics = []
+            for field_id in sorted(raw_metric_sum_counts):
+                statistic = raw_metric_sum_counts[field_id]
+                raw_sum = float(statistic["sum"])
+                count = int(statistic["count"])
+                if count <= 0 or not math.isfinite(raw_sum):
+                    raise MetricEventContractError(
+                        f"PPO raw sum/count is invalid: {field_id}"
+                    )
+                statistics.append(
+                    training_pb2.RawMetricSumCount(
+                        field_id=field_id,
+                        sum=raw_sum,
+                        count=count,
+                    )
+                )
+            if not statistics:
+                raise MetricEventContractError(
+                    "committed train update has no raw PPO statistics"
+                )
+            writer.append(
+                training_pb2.TrainUpdateMetricFact(
+                    train_update_id=update_id,
+                    train_update_sequence=int(train_updates),
+                    published_model=manifest_message(manifest).identity,
+                    delivery_id=delivery_id,
+                    training_semantics=self.semantics,
+                    cumulative_trained_samples=int(trained_samples),
+                    actual_batch_size=int(actual_batch_size),
+                    behavior_model_version_min=int(
+                        behavior_identity["minimum_model_version"]
+                    ),
+                    behavior_model_version_max=int(
+                        behavior_identity["maximum_model_version"]
+                    ),
+                    ppo_statistics=statistics,
+                    behavior_model_lineage_id=str(
+                        behavior_identity["model_lineage_id"]
+                    ),
+                ),
+                committed_at_unix_ms=int(time.time() * 1000),
+            )
+        except Exception as error:
+            self.logger.error(
+                "committed TrainUpdate metric fact was not persisted; PPO "
+                "transaction remains committed: %s",
+                error,
+            )
+            store = getattr(self, "metric_event_store", None)
+            if store is not None:
+                try:
+                    store.mark_incomplete(
+                        self.learner_service,
+                        "train_update_fact_persistence_failed",
+                    )
+                except Exception:
+                    pass
+
     def _learner_metrics_snapshot(self) -> dict:
         with self._metrics_lock:
             context = copy.deepcopy(self._metrics_context)
@@ -3275,6 +4155,8 @@ class TrainingRuntime:
                 "chain": chain,
                 "rates": rates,
                 "resources": {"learner": self._resource_snapshot()},
+                "metric_events": self._metric_event_snapshot(),
+                "metric_event_views": self._metric_event_view_snapshot(),
             }
             self.metrics_backend.write(record)
             with self._metrics_lock:
@@ -3511,6 +4393,7 @@ class TrainingRuntime:
 
     def run(self) -> int:
         try:
+            self._start_metric_events()
             self._start_metrics()
             self._initialize_models()
             ready_authority = self._wait_for_sample_pool(
@@ -3556,13 +4439,6 @@ class TrainingRuntime:
             )
             self._release_demand(required=True)
             self._shutdown_drain(shutdown_authority)
-            if (
-                self.publisher.archive_on_graceful_shutdown
-                and self._last_archive_version != self.trainer.model_version
-            ):
-                self.publisher.archive_version(
-                    self.trainer.model_version, "graceful-shutdown"
-                )
             self._record_metrics_best_effort("graceful shutdown")
             return 0
         except Exception as error:
@@ -3575,6 +4451,7 @@ class TrainingRuntime:
         finally:
             self._release_demand(required=False)
             self._stop_metrics()
+            self._stop_metric_events()
             try:
                 self.metrics_backend.close()
             except Exception as error:
@@ -3589,12 +4466,12 @@ def main() -> int:
     parser.add_argument(
         "--config", default="configs/learner_config.yaml"
     )
-    parser.add_argument("--initial-checkpoint", default="")
+    parser.add_argument("--initial-model-dir", default="")
     arguments = parser.parse_args()
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     config = load_config(arguments.config)
-    runtime = TrainingRuntime(config, arguments.initial_checkpoint)
+    runtime = TrainingRuntime(config, arguments.initial_model_dir)
     return runtime.run()
 
 

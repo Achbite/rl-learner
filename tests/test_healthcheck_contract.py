@@ -43,6 +43,13 @@ class HealthcheckContractTest(unittest.TestCase):
             "Migrating stopped learner-dev from legacy fixed monitor port",
             script,
         )
+        self.assertIn("container_uses_contract_artifact", script)
+        self.assertIn("verify_contract_mount_permissions", script)
+        self.assertIn("verify_training_runtime_artifacts", script)
+        self.assertIn("scripts/verify_runtime_artifacts.py", script)
+        self.assertIn(
+            "Migrating learner-dev to contract artifact", script
+        )
 
 
 if __name__ == "__main__":

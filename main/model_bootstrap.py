@@ -1,4 +1,4 @@
-"""Export a deterministic untrained model with a 0.8 manifest."""
+"""Export a deterministic untrained model with the current wire manifest."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def export_initial_model(
     root = Path(output_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     trainer = PPOTrainer(config)
-    model_file = "model_v000000.onnx"
+    model_file = "SaveModel.onnx"
     model_path = root / model_file
     temporary = root / f".{model_file}.{os.getpid()}.tmp"
     trainer.export_onnx(str(temporary))

@@ -1,9 +1,7 @@
 import copy
 import tempfile
-import threading
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -13,13 +11,12 @@ import yaml
 from main.training_runtime import (
     ModelPublisher,
     TrainingRuntime,
+    atomic_write_json,
     read_json,
 )
 from proto import training_pb2
 from src.contracts.identity import (
     canonical_config_digest,
-    contract_identity,
-    finalize_manifest_digest,
     manifest_message,
     service_identity,
     training_config_document,
@@ -75,74 +72,42 @@ def model_authority():
     )
 
 
-def previous_model_authority():
-    return service_identity(
-        "model-distributor", "model-distributor-resume-test-previous", 1
-    )
-
-
-def sample_authority():
-    return service_identity(
-        "sample-distributor", "sample-distributor-resume-test", 1
-    )
-
-
-class FakeLeaseRenewer:
-    def __init__(self):
-        self.error = ""
-        self.closed = False
-        self.renew_count = 0
-
-    def start(self):
-        return self
-
-    def renew_now(self):
-        self.renew_count += 1
-
-    def close(self):
-        self.closed = True
-
-
 class FakeModelDistributor:
     def __init__(self, runtime, manifests=()):
         self.runtime = runtime
         self.authority = model_authority()
-        self.status_authority = self.authority
         self.registry = {
             int(manifest.identity.model_version): copy.deepcopy(manifest)
             for manifest in manifests
         }
         self.register_requests = []
-        self.lookup_requests = []
         self.ack_version = max(self.registry, default=None)
 
     def GetModelDistributorStatus(self, request, timeout):
         response = training_pb2.ModelDistributorStatusRsp(
             contract=self.runtime.contract,
-            distributor=self.status_authority,
+            distributor=self.authority,
             ready=True,
             registered_model_count=len(self.registry),
         )
         if self.registry:
             latest = self.registry[max(self.registry)]
             response.latest_model.CopyFrom(latest.identity)
+            response.available_floor_model_version = min(self.registry)
+            response.latest_available_model_version = max(self.registry)
         if self.ack_version is not None:
-            response.latest_ack_status = (
-                training_pb2.MODEL_LOAD_STATUS_LOADED
-            )
+            response.latest_ack_status = training_pb2.MODEL_LOAD_STATUS_LOADED
             response.latest_ack_model.CopyFrom(
                 self.registry[self.ack_version].identity
             )
         return response
 
     def GetModelManifest(self, request, timeout):
-        self.lookup_requests.append(copy.deepcopy(request))
         if request.latest_in_lineage:
             version = max(self.registry, default=None)
         else:
-            version = int(request.requested_model.model_version)
-            if version not in self.registry:
-                version = None
+            requested = int(request.requested_model.model_version)
+            version = requested if requested in self.registry else None
         if version is None:
             return training_pb2.GetModelManifestRsp(
                 ret_code=-1,
@@ -155,6 +120,8 @@ class FakeModelDistributor:
             distributor=self.authority,
         )
         response.manifest.CopyFrom(self.registry[version])
+        response.available_floor_model_version = min(self.registry)
+        response.latest_available_model_version = max(self.registry)
         return response
 
     def RegisterModel(self, request, timeout):
@@ -165,9 +132,7 @@ class FakeModelDistributor:
         if existing is not None and existing != manifest:
             return training_pb2.RegisterModelRsp(
                 ret_code=-1,
-                result=(
-                    training_pb2.MODEL_REGISTER_RESULT_REJECTED_CONFLICT
-                ),
+                result=training_pb2.MODEL_REGISTER_RESULT_REJECTED_CONFLICT,
                 message="model slot conflict",
                 distributor=self.authority,
             )
@@ -215,11 +180,6 @@ class CheckpointResumePublicationTest(unittest.TestCase):
             "optimizer": copy.deepcopy(trainer._optimizer.state_dict()),
             "torch_rng": torch.get_rng_state().clone(),
             "numpy_rng": copy.deepcopy(np.random.get_state()),
-            "cuda_rng": (
-                [state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available()
-                else []
-            ),
             "training": trainer.model.training,
         }
 
@@ -234,7 +194,7 @@ class CheckpointResumePublicationTest(unittest.TestCase):
         cfg = config(root / "source")
         trainer = PPOTrainer(cfg)
         publisher = ModelPublisher(cfg)
-        publisher.prepare()
+        self.assertEqual(publisher.prepare(), "fresh")
         manifest = publisher.publish_runtime(
             trainer,
             train_update_id="bootstrap-v0",
@@ -248,7 +208,7 @@ class CheckpointResumePublicationTest(unittest.TestCase):
                 samples(trainer.model_version),
                 behavior_model_version=trainer.model_version,
             )
-            update_id = f"source-update-{update}"
+            update_id = f"train-update-{update:08d}"
             publisher.commit_optimizer_checkpoint(
                 trainer,
                 train_update_id=update_id,
@@ -270,437 +230,183 @@ class CheckpointResumePublicationTest(unittest.TestCase):
                 trained_samples=update * 2,
                 checkpoint_precommitted=True,
             )
+            atomic_write_json(
+                publisher.receipt_path(update_id),
+                {
+                    "schema_version": 1,
+                    "train_update_id": update_id,
+                    "state": "ACKED",
+                    "model": manifest["identity"],
+                    "train_updates": update,
+                    "trained_samples": update * 2,
+                },
+            )
         return cfg, trainer, publisher, manifest
 
-    @staticmethod
-    def reversioned_manifest(document, version):
-        candidate = copy.deepcopy(
-            TrainingRuntime._manifest_for_wire(document)
-        )
-        candidate["identity"]["model_version"] = version
-        candidate["identity"]["manifest_digest"] = "0" * 64
-        return manifest_message(finalize_manifest_digest(candidate))
-
-    @staticmethod
-    def artifact_conflicting_manifest(document):
-        candidate = copy.deepcopy(
-            TrainingRuntime._manifest_for_wire(document)
-        )
-        candidate["identity"]["artifact_digest"] = "f" * 64
-        candidate["identity"]["manifest_digest"] = "0" * 64
-        return manifest_message(finalize_manifest_digest(candidate))
-
-    def make_runtime(self, root: Path, checkpoint: Path):
-        runtime = TrainingRuntime(
-            config(root / "resumed"), str(checkpoint)
-        )
-        runtime.UPDATE_COMMIT_RETRY_DELAY_SEC = 0.0
-        runtime.model_startup_timeout = 0.5
-        return runtime
-
-    def test_publication_reserve_changes_only_version_and_is_one_shot(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg, _, publisher, _ = self.make_source(Path(directory))
-            checkpoint = publisher.checkpoint_path(1)
-            trainer = PPOTrainer(cfg)
-            self.assertTrue(trainer.load_checkpoint(str(checkpoint)))
-            before = self.trainer_snapshot(trainer)
-
-            self.assertEqual(
-                trainer.reserve_initial_checkpoint_publication_version(1),
-                2,
-            )
-
-            self.assertEqual(trainer.model_version, 2)
-            self.assert_nested_equal(before, self.trainer_snapshot(trainer))
-            with self.assertRaisesRegex(RuntimeError, "already reserved"):
-                trainer.reserve_initial_checkpoint_publication_version(1)
-
-            reloaded = PPOTrainer(cfg)
-            self.assertTrue(reloaded.load_checkpoint(str(checkpoint)))
-            reloaded.reserve_initial_checkpoint_publication_version(1)
-            self.assertTrue(reloaded.load_checkpoint(str(checkpoint)))
-            with self.assertRaisesRegex(RuntimeError, "already reserved"):
-                reloaded.reserve_initial_checkpoint_publication_version(1)
-
-            mismatched = PPOTrainer(cfg)
-            self.assertTrue(mismatched.load_checkpoint(str(checkpoint)))
-            mismatch_before = self.trainer_snapshot(mismatched)
-            with self.assertRaisesRegex(RuntimeError, "source version mismatch"):
-                mismatched.reserve_initial_checkpoint_publication_version(0)
-            self.assertEqual(mismatched.model_version, 1)
-            self.assert_nested_equal(
-                mismatch_before, self.trainer_snapshot(mismatched)
-            )
-
-            unloaded = PPOTrainer(cfg)
-            with self.assertRaisesRegex(RuntimeError, "loaded checkpoint"):
-                unloaded.reserve_initial_checkpoint_publication_version(0)
-
-            overflow = PPOTrainer(cfg)
-            self.assertTrue(overflow.load_checkpoint(str(checkpoint)))
-            overflow._model_version = PPOTrainer.MAX_MODEL_VERSION
-            overflow._checkpoint_source_model_version = (
-                PPOTrainer.MAX_MODEL_VERSION
-            )
-            with self.assertRaisesRegex(OverflowError, "uint64"):
-                overflow.reserve_initial_checkpoint_publication_version(
-                    PPOTrainer.MAX_MODEL_VERSION
-                )
-            self.assertEqual(
-                overflow.model_version, PPOTrainer.MAX_MODEL_VERSION
-            )
-            self.assertFalse(overflow._publication_version_reserved)
-
-    def test_surviving_source_registers_new_baseline_and_first_update(self):
+    def test_inherited_publication_loads_only_weights_and_starts_at_v0(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, _, source_publisher, source_manifest = self.make_source(root)
-            runtime = self.make_runtime(
-                root, source_publisher.checkpoint_path(1)
+            _, source_trainer, source_publisher, source_manifest = (
+                self.make_source(root)
+            )
+            child_cfg = config(root / "child")
+            child_cfg["identity"]["model_lineage_id"] = "child-lineage"
+            child_cfg["training"]["seed"] = 7
+            child_cfg["model"]["bootstrap_seed"] = 7
+            child_cfg["identity"]["training_config_digest"] = (
+                canonical_config_digest(training_config_document(child_cfg))
+            )
+            expected_fresh = PPOTrainer(child_cfg)
+            expected_snapshot = self.trainer_snapshot(expected_fresh)
+
+            runtime = TrainingRuntime(
+                child_cfg, str(source_publisher.archive_path(1))
             )
             try:
-                source_wire = manifest_message(
-                    TrainingRuntime._manifest_for_wire(source_manifest)
+                self.assertEqual(runtime._startup_mode, "inherited-weights")
+                self.assertEqual(runtime.trainer.model_version, 0)
+                self.assertEqual(runtime.train_updates, 0)
+                self.assertEqual(runtime.trained_samples, 0)
+                self.assert_nested_equal(
+                    source_trainer.model.state_dict(),
+                    runtime.trainer.model.state_dict(),
                 )
-                distributor = FakeModelDistributor(runtime, [source_wire])
-                runtime.model_stub = distributor
-
+                actual = self.trainer_snapshot(runtime.trainer)
+                self.assert_nested_equal(
+                    expected_snapshot["optimizer"], actual["optimizer"]
+                )
+                self.assert_nested_equal(
+                    expected_snapshot["torch_rng"], actual["torch_rng"]
+                )
+                self.assert_nested_equal(
+                    expected_snapshot["numpy_rng"], actual["numpy_rng"]
+                )
+                self.assertEqual(
+                    runtime.publisher.initial_model_provenance[
+                        "initial_model_lineage_id"
+                    ],
+                    source_manifest["identity"]["model_lineage_id"],
+                )
+                runtime.model_stub = FakeModelDistributor(runtime)
+                runtime._wait_initial_model_loaded = mock.Mock()
                 runtime._initialize_models()
+                self.assertEqual(len(runtime.model_stub.register_requests), 1)
+                inherited = runtime.publisher.complete_manifest(0)
+                self.assertIsNotNone(inherited)
+                self.assertEqual(inherited["identity"]["model_version"], 0)
+                self.assertEqual(
+                    inherited["identity"]["model_lineage_id"], "child-lineage"
+                )
+                self.assertEqual(
+                    inherited["train_update_id"], "inherited-bootstrap-v0"
+                )
+                self.assertEqual(
+                    inherited["initial_model_version"],
+                    source_manifest["identity"]["model_version"],
+                )
+            finally:
+                self.close_runtime(runtime)
 
-                self.assertEqual(runtime.trainer.model_version, 2)
-                self.assertEqual(runtime.initial_model_version, 2)
+    def test_weight_inheritance_is_one_shot_and_requires_a_fresh_trainer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg, _, publisher, _ = self.make_source(root)
+            checkpoint = str(publisher.checkpoint_path(1))
+            trainer = PPOTrainer(cfg)
+            self.assertTrue(trainer.load_model_weights(checkpoint))
+            with self.assertRaisesRegex(RuntimeError, "fresh trainer"):
+                trainer.load_model_weights(checkpoint)
+
+            trained = PPOTrainer(cfg)
+            trained.train_on_batch(samples(0), behavior_model_version=0)
+            with self.assertRaisesRegex(RuntimeError, "fresh trainer"):
+                trained.load_model_weights(checkpoint)
+
+    def test_same_run_resume_restores_exact_state_without_republication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg, source_trainer, publisher, manifest = self.make_source(root)
+            expected = self.trainer_snapshot(source_trainer)
+            runtime = TrainingRuntime(cfg)
+            try:
+                self.assertEqual(runtime._startup_mode, "same-run-resume")
+                self.assertEqual(runtime.trainer.model_version, 1)
                 self.assertEqual(runtime.train_updates, 1)
                 self.assertEqual(runtime.trained_samples, 2)
-                self.assertEqual(len(distributor.register_requests), 1)
-                self.assertEqual(
-                    distributor.register_requests[0].identity.model_version, 2
+                self.assert_nested_equal(
+                    expected, self.trainer_snapshot(runtime.trainer)
                 )
-                self.assertEqual(
-                    distributor.register_requests[0].identity.artifact_digest,
-                    source_wire.identity.artifact_digest,
-                )
-                baseline = runtime.model_manifests[2]
-                self.assertEqual(baseline["train_updates"], 1)
-                self.assertEqual(baseline["trained_samples"], 2)
-                self.assertEqual(baseline["initial_model_version"], 1)
-                self.assertEqual(
-                    baseline["train_update_id"],
-                    "initial-checkpoint-republish-v2",
-                )
-                checkpoint = ModelPublisher._load_checkpoint(
-                    runtime.publisher.checkpoint_path(2)
-                )
-                self.assertEqual(checkpoint["model_version"], 2)
-                self.assertEqual(
-                    checkpoint["metadata"]["initial_model_version"], 1
-                )
-                metrics = runtime._learner_metrics_snapshot()
-                self.assertEqual(metrics["model_version"], 2)
-                self.assertEqual(metrics["initial_model_version"], 2)
-                self.assertEqual(metrics["train_updates"], 1)
-                self.assertEqual(metrics["run_train_updates"], 0)
-                self.assertEqual(metrics["run_trained_samples"], 0)
-                self.assertEqual(
-                    runtime.trainer.model_version
-                    - runtime.initial_model_version,
-                    metrics["run_train_updates"],
-                )
-                self.assertTrue(runtime.publisher.archive_path(2).is_dir())
-
-                runtime._validate_delivery = (
-                    lambda response, allow_partial=False: baseline["identity"]
-                )
-                runtime._training_samples = lambda batches: samples(2)
-                runtime._record_metrics = lambda: None
-                runtime._ack_idempotently = mock.Mock(return_value=1)
-                runtime._nack = mock.Mock()
-                response = SimpleNamespace(
-                    delivery_id="resume-delivery-1",
-                    actual_batch_size=2,
-                    batches=[SimpleNamespace(batch_id="resume-batch-1")],
-                    distributor=sample_authority(),
-                )
-                renewer = FakeLeaseRenewer()
-                with mock.patch(
-                    "main.training_runtime.LeaseRenewer",
-                    return_value=renewer,
-                ):
-                    runtime._train_delivery(response)
-
-                self.assertTrue(renewer.closed)
-                self.assertEqual(runtime.trainer.model_version, 3)
-                self.assertEqual(runtime.train_updates, 2)
-                self.assertEqual(runtime.trained_samples, 4)
-                self.assertEqual(runtime.initial_model_version, 2)
-                metrics = runtime._learner_metrics_snapshot()
-                self.assertEqual(metrics["run_train_updates"], 1)
-                self.assertEqual(metrics["run_trained_samples"], 2)
-                self.assertEqual(
-                    runtime.trainer.model_version
-                    - runtime.initial_model_version,
-                    metrics["run_train_updates"],
-                )
-                self.assertEqual(
-                    runtime.model_manifests[3]["initial_model_version"], 1
-                )
-                receipt = read_json(
-                    runtime.publisher.receipt_path("train-update-00000002")
-                )
-                self.assertEqual(receipt["state"], "ACKED")
-                self.assertEqual(receipt["target_model_version"], 3)
-                self.assertFalse(runtime.publisher.archive_path(3).exists())
-
-                response.delivery_id = "resume-delivery-2"
-                response.batches = [
-                    SimpleNamespace(batch_id="resume-batch-2")
-                ]
-                second_renewer = FakeLeaseRenewer()
-                with mock.patch(
-                    "main.training_runtime.LeaseRenewer",
-                    return_value=second_renewer,
-                ):
-                    runtime._train_delivery(response)
-
-                self.assertTrue(second_renewer.closed)
-                self.assertEqual(runtime.trainer.model_version, 4)
-                self.assertEqual(runtime.train_updates, 3)
-                self.assertEqual(runtime.trained_samples, 6)
-                self.assertEqual(runtime.initial_model_version, 2)
-                metrics = runtime._learner_metrics_snapshot()
-                self.assertEqual(metrics["run_train_updates"], 2)
-                self.assertEqual(metrics["run_trained_samples"], 4)
-                self.assertEqual(
-                    runtime.trainer.model_version
-                    - runtime.initial_model_version,
-                    metrics["run_train_updates"],
-                )
-                self.assertTrue(runtime.publisher.archive_path(4).is_dir())
-            finally:
-                self.close_runtime(runtime)
-
-    def test_existing_exact_target_is_adopted_without_register(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, _, source_publisher, _ = self.make_source(root)
-            runtime = self.make_runtime(
-                root, source_publisher.checkpoint_path(1)
-            )
-            try:
-                candidate = runtime.publisher.publish_runtime(
-                    runtime.trainer,
-                    train_update_id="initial-checkpoint-republish-v2",
-                    behavior_model=None,
-                    batch_ids=[],
-                    train_updates=runtime.train_updates,
-                    trained_samples=runtime.trained_samples,
-                )
-                candidate_wire = manifest_message(
-                    TrainingRuntime._manifest_for_wire(candidate)
-                )
-                distributor = FakeModelDistributor(
-                    runtime, [candidate_wire]
-                )
-                runtime.model_stub = distributor
+                runtime.model_stub = FakeModelDistributor(runtime)
+                runtime._wait_initial_model_loaded = mock.Mock()
                 with mock.patch.object(
                     runtime.publisher,
                     "publish_runtime",
-                    return_value=candidate,
-                ):
+                    wraps=runtime.publisher.publish_runtime,
+                ) as publish:
                     runtime._initialize_models()
-
-                self.assertEqual(distributor.register_requests, [])
-                self.assertEqual(runtime.model_manifests[2], candidate)
-                self.assertEqual(runtime.initial_model_version, 2)
+                publish.assert_not_called()
+                self.assertEqual(len(runtime.model_stub.register_requests), 1)
+                self.assertEqual(
+                    runtime.model_stub.register_requests[0].identity.model_version,
+                    1,
+                )
+                self.assertEqual(
+                    runtime.model_manifests[1]["identity"],
+                    manifest["identity"],
+                )
+                self.assertEqual(runtime.initial_model_version, 0)
+                self.assertTrue(publisher.archive_path(1).is_dir())
             finally:
                 self.close_runtime(runtime)
 
-    def test_changed_authority_positive_target_is_adopted(self):
+    def test_same_run_resume_rejects_import_and_unsettled_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, _, source_publisher, _ = self.make_source(root)
-            runtime = self.make_runtime(
-                root, source_publisher.checkpoint_path(1)
-            )
-            try:
-                candidate = runtime.publisher.publish_runtime(
-                    runtime.trainer,
-                    train_update_id="initial-checkpoint-republish-v2",
-                    behavior_model=None,
-                    batch_ids=[],
-                    train_updates=runtime.train_updates,
-                    trained_samples=runtime.trained_samples,
-                )
-                distributor = FakeModelDistributor(
-                    runtime,
-                    [
-                        manifest_message(
-                            TrainingRuntime._manifest_for_wire(candidate)
-                        )
-                    ],
-                )
-                distributor.status_authority = previous_model_authority()
-                runtime.model_stub = distributor
-                with mock.patch.object(
-                    runtime.publisher,
-                    "publish_runtime",
-                    return_value=candidate,
-                ):
-                    runtime._initialize_models()
+            cfg, _, publisher, _ = self.make_source(root)
+            with self.assertRaisesRegex(RuntimeError, "cannot also inherit"):
+                TrainingRuntime(cfg, str(publisher.archive_path(1)))
 
-                self.assertEqual(distributor.register_requests, [])
-                self.assertEqual(runtime.model_manifests[2], candidate)
-            finally:
-                self.close_runtime(runtime)
+            receipt_path = publisher.receipt_path("train-update-00000001")
+            receipt = read_json(receipt_path)
+            receipt["state"] = "ACK_PENDING"
+            atomic_write_json(receipt_path, receipt)
+            with self.assertRaisesRegex(RuntimeError, "not settled"):
+                ModelPublisher(cfg).prepare()
 
-    def test_changed_authority_absence_is_not_a_registration_preflight(self):
+    def test_same_run_resume_rejects_staged_or_corrupt_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, _, source_publisher, source_manifest = self.make_source(root)
-            runtime = self.make_runtime(
-                root, source_publisher.checkpoint_path(1)
-            )
-            try:
-                distributor = FakeModelDistributor(
-                    runtime,
-                    [
-                        manifest_message(
-                            TrainingRuntime._manifest_for_wire(
-                                source_manifest
-                            )
-                        )
-                    ],
-                )
-                distributor.status_authority = previous_model_authority()
-                runtime.model_stub = distributor
-                with self.assertRaisesRegex(
-                    RuntimeError, "authority changed"
-                ):
-                    runtime._initialize_models()
+            cfg, _, publisher, _ = self.make_source(root)
+            staged = publisher.staged_checkpoint_path(2)
+            staged.write_bytes(b"incomplete")
+            with self.assertRaisesRegex(RuntimeError, "incomplete transaction"):
+                ModelPublisher(cfg).prepare()
+            staged.unlink()
 
-                self.assertEqual(distributor.register_requests, [])
-                self.assertEqual(runtime.model_manifests, {})
-            finally:
-                self.close_runtime(runtime)
+            state = read_json(publisher.state_path)
+            state["train_updates"] = 99
+            atomic_write_json(publisher.state_path, state)
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                ModelPublisher(cfg).prepare()
 
-    def test_replaying_source_conflicts_with_existing_target_slot(self):
+    def test_initial_model_directory_must_be_exact_four_file_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, _, source_publisher, source_manifest = self.make_source(root)
-            source_checkpoint = source_publisher.checkpoint_path(1)
-            first = self.make_runtime(root / "first", source_checkpoint)
-            try:
-                source_wire = manifest_message(
-                    TrainingRuntime._manifest_for_wire(source_manifest)
-                )
-                distributor = FakeModelDistributor(first, [source_wire])
-                first.model_stub = distributor
-                first._initialize_models()
-                self.assertEqual(len(distributor.register_requests), 1)
-            finally:
-                self.close_runtime(first)
+            _, _, publisher, _ = self.make_source(root)
+            source = publisher.archive_path(1)
+            (source / "extra.txt").write_text("not canonical\n")
+            child = ModelPublisher(config(root / "child"))
+            self.assertEqual(child.prepare(), "fresh")
+            with self.assertRaisesRegex(RuntimeError, "exactly"):
+                child.load_initial_model_directory(PPOTrainer(child.config), str(source))
 
-            second = self.make_runtime(root / "second", source_checkpoint)
-            try:
-                distributor.runtime = second
-                second.model_stub = distributor
-                with self.assertRaisesRegex(
-                    RuntimeError, "target slot conflicts"
-                ):
-                    second._initialize_models()
-
-                self.assertEqual(second.trainer.model_version, 2)
-                self.assertEqual(second.model_manifests, {})
-                self.assertEqual(len(distributor.register_requests), 1)
-                self.assertTrue(second.publisher.model_path(2).is_file())
-            finally:
-                self.close_runtime(second)
-
-    def test_conflicting_surviving_source_fails_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, _, source_publisher, source_manifest = self.make_source(root)
-            runtime = self.make_runtime(
-                root, source_publisher.checkpoint_path(1)
-            )
-            try:
-                distributor = FakeModelDistributor(
-                    runtime,
-                    [self.artifact_conflicting_manifest(source_manifest)],
-                )
-                runtime.model_stub = distributor
-                with self.assertRaisesRegex(
-                    RuntimeError, "checkpoint source conflicts"
-                ):
-                    runtime._initialize_models()
-
-                self.assertEqual(runtime.trainer.model_version, 2)
-                self.assertEqual(runtime.model_manifests, {})
-                self.assertEqual(distributor.register_requests, [])
-                self.assertTrue(runtime.publisher.model_path(2).is_file())
-            finally:
-                self.close_runtime(runtime)
-
-    def test_newer_or_conflicting_remote_facts_fail_closed(self):
-        cases = ("newer", "target_conflict")
-        for case in cases:
-            with self.subTest(case=case):
-                with tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    _, _, source_publisher, source_manifest = (
-                        self.make_source(root)
-                    )
-                    runtime = self.make_runtime(
-                        root, source_publisher.checkpoint_path(1)
-                    )
-                    try:
-                        remote_version = 3 if case == "newer" else 2
-                        remote = self.reversioned_manifest(
-                            source_manifest, remote_version
-                        )
-                        distributor = FakeModelDistributor(runtime, [remote])
-                        runtime.model_stub = distributor
-                        publisher_spy = mock.Mock(
-                            wraps=runtime.publisher.publish_runtime
-                        )
-                        with mock.patch.object(
-                            runtime.publisher,
-                            "publish_runtime",
-                            publisher_spy,
-                        ):
-                            with self.assertRaisesRegex(
-                                RuntimeError,
-                                (
-                                    "newer publication"
-                                    if case == "newer"
-                                    else "target slot conflicts"
-                                ),
-                            ):
-                                runtime._initialize_models()
-
-                        self.assertEqual(runtime.trainer.model_version, 2)
-                        self.assertEqual(distributor.register_requests, [])
-                        if case == "newer":
-                            publisher_spy.assert_not_called()
-                            self.assertFalse(
-                                runtime.publisher.model_path(2).exists()
-                            )
-                        else:
-                            publisher_spy.assert_called_once()
-                            self.assertTrue(
-                                runtime.publisher.model_path(2).is_file()
-                            )
-                        self.assertEqual(runtime.model_manifests, {})
-                    finally:
-                        self.close_runtime(runtime)
-
-    def test_archive_cadence_uses_run_updates_not_publication_version(self):
+    def test_archive_cadence_uses_global_train_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             publisher = ModelPublisher(config(Path(directory)))
-            self.assertFalse(publisher.should_archive(0))
-            self.assertFalse(publisher.should_archive(1))
-            self.assertTrue(publisher.should_archive(2))
-            self.assertFalse(publisher.should_archive(3))
+            self.assertFalse(publisher.should_mark_permanent(0))
+            self.assertFalse(publisher.should_mark_permanent(1))
+            self.assertTrue(publisher.should_mark_permanent(2))
+            self.assertFalse(publisher.should_mark_permanent(3))
 
 
 if __name__ == "__main__":

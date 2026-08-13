@@ -44,10 +44,89 @@ class MetricsContractTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_metric_event_views_override_operational_snapshots(self):
+        record = {
+            "learner": {"policy_loss": 99.0},
+            "actor": {
+                "episodes": {"mean_agent_return": 88.0},
+                "metric_values": {
+                    "server.training.episode.success.agent_rate.v1": 0.25,
+                },
+            },
+            "metric_event_views": {
+                "episodes": {
+                    "windows": {
+                        "100": {
+                            "values": {
+                                "mean_agent_return": 4.0,
+                                "agent_success_rate": 0.5,
+                            }
+                        }
+                    }
+                },
+                "train_updates": {
+                    "latest": {
+                        "values": {
+                            "ppo": {"policy_loss": {"mean": -0.5}}
+                        }
+                    }
+                },
+            },
+        }
+        projected = metrics_server_module.project_metric_values(
+            record, metrics_server_module._STATIC_METRIC_DEFINITIONS
+        )["metric_values"]
+        self.assertEqual(projected["learner.loss.policy.v1"], -0.5)
+        self.assertEqual(
+            projected["server.episode.learning_return.mean.v1"], 4.0
+        )
+        self.assertEqual(
+            projected["server.training.episode.success.agent_rate.v1"],
+            50.0,
+        )
+
+    def test_metric_event_no_data_does_not_fall_back_to_rolling_snapshot(self):
+        record = {
+            "actor": {"episodes": {"mean_agent_return": 88.0}},
+            "metric_event_views": {
+                "status": "provisional",
+                "episodes": {
+                    "windows": {"100": {"status": "no_data", "values": {}}}
+                },
+            },
+        }
+        projected = metrics_server_module.project_metric_values(
+            record, metrics_server_module._STATIC_METRIC_DEFINITIONS
+        )["metric_values"]
+        self.assertIsNone(
+            projected["server.episode.learning_return.mean.v1"]
+        )
+
+    def test_metric_event_window_selection_uses_requested_raw_view(self):
+        record = {
+            "metric_event_views": {
+                "status": "provisional",
+                "episodes": {
+                    "windows": {
+                        "25": {"values": {"mean_agent_return": 2.5}},
+                        "100": {"values": {"mean_agent_return": 10.0}},
+                    }
+                },
+            }
+        }
+        projected = metrics_server_module.project_metric_values(
+            record,
+            metrics_server_module._STATIC_METRIC_DEFINITIONS,
+            "25",
+        )["metric_values"]
+        self.assertEqual(
+            projected["server.episode.learning_return.mean.v1"], 2.5
+        )
+
     def test_actor_snapshot_projects_client_session_presence(self):
         status = training_pb2.AIServerStatusRsp()
         status.contract.package_name = "rl-contracts"
-        status.contract.package_version = "0.10.0"
+        status.contract.package_version = "0.11.0"
         status.aiserver.component = "rl-aiserver"
         status.aiserver.instance_id = "aiserver-test"
         status.aiserver.lifecycle_epoch = 3

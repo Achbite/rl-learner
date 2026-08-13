@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir \
 WORKDIR /opt/rl/learner
 COPY . /opt/rl/learner
 RUN cp -a _deps/contracts/python/. proto/ && \
+    cp -a _deps/contracts/schemas/. schemas/ && \
     cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
     cp -a _deps/model-distributor /opt/rl/learner/model-distributor && \
     mkdir -p /opt/rl/identity && \

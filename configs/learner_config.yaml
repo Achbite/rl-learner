@@ -3,9 +3,9 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.10.0
-  source_digest: fc1bf2e3dfd804431f2528d8da53227e55ca9b58b32fc95327558d91cebb3b97
-  artifact_digest: d90083d97e377230f50c820d040a5d83ce7435dc88c4f948c222c86ac4a429ae
+  package_version: 0.11.0
+  source_digest: 7e3eb7227e67a2a880130c9c82f87041691c0095f838a60f80abc1f387c1c5b3
+  artifact_digest: 077ac6d61486fafd5f0430eeb05a492764b36e073282f6d7626d0414bb5b2ddf
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
@@ -55,10 +55,9 @@ training:
 
 model:
   local_train_dir: models/local-train
-  initial_checkpoint: ""
+  initial_model_dir: ""             # optional canonical four-file publication
   archive_interval_updates: 200
-  archive_on_graceful_shutdown: true
-  serving_retention_versions: 3
+  publication_retention_versions: 101
   obs_dim: 17
   action_dim: 9
   hidden_dim: 64

@@ -40,7 +40,8 @@ sample_pool_config="${SAMPLE_DISTRIBUTOR_CONFIG:-${default_sample_pool_dir}/conf
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
 model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
 local_train_root="${RL_LOCAL_TRAIN_ROOT:-${repo_dir}/models/local-train}"
-initial_checkpoint="${RL_INITIAL_CHECKPOINT:-}"
+initial_model_dir="${RL_INITIAL_MODEL_DIR:-}"
+new_run=0
 metrics_port="${RL_METRICS_PORT:-9005}"
 metrics_source_id="${RL_METRICS_SOURCE_ID:-}"
 if [ -z "${metrics_source_id}" ]; then
@@ -54,9 +55,13 @@ while [ "$#" -gt 0 ]; do
             config="${2:?--config requires a value}"
             shift 2
             ;;
-        --initial-checkpoint)
-            initial_checkpoint="${2:?--initial-checkpoint requires a value}"
+        --initial-model-dir)
+            initial_model_dir="${2:?--initial-model-dir requires a value}"
             shift 2
+            ;;
+        --new-run)
+            new_run=1
+            shift
             ;;
         --model-distributor)
             address="${2:?--model-distributor requires host:port}"
@@ -120,18 +125,15 @@ if [ "${local_train_root}" != "${expected_local_train_root}" ]; then
     echo "Unsafe Learner local-train path: ${local_train_root}" >&2
     exit 1
 fi
-if [ -n "${initial_checkpoint}" ]; then
-    if [ ! -f "${initial_checkpoint}" ]; then
-        echo "Initial checkpoint does not exist: ${initial_checkpoint}" >&2
+if [ -n "${initial_model_dir}" ]; then
+    if [ -L "${initial_model_dir}" ] || [ ! -d "${initial_model_dir}" ]; then
+        echo "Initial model directory is unavailable: ${initial_model_dir}" >&2
         exit 1
     fi
-    checkpoint_parent="$(
-        cd "$(dirname "${initial_checkpoint}")" && pwd -P
-    )"
-    initial_checkpoint="${checkpoint_parent}/$(basename "${initial_checkpoint}")"
-    case "${initial_checkpoint}" in
+    initial_model_dir="$(cd "${initial_model_dir}" && pwd -P)"
+    case "${initial_model_dir}" in
         "${local_train_root}"|"${local_train_root}"/*)
-            echo "Initial checkpoint must be outside local-train" >&2
+            echo "Initial model directory must be outside local-train" >&2
             exit 1
             ;;
     esac
@@ -144,18 +146,12 @@ if ! mkdir "${training_lock}" 2>/dev/null; then
 fi
 printf '%s\n' "$$" > "${training_lock}/pid"
 
-if [ -d "${local_train_root}" ]; then
+mkdir -p "${local_train_root}"
+if [ "${new_run}" -eq 1 ]; then
     find "${local_train_root}" -mindepth 1 -maxdepth 1 \
-        ! -name metrics \
         -exec rm -rf -- {} +
-else
-    mkdir -p "${local_train_root}"
-fi
-if ! rm -rf -- "${local_train_root}/metrics"; then
-    echo "Metrics cleanup unavailable; training continues without requiring metrics" >&2
 fi
 mkdir -p \
-    "${local_train_root}/runtime/serving" \
     "${local_train_root}/runtime/checkpoints" \
     "${local_train_root}/runtime/receipts" \
     "${local_train_root}/archive"
@@ -168,8 +164,8 @@ export RL_LOCAL_TRAIN_ROOT="${local_train_root}"
 export RL_SAMPLE_POOL_HOST="127.0.0.1"
 export RL_SAMPLE_POOL_PORT="${RL_SAMPLE_POOL_PORT:-9100}"
 export RL_MODEL_DISTRIBUTOR_PORT="${RL_MODEL_DISTRIBUTOR_PORT:-9200}"
-if [ -n "${initial_checkpoint}" ]; then
-    export RL_INITIAL_CHECKPOINT="${initial_checkpoint}"
+if [ -n "${initial_model_dir}" ]; then
+    export RL_INITIAL_MODEL_DIR="${initial_model_dir}"
 fi
 
 metrics_pid=""
@@ -307,8 +303,8 @@ python3 tools/metrics_server.py \
 metrics_pid=$!
 
 training_args=(--config "${config}")
-if [ -n "${initial_checkpoint}" ]; then
-    training_args+=(--initial-checkpoint "${initial_checkpoint}")
+if [ -n "${initial_model_dir}" ]; then
+    training_args+=(--initial-model-dir "${initial_model_dir}")
 fi
 python3 -m main.training_runtime "${training_args[@]}" &
 training_pid=$!

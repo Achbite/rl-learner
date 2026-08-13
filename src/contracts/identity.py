@@ -1,4 +1,4 @@
-"""Build and validate the exact rl-contracts 0.10.0 training identities."""
+"""Build and validate the exact rl-contracts 0.11.0 training identities."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.10.0"
+CONTRACT_VERSION = "0.11.0"
 REWARD_SCHEMA_ID = "maze.reward.v4"
 REWARD_SCHEMA_DIGEST = (
     "ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929"
@@ -52,7 +52,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the selected 0.10.0 artifact")
+        raise ValueError("contract identity is not the selected 0.11.0 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -308,6 +308,23 @@ def validate_config(config: dict) -> None:
     model = config["model"]
     training = config["training"]
     policy = config["policy"]
+    retired_model_fields = {
+        "archive_on_graceful_shutdown",
+        "initial_checkpoint",
+        "serving_retention_versions",
+    }
+    present_retired_fields = sorted(retired_model_fields.intersection(model))
+    if present_retired_fields:
+        raise ValueError(
+            "retired model publication fields are not allowed: "
+            + ", ".join(present_retired_fields)
+        )
+    if (
+        int(model["archive_interval_updates"]) <= 0
+        or int(model["publication_retention_versions"]) < 101
+        or not isinstance(model["initial_model_dir"], str)
+    ):
+        raise ValueError("model publication parameters are invalid")
     if (
         int(model["obs_dim"]) != 17
         or int(model["action_dim"]) != 9
