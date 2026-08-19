@@ -9,12 +9,13 @@ import sys
 import time
 from pathlib import Path
 
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main.training_runtime import atomic_write_json, sha256_file
+from src.config.effective_config import load_effective_config
 from src.contracts.identity import (
+    bind_runtime_lineage,
     contract_document,
     contract_identity,
     finalize_manifest_digest,
@@ -29,10 +30,7 @@ from src.training.ppo_trainer import PPOTrainer
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream) or {}
-    validate_config(config)
-    return config
+    return load_effective_config(path)
 
 
 def export_initial_model(
@@ -59,11 +57,11 @@ def export_initial_model(
         else model_path.as_uri()
     )
     document = {
-        "manifest_schema_version": 1,
+        "manifest_schema_version": 2,
         "contract": contract_document(contract_identity(config)),
         "identity": {
             "model_lineage_id": config["identity"]["model_lineage_id"],
-            "model_version": 0,
+            "model_step": 0,
             "artifact_digest": sha256_file(model_path),
             "manifest_digest": "0" * 64,
         },
@@ -90,7 +88,7 @@ def export_initial_model(
     document = finalize_manifest_digest(document)
     atomic_write_json(root / "manifest.json", document)
     logger.info(
-        "initial model exported: lineage=%s version=0 artifact=%s manifest=%s",
+        "initial model exported: lineage=%s step=0 artifact=%s manifest=%s",
         document["identity"]["model_lineage_id"],
         document["identity"]["artifact_digest"],
         document["identity"]["manifest_digest"],

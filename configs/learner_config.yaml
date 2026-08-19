@@ -3,9 +3,9 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.11.0
-  source_digest: 7e3eb7227e67a2a880130c9c82f87041691c0095f838a60f80abc1f387c1c5b3
-  artifact_digest: 077ac6d61486fafd5f0430eeb05a492764b36e073282f6d7626d0414bb5b2ddf
+  package_version: 0.13.0
+  source_digest: 1fc3866efe7e5869cc1a7ed4bc86d58f9c1abedafd7012b9f5dae08246ff145d
+  artifact_digest: 5ce9dff294e3cab466e2e0f058192f9715530645a41b45851b4d798e19a9a5a7
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
@@ -34,8 +34,7 @@ policy:
   policy_spec_digest: e1efb81040681fd13fdae439caab09778c8e0b0f6bba16b7808c30fbbb632617
 
 identity:
-  model_lineage_id: maze-fixed-map-seed-0
-  training_config_digest: b8a98bd14abc5f09e57c65516ff1eae8222b9515b058d76c34af4a88dee7551f
+  model_lineage_id: __FRESH_INTERNAL_LINEAGE_REQUIRED__
 
 training:
   device: cpu
@@ -51,52 +50,52 @@ training:
   n_epochs: 4                     # optimizer passes per leased batch, >0
   mini_batch_size: 64             # samples per optimizer mini-batch, >0
   normalize_advantage: true
-  max_policy_lag: 2               # accepted behavior-model lag, versions, >=0
+  max_policy_lag: 2               # accepted behavior-model step lag, >=0
 
 model:
-  local_train_dir: models/local-train
-  initial_model_dir: ""             # optional canonical four-file publication
+  # null means a fresh random bootstrap. A path or --initial-model selects
+  # weight-only warm-start while retaining a new lineage and model_step 0.
+  initial_model_path: null
+  local_train_dir: ../models/train
   archive_interval_updates: 200
-  publication_retention_versions: 101
+  publication_retention_steps: 101
   obs_dim: 17
   action_dim: 9
   hidden_dim: 64
   bootstrap_seed: 0
   tensor_dtype: float32
 
-sample_distributor:
+sample_pool:
   host: 127.0.0.1
   port: 9100
   train_batch_size: 512            # optimizer target; never split fragments
-  max_train_batch_size: 639        # target + max fragment - 1
+  max_fragment_samples: 128        # A3 Pool fragment upper bound
+  max_train_batch_size: 639        # derived again after startup overrides
   max_sample_age_ms: 120000        # freshness bound at Pool and Learner
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
-  finalize_drain_timeout_ms: 30000  # bounded Run tail is trained only after an explicit finalize request
+  finalize_drain_timeout_ms: 30000  # bounded execution tail is trained only after explicit finalize
   finalize_request_path: /tmp/rl-training-finalize
   finalize_complete_path: /tmp/rl-training-finalized
   shutdown_drain_timeout_ms: 20000
-  demand_ttl_ms: 10000              # short-lived Consumer Demand lease
-  demand_refresh_interval_ms: 3000  # refresh well before TTL expiry
-  demand_max_fragments: 639         # worst case: one sample per partial fragment
-  demand_max_estimated_bytes: 8388608
 
 model_distributor:
   host: 127.0.0.1
   port: 9200
-  startup_timeout_sec: 30
 
 aiserver_status:
   host: aiserver-dev
   port: 9002
+  # null keeps Learner alive until the exact bootstrap model ACK or a signal.
+  # A positive value enables an explicit bounded diagnostic timeout.
+  initial_model_ack_timeout_sec: null
 
 dashboard:
   enabled: true
   server_port: 9005
-  metrics_dir: models/local-train/metrics
   backend: jsonl
 
 log:
   console_level: INFO
   file_level: DEBUG
-  log_dir: logs
+  log_dir: ../logs

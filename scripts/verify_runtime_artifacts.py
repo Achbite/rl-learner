@@ -51,12 +51,16 @@ def verify_contract(root: Path, version: str, platform: str) -> dict[str, Any]:
         or manifest.get("package") != "rl-contracts"
         or manifest.get("version") != version
         or manifest.get("platform") != platform
+        or manifest.get("source_tree_state") != "clean"
+        or SOURCE_COMMIT.fullmatch(
+            str(manifest.get("source_commit", ""))
+        ) is None
     ):
         raise SystemExit("Contract artifact identity is invalid")
     verify_files(root, manifest)
-    schema = manifest.get("metric_schemas", {}).get("maze.metrics.v2")
-    catalog_path = root / "schemas/maze.metrics.v2.json"
-    digest_path = root / "schemas/maze.metrics.v2.sha256"
+    schema = manifest.get("metric_schemas", {}).get("maze.metrics.v3")
+    catalog_path = root / "schemas/maze.metrics.v3.json"
+    digest_path = root / "schemas/maze.metrics.v3.sha256"
     if not catalog_path.is_file() or not digest_path.is_file():
         raise SystemExit("Contract metric schema artifact is missing")
     digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
@@ -64,9 +68,9 @@ def verify_contract(root: Path, version: str, platform: str) -> dict[str, Any]:
         raise SystemExit("Contract metric schema digest is invalid")
     if schema != {
         "canonical_digest": {"algorithm": "sha256", "hex": digest},
-        "digest_path": "schemas/maze.metrics.v2.sha256",
-        "path": "schemas/maze.metrics.v2.json",
-        "schema_version": 2,
+        "digest_path": "schemas/maze.metrics.v3.sha256",
+        "path": "schemas/maze.metrics.v3.json",
+        "schema_version": 3,
     }:
         raise SystemExit("Contract metric schema manifest binding is invalid")
     return manifest
@@ -129,7 +133,7 @@ def main() -> None:
         args.sample_pool_version,
         args.platform,
         contract,
-        {"bin/maze_sample_distributor", "config/distributor_config.yaml"},
+        {"bin/maze_sample_pool", "config/pool_config.yaml"},
     )
     verify_component(
         args.model_distributor_dir,

@@ -76,10 +76,10 @@
     {
       "aggregation": "raw_sum_count",
       "count_unit": "sample",
-      "dimension": "model_version_distance",
+      "dimension": "model_step_distance",
       "fact": "train_update",
       "field_id": "policy_lag",
-      "unit": "model_version"
+      "unit": "model_step"
     },
     {
       "aggregation": "raw_sum_count",
@@ -122,6 +122,6 @@
       "unit": "reward"
     }
   ],
-  "schema_id": "maze.metrics.v2",
-  "schema_version": 2
+  "schema_id": "maze.metrics.v3",
+  "schema_version": 3
 }

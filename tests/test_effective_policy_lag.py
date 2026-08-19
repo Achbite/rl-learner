@@ -39,11 +39,11 @@ def model_document(cfg, version):
     ).hexdigest()
     return finalize_manifest_digest(
         {
-            "manifest_schema_version": 1,
+            "manifest_schema_version": 2,
             "contract": contract_document(contract_identity(cfg)),
             "identity": {
                 "model_lineage_id": cfg["identity"]["model_lineage_id"],
-                "model_version": version,
+                "model_step": version,
                 "artifact_digest": artifact_digest,
                 "manifest_digest": "0" * 64,
             },
@@ -93,7 +93,7 @@ class EffectivePolicyLagTest(unittest.TestCase):
             training_digest=training_config_digest(cfg),
         )
         runtime.trainer = SimpleNamespace(
-            model_version=current_version, max_policy_lag=2
+            model_step=current_version, max_policy_lag=2
         )
         runtime.learner_service = service_identity(
             "learner", "learner-effective-lag-test", 1
@@ -103,10 +103,6 @@ class EffectivePolicyLagTest(unittest.TestCase):
         runtime.max_sample_age_ms = 120000
         runtime.get_timeout_ms = 1000
         runtime.lease_timeout_ms = 30000
-        runtime.demand_id = "learner-effective-lag-test-demand"
-        runtime.demand_ttl_ms = 10000
-        runtime.demand_max_fragments = 1
-        runtime.demand_max_estimated_bytes = 1024
         runtime.model_manifests = {
             current_version: model_document(cfg, current_version)
         }
@@ -117,13 +113,9 @@ class EffectivePolicyLagTest(unittest.TestCase):
         self.assertEqual(
             runtime._effective_max_policy_lag(), expected_lag
         )
-        self.assertEqual(
-            runtime._demand_message().freshness.max_version_lag,
-            expected_lag,
-        )
         runtime._get_batch()
         self.assertEqual(
-            runtime.sample_stub.request.freshness.max_version_lag,
+            runtime.sample_stub.request.freshness.max_model_step_lag,
             expected_lag,
         )
 
@@ -142,7 +134,7 @@ class EffectivePolicyLagTest(unittest.TestCase):
             bootstrap_valid=True,
             behavior_policy=training_pb2.BehaviorPolicyReference(
                 model_lineage_id=runtime.publisher.lineage_id,
-                model_version=version,
+                model_step=version,
                 distribution_schema_id=(
                     runtime.semantics.policy_distribution_schema_id
                 ),
@@ -161,7 +153,7 @@ class EffectivePolicyLagTest(unittest.TestCase):
         )
         sample = batch.samples.add(
             action=1,
-            reward=0.01,
+            reward=0.0,
             old_log_probability=-2.0,
             old_value_prediction=0.1,
             end_kind=training_pb2.TRANSITION_END_KIND_CONTINUING,
@@ -183,8 +175,8 @@ class EffectivePolicyLagTest(unittest.TestCase):
             returned_samples=1,
             actual_batch_size=1,
             returned_fragments=1,
-            minimum_behavior_model_version=version,
-            maximum_behavior_model_version=version,
+            minimum_behavior_model_step=version,
+            maximum_behavior_model_step=version,
             oldest_sample_created_at_unix_ms=created_at,
             newest_sample_created_at_unix_ms=created_at,
             batches=[batch],
@@ -196,23 +188,23 @@ class EffectivePolicyLagTest(unittest.TestCase):
         self.assert_freshness_surfaces(runtime, 0)
         summary = runtime._validate_delivery(self.delivery(runtime, 7))
 
-        self.assertEqual(summary["minimum_model_version"], 7)
-        self.assertEqual(summary["maximum_model_version"], 7)
+        self.assertEqual(summary["minimum_model_step"], 7)
+        self.assertEqual(summary["maximum_model_step"], 7)
 
     def test_contiguous_publications_expand_to_configured_cap(self):
         cfg, runtime = self.runtime(current_version=7)
         self.assert_freshness_surfaces(runtime, 0)
 
         runtime.model_manifests[8] = model_document(cfg, 8)
-        runtime.trainer.model_version = 8
+        runtime.trainer.model_step = 8
         self.assert_freshness_surfaces(runtime, 1)
 
         runtime.model_manifests[9] = model_document(cfg, 9)
-        runtime.trainer.model_version = 9
+        runtime.trainer.model_step = 9
         self.assert_freshness_surfaces(runtime, 2)
 
         runtime.model_manifests[10] = model_document(cfg, 10)
-        runtime.trainer.model_version = 10
+        runtime.trainer.model_step = 10
         self.assert_freshness_surfaces(runtime, 2)
 
     def test_manifest_gap_does_not_widen_freshness(self):
@@ -229,15 +221,15 @@ class EffectivePolicyLagTest(unittest.TestCase):
     def test_contiguous_old_samples_remain_valid_after_publication(self):
         cfg, runtime = self.runtime(current_version=7)
         runtime.model_manifests[8] = model_document(cfg, 8)
-        runtime.trainer.model_version = 8
+        runtime.trainer.model_step = 8
 
         summary = runtime._validate_delivery(self.delivery(runtime, 7))
-        self.assertEqual(summary["minimum_model_version"], 7)
+        self.assertEqual(summary["minimum_model_step"], 7)
 
         runtime.model_manifests[9] = model_document(cfg, 9)
-        runtime.trainer.model_version = 9
+        runtime.trainer.model_step = 9
         summary = runtime._validate_delivery(self.delivery(runtime, 7))
-        self.assertEqual(summary["minimum_model_version"], 7)
+        self.assertEqual(summary["minimum_model_step"], 7)
 
     def test_unresolvable_manifest_stops_the_contiguous_window(self):
         cfg, runtime = self.runtime(current_version=9)
@@ -263,17 +255,9 @@ class EffectivePolicyLagTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     RuntimeError, "current model manifest"
                 ):
-                    runtime._demand_message()
-                with self.assertRaisesRegex(
-                    RuntimeError, "current model manifest"
-                ):
                     runtime._get_batch()
                 self.assertIsNone(runtime.sample_stub.request)
                 with self.assertRaisesRegex(
                     RuntimeError, "current model manifest"
                 ):
                     runtime._validate_delivery(response)
-
-
-if __name__ == "__main__":
-    unittest.main()

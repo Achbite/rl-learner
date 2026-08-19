@@ -8,12 +8,13 @@ PPO 训练器
 
 import copy
 import os
-from collections.abc import Mapping
 from typing import Dict, List, Tuple
 
 import numpy as np
+import onnx
 import torch
 import torch.nn as nn
+from onnx import numpy_helper
 from torch.distributions import Categorical
 
 from src.log.logger import setup_logger
@@ -108,7 +109,7 @@ class PPOTrainer:
         4. export_onnx() 定期导出模型
     """
 
-    MAX_MODEL_VERSION = (1 << 64) - 1
+    MAX_MODEL_STEP = (1 << 64) - 1
 
     def __init__(self, config: dict):
         """
@@ -150,8 +151,8 @@ class PPOTrainer:
         self._model = ActorCritic(self._obs_dim, self._action_dim, self._hidden_dim).to(self._device)
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=self._lr)
 
-        # ---- 模型版本号 ----
-        self._model_version = 0
+        # ---- 公开训练步长；每次成功 PPO Train Update 恰好加一 ----
+        self._model_step = 0
         self._model_weights_inherited = False
         self._last_raw_metric_sum_counts: dict[str, dict[str, float | int]] = {}
 
@@ -291,7 +292,7 @@ class PPOTrainer:
     def train_on_batch(
         self,
         samples: List[dict],
-        behavior_model_version: int | None = None,
+        behavior_model_step: int | None = None,
     ) -> Dict[str, float]:
         """
         对一批已计算好 GAE 的样本执行 PPO 训练
@@ -301,37 +302,41 @@ class PPOTrainer:
         Returns:
             训练统计字典
         """
-        behavior_versions = [
+        behavior_steps = [
             int(
                 sample.get(
-                    "behavior_model_version",
-                    self._model_version
-                    if behavior_model_version is None
-                    else behavior_model_version,
+                    "behavior_model_step",
+                    self._model_step
+                    if behavior_model_step is None
+                    else behavior_model_step,
                 )
             )
             for sample in samples
         ]
+        if samples and len(set(behavior_steps)) != 1:
+            raise ValueError(
+                "one PPO update must contain exactly one behavior model step"
+            )
         policy_lags = [
-            self._model_version - version for version in behavior_versions
+            self._model_step - step for step in behavior_steps
         ]
         if any(lag < 0 for lag in policy_lags):
-            raise ValueError("behavior model version is from the future")
+            raise ValueError("behavior model step is from the future")
         if any(lag > self._max_policy_lag for lag in policy_lags):
             raise ValueError(
-                "behavior model version exceeds max_policy_lag: "
-                f"current={self._model_version} "
-                f"behavior=[{min(behavior_versions)},"
-                f"{max(behavior_versions)}] "
+                "behavior model step exceeds max_policy_lag: "
+                f"current={self._model_step} "
+                f"behavior=[{min(behavior_steps)},"
+                f"{max(behavior_steps)}] "
                 f"max={self._max_policy_lag}"
             )
         policy_lag = max(policy_lags, default=0)
         if not samples:
             self._last_raw_metric_sum_counts = {}
             return self._empty_stats(policy_lag)
-        if self._model_version >= self.MAX_MODEL_VERSION:
+        if self._model_step >= self.MAX_MODEL_STEP:
             raise RuntimeError(
-                "model version exhausted the uint64 publication space"
+                "model step exhausted the uint64 publication space"
             )
 
         # ---- 1. 转换为 Tensor ----
@@ -529,7 +534,7 @@ class PPOTrainer:
         if total_updates == 0:
             return self._empty_stats(policy_lag)
 
-        self._model_version += 1
+        self._model_step += 1
 
         self._last_raw_metric_sum_counts = {
             "approx_kl": {
@@ -601,16 +606,16 @@ class PPOTrainer:
             "explained_variance": round(explained_variance, 6),
             "learning_rate": self._lr,
             "policy_lag": policy_lag,
-            "minimum_behavior_model_version": min(behavior_versions),
-            "maximum_behavior_model_version": max(behavior_versions),
+            "minimum_behavior_model_step": min(behavior_steps),
+            "maximum_behavior_model_step": max(behavior_steps),
             "mean_policy_lag": round(float(np.mean(policy_lags)), 6),
             "max_policy_lag": self._max_policy_lag,
-            "model_version": self._model_version,
+            "model_step": self._model_step,
         }
 
         self._logger.info(
-            "训练步骤 v%d: policy_loss=%.4f, value_loss=%.4f, entropy=%.4f, clip=%.3f, samples=%d",
-            self._model_version, stats["policy_loss"], stats["value_loss"],
+            "训练更新 model_step=%d: policy_loss=%.4f, value_loss=%.4f, entropy=%.4f, clip=%.3f, samples=%d",
+            self._model_step, stats["policy_loss"], stats["value_loss"],
             stats["entropy"], stats["clip_fraction"], n_samples,
         )
 
@@ -659,7 +664,7 @@ class PPOTrainer:
         finally:
             self._model.train(was_training)
 
-        self._logger.info("ONNX 模型已导出: %s (version=%d)", export_path, self._model_version)
+        self._logger.info("ONNX 模型已导出: %s (step=%d)", export_path, self._model_step)
 
     # ---- PyTorch Checkpoint 保存/加载（断点续训）----
     def save_checkpoint(self, path: str, metadata: dict | None = None):
@@ -668,7 +673,7 @@ class PPOTrainer:
         torch.save({
             "model_state_dict": self._model.state_dict(),
             "optimizer_state_dict": self._optimizer.state_dict(),
-            "model_version": self._model_version,
+            "model_step": self._model_step,
             "model_training": bool(self._model.training),
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
@@ -689,20 +694,24 @@ class PPOTrainer:
             checkpoint = torch.load(path, map_location=self._device)
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self._model_version = int(checkpoint.get("model_version", 0))
+        if "model_version" in checkpoint:
+            raise RuntimeError("legacy model_version checkpoint is not accepted")
+        self._model_step = int(checkpoint.get("model_step", 0))
+        if self._model_step < 0 or self._model_step > self.MAX_MODEL_STEP:
+            raise RuntimeError("checkpoint model_step is invalid")
         self._model_weights_inherited = False
         self._model.train(bool(checkpoint.get("model_training", True)))
         if "torch_rng_state" in checkpoint:
             torch.set_rng_state(checkpoint["torch_rng_state"])
         if "numpy_rng_state" in checkpoint:
             np.random.set_state(checkpoint["numpy_rng_state"])
-        self._logger.info("Checkpoint 已加载: %s (version=%d)", path, self._model_version)
+        self._logger.info("Checkpoint 已加载: %s (step=%d)", path, self._model_step)
         return True
 
-    def load_model_weights(self, path: str) -> bool:
-        """Load only model parameters into a fresh training lineage."""
+    def load_onnx_weights(self, path: str) -> bool:
+        """Load canonical SaveModel.onnx weights into a fresh training execution."""
         if (
-            self._model_version != 0
+            self._model_step != 0
             or self._optimizer.state
             or self._model_weights_inherited
         ):
@@ -710,38 +719,54 @@ class PPOTrainer:
                 "model weights can only be inherited by a fresh trainer"
             )
         if not os.path.isfile(path):
-            self._logger.warning("Checkpoint 不存在: %s", path)
+            self._logger.warning("ONNX 模型不存在: %s", path)
             return False
         try:
-            checkpoint = torch.load(
-                path, map_location=self._device, weights_only=False
-            )
-        except TypeError:
-            checkpoint = torch.load(path, map_location=self._device)
-        if not isinstance(checkpoint, Mapping):
-            raise RuntimeError("inherited checkpoint is not a mapping")
-        source_state = checkpoint.get("model_state_dict")
-        if not isinstance(source_state, Mapping):
-            raise RuntimeError("inherited checkpoint has no model state")
+            document = onnx.load(path, load_external_data=False)
+            onnx.checker.check_model(document)
+        except Exception as error:
+            raise RuntimeError("inherited ONNX model is invalid") from error
+        if any(initializer.external_data for initializer in document.graph.initializer):
+            raise RuntimeError("inherited ONNX model must be self-contained")
+        if [item.name for item in document.graph.input] != ["observation"]:
+            raise RuntimeError("inherited ONNX input contract does not match")
+        if [item.name for item in document.graph.output] != [
+            "action_logits",
+            "value",
+        ]:
+            raise RuntimeError("inherited ONNX output contract does not match")
+
+        initializers = {
+            initializer.name: initializer
+            for initializer in document.graph.initializer
+        }
         target_state = self._model.state_dict()
-        if set(source_state) != set(target_state):
-            raise RuntimeError("inherited model parameter names do not match")
+        if set(initializers) != set(target_state):
+            raise RuntimeError("inherited ONNX parameter names do not match")
+        source_state = {}
         for name, target in target_state.items():
-            source = source_state[name]
-            if (
-                not isinstance(source, torch.Tensor)
-                or source.shape != target.shape
-                or source.dtype != target.dtype
-            ):
-                raise RuntimeError(
-                    f"inherited model parameter is incompatible: {name}"
+            try:
+                array = np.array(
+                    numpy_helper.to_array(initializers[name]), copy=True
                 )
+            except Exception as error:
+                raise RuntimeError(
+                    f"inherited ONNX parameter is unreadable: {name}"
+                ) from error
+            source = torch.from_numpy(array)
+            if source.shape != target.shape or source.dtype != target.dtype:
+                raise RuntimeError(
+                    f"inherited ONNX parameter is incompatible: {name}"
+                )
+            if not torch.isfinite(source).all():
+                raise RuntimeError(
+                    f"inherited ONNX parameter is non-finite: {name}"
+                )
+            source_state[name] = source.to(self._device)
         self._model.load_state_dict(source_state, strict=True)
         self._model_weights_inherited = True
-        # The optimizer, RNG, counters and publication identity intentionally
-        # remain those of this newly constructed trainer.
         self._logger.info(
-            "Checkpoint 模型权重已继承: %s (new lineage version=0)", path
+            "ONNX 模型权重已继承: %s (fresh training step=0)", path
         )
         return True
 
@@ -752,9 +777,9 @@ class PPOTrainer:
         return self._model
 
     @property
-    def model_version(self) -> int:
-        """返回当前模型版本号"""
-        return self._model_version
+    def model_step(self) -> int:
+        """返回当前公开训练模型步长。"""
+        return self._model_step
 
     @property
     def obs_dim(self) -> int:
@@ -791,5 +816,5 @@ class PPOTrainer:
             "learning_rate": self._lr,
             "policy_lag": policy_lag,
             "max_policy_lag": self._max_policy_lag,
-            "model_version": self._model_version,
+            "model_step": self._model_step,
         }

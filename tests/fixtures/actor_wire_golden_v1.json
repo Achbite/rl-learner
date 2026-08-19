@@ -8,7 +8,7 @@
   },
   "wire_dtype": "float32",
   "temperature": 1.0,
-  "behavior_model_version": 0,
+  "behavior_model_step": 0,
   "observation": [
     0.0,
     0.6931471824645996,

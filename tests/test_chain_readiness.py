@@ -6,7 +6,7 @@ from main.training_runtime import training_chain_status
 def identity(version: int, artifact: str) -> dict:
     return {
         "model_lineage_id": "maze-fixed-map-seed-0",
-        "model_version": version,
+        "model_step": version,
         "artifact_digest": artifact * 64,
         "manifest_digest": chr(ord(artifact) + 1) * 64,
     }
@@ -19,9 +19,11 @@ class TrainingChainReadinessTest(unittest.TestCase):
         return (
             {
                 "ready": True,
+                "state": "AISERVER_STATE_READY",
                 "instance_id": "actor-current",
                 "client_session_recent": True,
                 "model_identity": actor_model,
+                "staged_model_identity": {},
             },
             {
                 "ready": True,
@@ -48,6 +50,8 @@ class TrainingChainReadinessTest(unittest.TestCase):
         chain = training_chain_status(*self.healthy_components())
         self.assertTrue(chain["ready"])
         self.assertEqual(chain["model_lag"], 1)
+        self.assertEqual(chain["model_sync"]["state"], "catching_up")
+        self.assertEqual(chain["model_sync"]["lag"], 1)
 
     def test_rejects_digest_or_ack_identity_mismatch(self):
         actor, pool, learner, model = self.healthy_components()
@@ -79,7 +83,3 @@ class TrainingChainReadinessTest(unittest.TestCase):
         learner["policy_lag"] = 2
         chain = training_chain_status(actor, pool, learner, model)
         self.assertIn("training_policy_lag_invalid", chain["reasons"])
-
-
-if __name__ == "__main__":
-    unittest.main()

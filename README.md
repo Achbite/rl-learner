@@ -2,94 +2,101 @@
 
 简体中文 | [English](README.en.md)
 
-Learner 容器内运行 PPO、Sample Pool、Model Distributor 和可选监控。完整三端链路请从 [rl-framework](../rl-framework/README.md) 启动。
+Learner 容器内运行 PPO、LocalSampleService、ModelDistributor 和可选监控。本地完整三端链路由开发者分别启动 Learner、AIServer 和 Client；Framework 只提供只读诊断，不参与运行编排。
 
-## 1. 准备制品
-
-在八仓同级目录中依次执行：
+## 1. 组件开发环境
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh)
-(cd rl-sample-pool && bash build_artifact.sh)
-(cd rl-model-distributor && bash build_artifact.sh)
-(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
-```
-
-构建 Learner 镜像；该命令同时生成匹配版本的 smoke model：
-
-```bash
-RL_LEARNER_IMAGE_TAG=training-001 bash build_image.sh
-```
-
-## 2. 组件开发环境
-
-```bash
-# 从已经构建的 training-001 运行镜像构建开发镜像
-LEARNER_IMAGE_TAG=training-001 make dev-image
-
-# 进入源码挂载容器
+# 宿主机：自动准备 dirty-capable 开发依赖、构建或复用开发镜像并进入容器
 make shell
 
-# Python 编译检查
+# 宿主机：复用同一开发镜像和依赖身份进行编译
 make build
 
-# 运行测试
-make test
+# 容器内：唯一测试入口（测试清单受 TCR 管理）
+bash ./test.sh
 ```
 
-## 3. 启动 Learner 侧服务
+开发入口不依赖旧 runtime image，也不要求正式 0.13 artifact 或 clean source。开发依赖只写入
+`.workspace/dev-artifacts`，不得用于正式镜像。`make shell` 只能在宿主机执行。
 
-新 Run 会清空 Learner 自己的 `models/local-train`，从模型版本 0 开始：
+## 2. 启动 Learner 侧服务
+
+进入容器后修改 config，并直接启动 Learner。Learner 只有 training workload，不接受位置 workload：
 
 ```bash
-bash scripts/dev_container.sh training --new-run
+./run.sh --help
+./run.sh --config configs/learner_config.yaml
 ```
 
-正常停止后继续同一个 Run 时不要传 `--new-run`：
+`--help` 只打印实际支持的覆盖项及对应 config 字段，不启动 Sample Pool、Model Distributor、
+PPO 或监控进程。
 
-```bash
-bash scripts/dev_container.sh training
-```
+`configs/learner_config.yaml` 是完整默认事实源；启动时只执行一次
+`config -> RL_PPO_*/RL_TRAINING_* 白名单环境覆盖 -> CLI 覆盖 -> 校验`。支持的业务 CLI
+只有 `--initial-model`、`--model-distributor`、`--aiserver` 和 `--metrics-port`，分别覆盖
+config 中已经存在的 warm-start、Distributor、AIServer 和 Dashboard 字段。`run.sh` 与 PPO
+Runtime 复用同一解析器，shell 不保存第二套训练目录、端点或端口默认值。相对路径统一相对
+所选 config 文件所在目录解析。
 
-这只启动 Learner 侧服务；没有 AIServer 和 Client 时会等待链路。完整训练请使用 Framework。
+每次 invocation 都是新的 task-neutral 训练。Learner 只看到自己的直接 `models/train`，不接收
+也不理解平台 `task_id/run_id`；`model_step`、Update、样本计数和优化器状态均从 0 开始。
+`run.sh` 取得同级 workspace lock 后会清空 config 指定的 `model.local_train_dir`，然后生成
+新的内部 lineage 并发布随机 `0000000`。该目录必须以 `/train` 结尾且不能是符号链接；清理
+范围严格限制在这个目录的子项。需要保留或继承的模型必须在下一次启动前复制到该目录之外。
+
+没有 AIServer 时，Learner 默认无限等待 AIServer 对 bootstrap 模型的 exact ACK，并保持
+Sample Pool、Model Distributor 和监控存活；等待只会因 exact ACK、显式 `SIGINT/SIGTERM`
+或 config 中显式设置的正数 `aiserver_status.initial_model_ack_timeout_sec` 结束。Client 可以在
+AIServer ready 后再启动。
 
 launcher 会打印本次可用的监控 URL。`9005` 只属于可选观测，端口或监控失败不会终止 PPO。
 
-## 4. 从已有模型开始新 Run
+## 3. 从已有模型开始全新训练
 
-将完整保存点放在 `models/local-train` 之外、容器可读取的位置，例如：
+指定要继承的 `SaveModel.onnx` 文件：
 
 ```text
-models/import/000200/
+models/save/0002355/
   SaveModel.onnx
-  checkpoint.pt
-  manifest.json
-  metadata.json
 ```
 
 启动：
 
 ```bash
-bash scripts/dev_container.sh training \
-  --new-run \
-  --initial-model-dir /workspace/rl-learner/models/import/000200
+./run.sh --config configs/learner_config.yaml \
+  --initial-model /workspace/rl-learner/models/save/0002355/SaveModel.onnx
 ```
 
-该入口只继承模型权重和来源信息；新 lineage 的模型版本、优化器、RNG、更新数和样本计数从 0 开始。
+该入口只读取显式文件的权重；它仍是全新独立训练，launcher 自动生成新的内部模型 lineage，`model_step`、优化器、RNG、更新数和样本计数从 0 开始。
+config 的 `model.initial_model_path` 默认为 `null`；在 config 中显式设置路径，或使用
+`--initial-model` 覆盖，都会触发同一种权重继承。两种方式都必须直接指向常规、非符号链接的
+`SaveModel.onnx`，且不能位于本次新的 `model.local_train_dir` 中。
 
-## 5. 归档与恢复
+## 4. 训练模型包
 
-每次完整发布使用同一布局：
+每次完整发布使用同一公开布局；checkpoint 只存在于本次训练的私有 runtime：
 
 ```text
-models/local-train/archive/000200/
+models/train/0000200/
   SaveModel.onnx
-  checkpoint.pt
   manifest.json
   metadata.json
+
+models/train/runtime/checkpoints/
+  publication-0000200.checkpoint.pt
 ```
 
-正常停止保留归档和运行状态；不带 `--new-run` 的下一次启动恢复同一个 Run。只有显式 `--new-run` 才清理 Learner 本地 Run 数据。
+正常停止不会立即删除公开模型包；它们会保留到下一次 `run.sh` 清空同一个
+`model.local_train_dir`。私有 checkpoint 不属于模型包，也不能作为后续训练的入口；要保留或
+继承某个模型，必须先将 `SaveModel.onnx` 放到训练目录之外，再通过 config 或
+`--initial-model` 显式读取。后续训练不会自动恢复旧 Update。
+
+## 5. 正式制品与镜像
+
+只有 Level 1/2 通过、用户 Review 并形成 clean savepoint 后，才在宿主机依次构建正式
+Contracts/Pool/Distributor artifact、同步 runtime 依赖并运行 `bash build_image.sh`。正式脚本
+不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录。
 
 ## 6. 端口
 

@@ -121,27 +121,29 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "learner.model_step.v1", "Model Step", "training_depth",
         "model_step", "step", "learner", "latest", "gauge",
+        ("learner", "model_step"),
         ("metric_event_views", "train_updates", "latest", "values",
-         "latest_model_version"),
-        ("learner", "model_version"), ("model", "latest_version"),
-        ("model_version",),
+         "latest_model_step"), ("model", "latest_step"),
+        ("model_step",),
     ),
     _metric_definition(
         "learner.train_update.total.v1", "Train Update", "training_depth",
         "train_update", "update", "learner", "total", "counter",
+        ("learner", "train_updates"),
         ("metric_event_views", "train_updates", "latest", "values",
          "latest_train_update_sequence"),
-        ("learner", "run_train_updates"), ("learner", "train_updates"),
+        ("learner", "run_train_updates"),
         ("train_step",),
     ),
     _metric_definition(
         "learner.trained_samples.total.v1", "Trained Samples",
         "training_depth", "sample_count", "samples", "learner", "total",
         "counter",
+        ("learner", "trained_samples"),
         ("metric_event_views", "train_updates", "latest", "values",
          "latest_cumulative_trained_samples"),
         ("learner", "run_trained_samples"),
-        ("learner", "trained_samples"), ("trained_samples",),
+        ("trained_samples",),
     ),
     _metric_definition(
         "server.episode.max_steps.current.v1", "Episode Max Steps",
@@ -372,48 +374,42 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "sample.flow.accepted.total.v1", "Accepted Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "total", "counter",
-        ("distributor", "accepted"),
+        ("sample_pool", "accepted"),
     ),
     _metric_definition(
         "sample.flow.acknowledged.total.v1", "Acknowledged Samples",
         "sample_flow", "sample_count", "samples", "sample_chain", "total",
-        "counter", ("distributor", "acked"),
+        "counter", ("sample_pool", "acked"),
     ),
     _metric_definition(
         "sample.flow.trained.total.v1", "Trained Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "total", "counter",
-        ("distributor", "trained"), ("trained_samples",),
+        ("sample_pool", "trained"), ("trained_samples",),
     ),
     _metric_definition(
         "sample.flow.invalid.total.v1", "Invalid Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "total", "counter",
-        ("distributor", "invalid"),
+        ("sample_pool", "invalid"),
     ),
     _metric_definition(
         "sample.flow.stale.total.v1", "Stale Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "total", "counter",
-        ("distributor", "stale"),
-    ),
-    _metric_definition(
-        "sample.flow.producer_stale_before_ingress.total.v1",
-        "Producer Stale Before Ingress", "sample_flow", "sample_count",
-        "samples", "server", "total", "counter",
-        ("actor", "producer_stale_before_ingress"),
+        ("sample_pool", "stale"),
     ),
     _metric_definition(
         "sample.flow.shutdown_untrained.total.v1", "Shutdown Untrained",
         "sample_flow", "sample_count", "samples", "sample_chain", "total",
-        "counter", ("distributor", "shutdown_untrained"),
+        "counter", ("sample_pool", "shutdown_untrained"),
     ),
     _metric_definition(
         "sample.flow.ready.total.v1", "Ready Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "latest", "gauge",
-        ("distributor", "ready_samples"),
+        ("sample_pool", "ready_samples"),
     ),
     _metric_definition(
         "sample.flow.leased.total.v1", "Leased Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "latest", "gauge",
-        ("distributor", "leased_samples"),
+        ("sample_pool", "leased_samples"),
     ),
     _metric_definition(
         "sample.flow.outbound_pending.total.v1", "Outbound Pending",
@@ -486,7 +482,7 @@ _STATIC_METRIC_DEFINITIONS = (
     ),
     _metric_definition(
         "learner.ppo.policy_lag.v1", "Policy Lag", "ppo_stability",
-        "model_step", "version", "train_update", "latest", "gauge",
+        "model_step", "step", "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "policy_lag", "mean"),
         ("learner", "policy_lag"), ("policy_lag",),
@@ -698,6 +694,12 @@ class MetricsFileReader:
                 for path in glob.glob(
                     os.path.join(self._metrics_dir, "metrics_*.jsonl")
                 ):
+                    try:
+                        legacy_source_eligible = (
+                            os.path.getmtime(path) >= self._started_at - 5.0
+                        )
+                    except OSError:
+                        legacy_source_eligible = False
                     self._files.setdefault(
                         path,
                         {
@@ -705,6 +707,7 @@ class MetricsFileReader:
                             "pending": b"",
                             "discarding_oversize_line": False,
                             "corrupt": 0,
+                            "legacy_source_eligible": legacy_source_eligible,
                         },
                     )
             for path, state in list(self._files.items()):
@@ -742,9 +745,14 @@ class MetricsFileReader:
                 if not raw_line.strip():
                     continue
                 try:
-                    self._records.append(
-                        json.loads(raw_line.decode("utf-8"))
-                    )
+                    record = json.loads(raw_line.decode("utf-8"))
+                    record_source_id = record.get("metrics_source_id")
+                    if record_source_id is None:
+                        if not state.get("legacy_source_eligible", False):
+                            continue
+                    elif record_source_id != self._metrics_source_id:
+                        continue
+                    self._records.append(record)
                     self._total_record_count += 1
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
                     state["corrupt"] += 1
@@ -862,15 +870,15 @@ class MetricsFileReader:
 
     def summary(self):
         latest = self.latest()
-        distributor = latest.get("distributor", {})
+        sample_pool = latest.get("sample_pool", {})
         rates = latest.get("rates", {})
         chain = latest.get("chain", {})
         return {
             "mode": latest.get("mode", ""),
             "sequence": latest.get("sequence", 0),
-            "consumed": distributor.get("acked", 0),
+            "consumed": sample_pool.get("acked", 0),
             "consumer_sps": rates.get("trained_sps", 0.0),
-            "queue_size": distributor.get("ready_samples", 0),
+            "queue_size": sample_pool.get("ready_samples", 0),
             "chain_ready": chain.get("ready", False),
         }
 
@@ -1028,7 +1036,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Serve the current training metrics API"
     )
-    parser.add_argument("--dir", "-d", default="models/local-train/metrics")
+    parser.add_argument("--dir", "-d", required=True)
     parser.add_argument("--port", "-p", type=int, default=9005)
     parser.add_argument(
         "--source-id",
@@ -1051,7 +1059,10 @@ def main():
         allow_reuse_address = True
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), MetricsHTTPHandler)
-    print(f"[MetricsServer] http://0.0.0.0:{args.port}")
+    print(f"[MetricsServer] container listener: http://0.0.0.0:{args.port}")
+    public_url = os.environ.get("RL_METRICS_PUBLIC_URL", "").strip()
+    if public_url:
+        print(f"[MetricsServer] Learner Monitor: {public_url}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

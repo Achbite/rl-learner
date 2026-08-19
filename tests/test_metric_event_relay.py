@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from proto import common_pb2, training_pb2
+from proto import training_pb2
 from src.contracts.identity import service_identity
 from src.metrics.metric_events import (
     AIServerMetricRelay,
@@ -14,11 +14,23 @@ from tests.test_metric_event_store import contract, episode_batch
 
 
 class _Logger:
-    def warning(self, *_args, **_kwargs):
-        pass
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+        self.errors = []
 
-    def error(self, *_args, **_kwargs):
-        pass
+    @staticmethod
+    def _format(message, args):
+        return message % args if args else message
+
+    def info(self, message, *args, **_kwargs):
+        self.infos.append(self._format(message, args))
+
+    def warning(self, message, *args, **_kwargs):
+        self.warnings.append(self._format(message, args))
+
+    def error(self, message, *args, **_kwargs):
+        self.errors.append(self._format(message, args))
 
 
 class _StatusStub:
@@ -129,7 +141,3 @@ class AIServerMetricRelayTest(unittest.TestCase):
             self.assertEqual(event_stub.gets, [])
             self.assertEqual(recovered.snapshot()["pending_batch_count"], 0)
             recovered.close()
-
-
-if __name__ == "__main__":
-    unittest.main()

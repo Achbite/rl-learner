@@ -1,4 +1,5 @@
 import copy
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,12 +13,10 @@ from main.training_runtime import (
     ModelPublisher,
     TrainingRuntime,
     atomic_write_json,
-    read_json,
 )
 from proto import training_pb2
 from src.contracts.identity import (
     canonical_config_digest,
-    manifest_message,
     service_identity,
     training_config_document,
 )
@@ -52,7 +51,7 @@ def samples(behavior_version: int) -> list[dict]:
             "old_value_prediction": 0.1,
             "advantage": 0.5,
             "td_return": 0.6,
-            "behavior_model_version": behavior_version,
+            "behavior_model_step": behavior_version,
         },
         {
             "observation": [0.1] * 17,
@@ -61,7 +60,7 @@ def samples(behavior_version: int) -> list[dict]:
             "old_value_prediction": 0.2,
             "advantage": -0.25,
             "td_return": -0.05,
-            "behavior_model_version": behavior_version,
+            "behavior_model_step": behavior_version,
         },
     ]
 
@@ -77,7 +76,7 @@ class FakeModelDistributor:
         self.runtime = runtime
         self.authority = model_authority()
         self.registry = {
-            int(manifest.identity.model_version): copy.deepcopy(manifest)
+            int(manifest.identity.model_step): copy.deepcopy(manifest)
             for manifest in manifests
         }
         self.register_requests = []
@@ -93,8 +92,8 @@ class FakeModelDistributor:
         if self.registry:
             latest = self.registry[max(self.registry)]
             response.latest_model.CopyFrom(latest.identity)
-            response.available_floor_model_version = min(self.registry)
-            response.latest_available_model_version = max(self.registry)
+            response.available_floor_model_step = min(self.registry)
+            response.latest_available_model_step = max(self.registry)
         if self.ack_version is not None:
             response.latest_ack_status = training_pb2.MODEL_LOAD_STATUS_LOADED
             response.latest_ack_model.CopyFrom(
@@ -106,7 +105,7 @@ class FakeModelDistributor:
         if request.latest_in_lineage:
             version = max(self.registry, default=None)
         else:
-            requested = int(request.requested_model.model_version)
+            requested = int(request.requested_model.model_step)
             version = requested if requested in self.registry else None
         if version is None:
             return training_pb2.GetModelManifestRsp(
@@ -120,14 +119,14 @@ class FakeModelDistributor:
             distributor=self.authority,
         )
         response.manifest.CopyFrom(self.registry[version])
-        response.available_floor_model_version = min(self.registry)
-        response.latest_available_model_version = max(self.registry)
+        response.available_floor_model_step = min(self.registry)
+        response.latest_available_model_step = max(self.registry)
         return response
 
     def RegisterModel(self, request, timeout):
         manifest = copy.deepcopy(request.manifest)
         self.register_requests.append(manifest)
-        version = int(manifest.identity.model_version)
+        version = int(manifest.identity.model_step)
         existing = self.registry.get(version)
         if existing is not None and existing != manifest:
             return training_pb2.RegisterModelRsp(
@@ -205,8 +204,8 @@ class CheckpointResumePublicationTest(unittest.TestCase):
         )
         for update in range(1, updates + 1):
             stats = trainer.train_on_batch(
-                samples(trainer.model_version),
-                behavior_model_version=trainer.model_version,
+                samples(trainer.model_step),
+                behavior_model_step=trainer.model_step,
             )
             update_id = f"train-update-{update:08d}"
             publisher.commit_optimizer_checkpoint(
@@ -246,7 +245,7 @@ class CheckpointResumePublicationTest(unittest.TestCase):
     def test_inherited_publication_loads_only_weights_and_starts_at_v0(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _, source_trainer, source_publisher, source_manifest = (
+            _, source_trainer, source_publisher, _ = (
                 self.make_source(root)
             )
             child_cfg = config(root / "child")
@@ -258,13 +257,19 @@ class CheckpointResumePublicationTest(unittest.TestCase):
             )
             expected_fresh = PPOTrainer(child_cfg)
             expected_snapshot = self.trainer_snapshot(expected_fresh)
-
-            runtime = TrainingRuntime(
-                child_cfg, str(source_publisher.archive_path(1))
+            save_directory = root / "models" / "save" / "0000001"
+            save_directory.mkdir(parents=True)
+            shutil.copy2(
+                source_publisher.model_path(1),
+                save_directory / "SaveModel.onnx",
             )
+
+            initial_model = save_directory / "SaveModel.onnx"
+            child_cfg["model"]["initial_model_path"] = str(initial_model)
+            runtime = TrainingRuntime(child_cfg)
             try:
                 self.assertEqual(runtime._startup_mode, "inherited-weights")
-                self.assertEqual(runtime.trainer.model_version, 0)
+                self.assertEqual(runtime.trainer.model_step, 0)
                 self.assertEqual(runtime.train_updates, 0)
                 self.assertEqual(runtime.trained_samples, 0)
                 self.assert_nested_equal(
@@ -283,9 +288,9 @@ class CheckpointResumePublicationTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     runtime.publisher.initial_model_provenance[
-                        "initial_model_lineage_id"
+                        "initial_model_path"
                     ],
-                    source_manifest["identity"]["model_lineage_id"],
+                    str(initial_model),
                 )
                 runtime.model_stub = FakeModelDistributor(runtime)
                 runtime._wait_initial_model_loaded = mock.Mock()
@@ -293,7 +298,7 @@ class CheckpointResumePublicationTest(unittest.TestCase):
                 self.assertEqual(len(runtime.model_stub.register_requests), 1)
                 inherited = runtime.publisher.complete_manifest(0)
                 self.assertIsNotNone(inherited)
-                self.assertEqual(inherited["identity"]["model_version"], 0)
+                self.assertEqual(inherited["identity"]["model_step"], 0)
                 self.assertEqual(
                     inherited["identity"]["model_lineage_id"], "child-lineage"
                 )
@@ -301,8 +306,7 @@ class CheckpointResumePublicationTest(unittest.TestCase):
                     inherited["train_update_id"], "inherited-bootstrap-v0"
                 )
                 self.assertEqual(
-                    inherited["initial_model_version"],
-                    source_manifest["identity"]["model_version"],
+                    inherited["initial_model_path"], str(initial_model)
                 )
             finally:
                 self.close_runtime(runtime)
@@ -311,94 +315,42 @@ class CheckpointResumePublicationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cfg, _, publisher, _ = self.make_source(root)
-            checkpoint = str(publisher.checkpoint_path(1))
+            model = str(publisher.model_path(1))
             trainer = PPOTrainer(cfg)
-            self.assertTrue(trainer.load_model_weights(checkpoint))
+            self.assertTrue(trainer.load_onnx_weights(model))
             with self.assertRaisesRegex(RuntimeError, "fresh trainer"):
-                trainer.load_model_weights(checkpoint)
+                trainer.load_onnx_weights(model)
 
             trained = PPOTrainer(cfg)
-            trained.train_on_batch(samples(0), behavior_model_version=0)
+            trained.train_on_batch(samples(0), behavior_model_step=0)
             with self.assertRaisesRegex(RuntimeError, "fresh trainer"):
-                trained.load_model_weights(checkpoint)
+                trained.load_onnx_weights(model)
 
-    def test_same_run_resume_restores_exact_state_without_republication(self):
+    def test_previous_workspace_is_never_auto_resumed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            cfg, source_trainer, publisher, manifest = self.make_source(root)
-            expected = self.trainer_snapshot(source_trainer)
-            runtime = TrainingRuntime(cfg)
-            try:
-                self.assertEqual(runtime._startup_mode, "same-run-resume")
-                self.assertEqual(runtime.trainer.model_version, 1)
-                self.assertEqual(runtime.train_updates, 1)
-                self.assertEqual(runtime.trained_samples, 2)
-                self.assert_nested_equal(
-                    expected, self.trainer_snapshot(runtime.trainer)
-                )
-                runtime.model_stub = FakeModelDistributor(runtime)
-                runtime._wait_initial_model_loaded = mock.Mock()
-                with mock.patch.object(
-                    runtime.publisher,
-                    "publish_runtime",
-                    wraps=runtime.publisher.publish_runtime,
-                ) as publish:
-                    runtime._initialize_models()
-                publish.assert_not_called()
-                self.assertEqual(len(runtime.model_stub.register_requests), 1)
-                self.assertEqual(
-                    runtime.model_stub.register_requests[0].identity.model_version,
-                    1,
-                )
-                self.assertEqual(
-                    runtime.model_manifests[1]["identity"],
-                    manifest["identity"],
-                )
-                self.assertEqual(runtime.initial_model_version, 0)
-                self.assertTrue(publisher.archive_path(1).is_dir())
-            finally:
-                self.close_runtime(runtime)
-
-    def test_same_run_resume_rejects_import_and_unsettled_receipt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            cfg, _, publisher, _ = self.make_source(root)
-            with self.assertRaisesRegex(RuntimeError, "cannot also inherit"):
-                TrainingRuntime(cfg, str(publisher.archive_path(1)))
-
-            receipt_path = publisher.receipt_path("train-update-00000001")
-            receipt = read_json(receipt_path)
-            receipt["state"] = "ACK_PENDING"
-            atomic_write_json(receipt_path, receipt)
-            with self.assertRaisesRegex(RuntimeError, "not settled"):
+            cfg, _, _, _ = self.make_source(root)
+            with self.assertRaisesRegex(RuntimeError, "previous state"):
                 ModelPublisher(cfg).prepare()
 
-    def test_same_run_resume_rejects_staged_or_corrupt_state(self):
+    def test_initial_model_requires_an_explicit_onnx_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            cfg, _, publisher, _ = self.make_source(root)
-            staged = publisher.staged_checkpoint_path(2)
-            staged.write_bytes(b"incomplete")
-            with self.assertRaisesRegex(RuntimeError, "incomplete transaction"):
-                ModelPublisher(cfg).prepare()
-            staged.unlink()
-
-            state = read_json(publisher.state_path)
-            state["train_updates"] = 99
-            atomic_write_json(publisher.state_path, state)
-            with self.assertRaisesRegex(RuntimeError, "does not match"):
-                ModelPublisher(cfg).prepare()
-
-    def test_initial_model_directory_must_be_exact_four_file_publication(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _, _, publisher, _ = self.make_source(root)
-            source = publisher.archive_path(1)
-            (source / "extra.txt").write_text("not canonical\n")
             child = ModelPublisher(config(root / "child"))
             self.assertEqual(child.prepare(), "fresh")
-            with self.assertRaisesRegex(RuntimeError, "exactly"):
-                child.load_initial_model_directory(PPOTrainer(child.config), str(source))
+            model_directory = root / "models" / "save" / "2355"
+            model_directory.mkdir(parents=True)
+            (model_directory / "SaveModel.onnx").write_bytes(b"not-used")
+            with self.assertRaisesRegex(RuntimeError, "explicit SaveModel.onnx"):
+                child.load_initial_model(
+                    PPOTrainer(child.config), str(model_directory)
+                )
+            wrong_name = model_directory / "model.onnx"
+            wrong_name.write_bytes(b"not-used")
+            with self.assertRaisesRegex(RuntimeError, "explicit SaveModel.onnx"):
+                child.load_initial_model(
+                    PPOTrainer(child.config), str(wrong_name)
+                )
 
     def test_archive_cadence_uses_global_train_updates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -407,7 +359,3 @@ class CheckpointResumePublicationTest(unittest.TestCase):
             self.assertFalse(publisher.should_mark_permanent(1))
             self.assertTrue(publisher.should_mark_permanent(2))
             self.assertFalse(publisher.should_mark_permanent(3))
-
-
-if __name__ == "__main__":
-    unittest.main()

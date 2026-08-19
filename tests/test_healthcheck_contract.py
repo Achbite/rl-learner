@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from scripts.healthcheck import main
@@ -24,33 +23,3 @@ class HealthcheckContractTest(unittest.TestCase):
                 side_effect=lambda port, failed=failed_port: port != failed,
             ):
                 self.assertEqual(main(), 1)
-
-    def test_optional_monitor_uses_dynamic_vm_port_mapping(self):
-        script = (
-            Path(__file__).resolve().parents[1]
-            / "scripts"
-            / "dev_container.sh"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn('--publish "127.0.0.1::9005"', script)
-        self.assertNotIn('--publish "127.0.0.1:9005:9005"', script)
-        self.assertIn('docker port "${container_name}" 9005/tcp', script)
-        self.assertIn(
-            'command -v ssh >/dev/null 2>&1; then\n        return 1',
-            script,
-        )
-        self.assertIn(
-            "Migrating stopped learner-dev from legacy fixed monitor port",
-            script,
-        )
-        self.assertIn("container_uses_contract_artifact", script)
-        self.assertIn("verify_contract_mount_permissions", script)
-        self.assertIn("verify_training_runtime_artifacts", script)
-        self.assertIn("scripts/verify_runtime_artifacts.py", script)
-        self.assertIn(
-            "Migrating learner-dev to contract artifact", script
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()

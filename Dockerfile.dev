@@ -1,16 +1,36 @@
-ARG LEARNER_RUNTIME_IMAGE=rl-training/learner:test-001
-FROM ${LEARNER_RUNTIME_IMAGE}
+ARG PYTHON_DEV_BASE_IMAGE=python@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6
+FROM ${PYTHON_DEV_BASE_IMAGE}
 
+ARG TORCH_VERSION=2.12.1+cpu
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    cmake \
     git \
+    libabsl-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    libssl-dev \
     make \
+    ninja-build \
+    pkg-config \
+    procps \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/rl-learner-dev-requirements.txt
 RUN pip install --no-cache-dir \
+        "torch==${TORCH_VERSION}" \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
         -r /tmp/rl-learner-dev-requirements.txt && \
     rm /tmp/rl-learner-dev-requirements.txt
 
+LABEL org.rl-training.dev-toolchain="python-3.11-debian13"
 WORKDIR /workspace/rl-learner
 ENTRYPOINT []
 CMD ["sleep", "infinity"]

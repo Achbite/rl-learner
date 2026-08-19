@@ -1,18 +1,22 @@
-"""Build and validate the exact rl-contracts 0.11.0 training identities."""
+"""Build and validate the exact rl-contracts 0.13.0 training identities."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import math
+import os
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.11.0"
+CONTRACT_VERSION = "0.13.0"
+RUNTIME_LINEAGE_PLACEHOLDER = "__FRESH_INTERNAL_LINEAGE_REQUIRED__"
+RUNTIME_LINEAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 REWARD_SCHEMA_ID = "maze.reward.v4"
 REWARD_SCHEMA_DIGEST = (
     "ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929"
@@ -52,7 +56,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the selected 0.11.0 artifact")
+        raise ValueError("contract identity is not the selected 0.13.0 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -110,6 +114,27 @@ def canonical_config_digest(document: Any) -> str:
     ).hexdigest()
 
 
+def bind_runtime_lineage(
+    config: dict,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
+    """Bind the fresh internal lineage without mutating the template."""
+    result = copy.deepcopy(config)
+    configured = str(result.get("identity", {}).get("model_lineage_id", ""))
+    selected_environment = os.environ if environment is None else environment
+    lineage = str(selected_environment.get("RL_MODEL_LINEAGE_ID", configured))
+    if (
+        not lineage
+        or lineage == RUNTIME_LINEAGE_PLACEHOLDER
+        or RUNTIME_LINEAGE.fullmatch(lineage) is None
+    ):
+        raise ValueError(
+            "the launcher must bind a fresh internal model lineage"
+        )
+    result["identity"]["model_lineage_id"] = lineage
+    return result
+
+
 def training_config_document(config: dict) -> dict:
     """Return the exact task-neutral configuration bound to model identity."""
     semantics = config["training_semantics"]
@@ -118,7 +143,6 @@ def training_config_document(config: dict) -> dict:
     return {
         "training_semantics_digest": semantics["semantics_digest"],
         "policy_spec_digest": config["policy"]["policy_spec_digest"],
-        "model_lineage_id": config["identity"]["model_lineage_id"],
         "training": {
             key: training[key]
             for key in (
@@ -149,7 +173,7 @@ def training_config_document(config: dict) -> dict:
             )
         },
         "sample": {
-            "train_batch_size": config["sample_distributor"][
+            "train_batch_size": config["sample_pool"][
                 "train_batch_size"
             ]
         },
@@ -158,15 +182,6 @@ def training_config_document(config: dict) -> dict:
 
 def training_config_digest(config: dict) -> common_pb2.ContentDigest:
     actual = canonical_config_digest(training_config_document(config))
-    configured = config["identity"].get("training_config_digest")
-    if configured is None:
-        raise ValueError("configured training_config_digest is required")
-    configured_digest = _digest(configured).hex
-    if configured_digest != actual:
-        raise ValueError(
-            "configured training_config_digest does not match the "
-            "canonical training configuration"
-        )
     return _digest(actual)
 
 
@@ -174,9 +189,19 @@ def model_identity(document: dict) -> training_pb2.ModelIdentity:
     identity = document["identity"]
     if not identity.get("model_lineage_id"):
         raise ValueError("model lineage is required")
+    if "model_version" in identity:
+        raise ValueError("legacy model_version is not accepted")
+    model_step = identity.get("model_step")
+    if (
+        isinstance(model_step, bool)
+        or not isinstance(model_step, int)
+        or model_step < 0
+        or model_step > (1 << 64) - 1
+    ):
+        raise ValueError("model_step must be a uint64 integer")
     return training_pb2.ModelIdentity(
         model_lineage_id=str(identity["model_lineage_id"]),
-        model_version=int(identity["model_version"]),
+        model_step=model_step,
         artifact_digest=_digest(identity["artifact_digest"]),
         manifest_digest=_digest(identity["manifest_digest"]),
     )
@@ -185,13 +210,19 @@ def model_identity(document: dict) -> training_pb2.ModelIdentity:
 def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
     return {
         "model_lineage_id": message.model_lineage_id,
-        "model_version": int(message.model_version),
+        "model_step": int(message.model_step),
         "artifact_digest": message.artifact_digest.hex,
         "manifest_digest": message.manifest_digest.hex,
     }
 
 
 def manifest_message(document: dict) -> training_pb2.ModelArtifactManifest:
+    if int(document["manifest_schema_version"]) != 2:
+        raise ValueError("training manifest_schema_version must be 2")
+    if "model_version" in document or "model_version" in document.get(
+        "identity", {}
+    ):
+        raise ValueError("legacy model_version is not accepted")
     message = training_pb2.ModelArtifactManifest(
         manifest_schema_version=int(document["manifest_schema_version"]),
         contract=contract_identity({"contract": document["contract"]}),
@@ -218,6 +249,11 @@ def manifest_message(document: dict) -> training_pb2.ModelArtifactManifest:
         int(value) for value in document["action_shape"]
     )
     message.value_shape.extend(int(value) for value in document["value_shape"])
+    if (
+        not message.identity.HasField("model_step")
+        or int(message.identity.model_step) != int(message.train_updates)
+    ):
+        raise ValueError("model_step must equal train_updates")
     return message
 
 
@@ -292,7 +328,7 @@ def validate_config(config: dict) -> None:
         "identity",
         "training_semantics",
         "contract",
-        "sample_distributor",
+        "sample_pool",
         "model_distributor",
         "aiserver_status",
         "dashboard",
@@ -302,16 +338,33 @@ def validate_config(config: dict) -> None:
     if missing:
         raise ValueError(f"missing config sections: {sorted(missing)}")
     contract_identity(config)
+    lineage = str(config["identity"].get("model_lineage_id", ""))
+    if lineage != RUNTIME_LINEAGE_PLACEHOLDER and (
+        not lineage or RUNTIME_LINEAGE.fullmatch(lineage) is None
+    ):
+        raise ValueError("identity.model_lineage_id is invalid")
     semantics = training_semantics(config)
     policy_spec_digest(config)
-    training_config_digest(config)
+    actual_training_digest = training_config_digest(config).hex
+    expected_training_digest = config["identity"].get(
+        "expected_training_config_digest"
+    )
+    if expected_training_digest is not None and (
+        _digest(expected_training_digest).hex != actual_training_digest
+    ):
+        raise ValueError(
+            "expected_training_config_digest does not match the effective "
+            "training configuration"
+        )
     model = config["model"]
     training = config["training"]
     policy = config["policy"]
     retired_model_fields = {
         "archive_on_graceful_shutdown",
         "initial_checkpoint",
+        "initial_model_dir",
         "serving_retention_versions",
+        "publication_retention_versions",
     }
     present_retired_fields = sorted(retired_model_fields.intersection(model))
     if present_retired_fields:
@@ -319,10 +372,20 @@ def validate_config(config: dict) -> None:
             "retired model publication fields are not allowed: "
             + ", ".join(present_retired_fields)
         )
+    if "initial_model_path" not in model:
+        raise ValueError("model.initial_model_path default is required")
+    initial_model_path = model["initial_model_path"]
+    if initial_model_path is not None and (
+        not isinstance(initial_model_path, str) or not initial_model_path
+    ):
+        raise ValueError("model.initial_model_path must be null or a path")
+    if not isinstance(model.get("local_train_dir"), str) or not model[
+        "local_train_dir"
+    ]:
+        raise ValueError("model.local_train_dir must be configured")
     if (
         int(model["archive_interval_updates"]) <= 0
-        or int(model["publication_retention_versions"]) < 101
-        or not isinstance(model["initial_model_dir"], str)
+        or int(model["publication_retention_steps"]) != 101
     ):
         raise ValueError("model publication parameters are invalid")
     if (
@@ -360,37 +423,82 @@ def validate_config(config: dict) -> None:
     ]
     for name, minimum, maximum, include_minimum in numeric_ranges:
         value = float(training[name])
-        if value > maximum or (
+        if not math.isfinite(value) or value > maximum or (
             value < minimum if include_minimum else value <= minimum
         ):
             raise ValueError(f"training.{name} is outside the locked range")
+    sample = config["sample_pool"]
+    train_batch_size = int(sample["train_batch_size"])
+    max_fragment_samples = int(sample["max_fragment_samples"])
+    max_train_batch_size = int(sample["max_train_batch_size"])
     if (
-        int(training["n_epochs"]) <= 0
+        isinstance(training["normalize_advantage"], bool) is False
+        or int(training["seed"]) < 0
+        or int(model["bootstrap_seed"]) < 0
+        or int(training["seed"]) != int(model["bootstrap_seed"])
+        or int(training["n_epochs"]) <= 0
         or int(training["mini_batch_size"]) <= 0
         or int(training["max_policy_lag"]) < 0
-        or int(config["sample_distributor"]["train_batch_size"]) != 512
-        or int(config["sample_distributor"]["max_train_batch_size"])
-        < int(config["sample_distributor"]["train_batch_size"])
-        or int(config["sample_distributor"]["max_sample_age_ms"]) <= 0
-        or int(config["sample_distributor"]["finalize_drain_timeout_ms"])
+        or int(model["publication_retention_steps"])
+        < int(training["max_policy_lag"]) + 1
+        or train_batch_size <= 0
+        or max_fragment_samples <= 0
+        or max_train_batch_size
+        != train_batch_size + max_fragment_samples - 1
+        or int(config["sample_pool"]["max_sample_age_ms"]) <= 0
+        or int(config["sample_pool"]["finalize_drain_timeout_ms"])
         <= 0
         or not str(
-            config["sample_distributor"]["finalize_request_path"]
+            config["sample_pool"]["finalize_request_path"]
         ).startswith("/")
         or not str(
-            config["sample_distributor"]["finalize_complete_path"]
+            config["sample_pool"]["finalize_complete_path"]
         ).startswith("/")
-        or config["sample_distributor"]["finalize_request_path"]
-        == config["sample_distributor"]["finalize_complete_path"]
-        or int(config["sample_distributor"]["demand_ttl_ms"]) <= 0
-        or int(config["sample_distributor"]["demand_refresh_interval_ms"])
-        <= 0
-        or int(config["sample_distributor"]["demand_refresh_interval_ms"])
-        >= int(config["sample_distributor"]["demand_ttl_ms"])
-        or int(config["sample_distributor"]["demand_max_fragments"]) <= 0
-        or int(
-            config["sample_distributor"]["demand_max_estimated_bytes"]
-        )
-        <= 0
+        or config["sample_pool"]["finalize_request_path"]
+        == config["sample_pool"]["finalize_complete_path"]
     ):
         raise ValueError("integer training parameters are invalid")
+    for section_name in (
+        "sample_pool",
+        "model_distributor",
+        "aiserver_status",
+    ):
+        section = config[section_name]
+        if not isinstance(section.get("host"), str) or not section["host"]:
+            raise ValueError(f"{section_name}.host must be configured")
+        port = section.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError(f"{section_name}.port must be in [1, 65535]")
+    if "startup_timeout_sec" in config["model_distributor"]:
+        raise ValueError(
+            "model_distributor.startup_timeout_sec is retired; initial model "
+            "ACK waiting belongs to aiserver_status"
+        )
+    if "initial_model_ack_timeout_sec" not in config["aiserver_status"]:
+        raise ValueError(
+            "aiserver_status.initial_model_ack_timeout_sec default is required"
+        )
+    initial_ack_timeout = config["aiserver_status"][
+        "initial_model_ack_timeout_sec"
+    ]
+    if initial_ack_timeout is not None and (
+        isinstance(initial_ack_timeout, bool)
+        or not isinstance(initial_ack_timeout, (int, float))
+        or not math.isfinite(float(initial_ack_timeout))
+        or float(initial_ack_timeout) <= 0.0
+    ):
+        raise ValueError(
+            "aiserver_status.initial_model_ack_timeout_sec must be null or "
+            "a positive finite number"
+        )
+    dashboard = config["dashboard"]
+    dashboard_port = dashboard.get("server_port")
+    if (
+        not isinstance(dashboard.get("enabled"), bool)
+        or isinstance(dashboard_port, bool)
+        or not isinstance(dashboard_port, int)
+        or not 1 <= dashboard_port <= 65535
+        or not isinstance(dashboard.get("backend"), str)
+        or not dashboard["backend"]
+    ):
+        raise ValueError("dashboard configuration is invalid")

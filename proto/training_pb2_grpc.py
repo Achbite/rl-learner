@@ -293,7 +293,7 @@ class LearnerService:
             _registered_method=True)
 
 
-class SampleDistributorServiceStub:
+class SamplePoolIngressServiceStub:
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -302,101 +302,150 @@ class SampleDistributorServiceStub:
         Args:
             channel: A grpc.Channel.
         """
-        self.UpsertSampleDemand = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/UpsertSampleDemand',
-                request_serializer=training__pb2.UpsertSampleDemandReq.SerializeToString,
-                response_deserializer=training__pb2.SampleDemandRsp.FromString,
-                _registered_method=True)
-        self.ReleaseSampleDemand = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/ReleaseSampleDemand',
-                request_serializer=training__pb2.ReleaseSampleDemandReq.SerializeToString,
-                response_deserializer=training__pb2.SampleDemandRsp.FromString,
-                _registered_method=True)
-        self.GetSampleDemandStatus = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/GetSampleDemandStatus',
-                request_serializer=training__pb2.GetSampleDemandStatusReq.SerializeToString,
-                response_deserializer=training__pb2.SampleDemandStatusRsp.FromString,
-                _registered_method=True)
-        self.AcquireSampleCredit = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/AcquireSampleCredit',
-                request_serializer=training__pb2.AcquireSampleCreditReq.SerializeToString,
-                response_deserializer=training__pb2.SampleCreditGrant.FromString,
-                _registered_method=True)
-        self.ReleaseSampleCredit = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/ReleaseSampleCredit',
-                request_serializer=training__pb2.ReleaseSampleCreditReq.SerializeToString,
-                response_deserializer=training__pb2.ReleaseSampleCreditRsp.FromString,
-                _registered_method=True)
         self.PushSamples = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/PushSamples',
+                '/rl.training.v1.SamplePoolIngressService/PushSamples',
                 request_serializer=training__pb2.PushSamplesReq.SerializeToString,
                 response_deserializer=training__pb2.PushSamplesRsp.FromString,
                 _registered_method=True)
-        self.GetBatch = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/GetBatch',
-                request_serializer=training__pb2.GetBatchReq.SerializeToString,
-                response_deserializer=training__pb2.GetBatchRsp.FromString,
-                _registered_method=True)
-        self.AckBatch = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/AckBatch',
-                request_serializer=training__pb2.AckBatchReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
-                _registered_method=True)
-        self.NackBatch = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/NackBatch',
-                request_serializer=training__pb2.NackBatchReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
-                _registered_method=True)
-        self.RenewLease = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/RenewLease',
-                request_serializer=training__pb2.RenewLeaseReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
-                _registered_method=True)
         self.GetStatus = channel.unary_unary(
-                '/rl.training.v1.SampleDistributorService/GetStatus',
-                request_serializer=training__pb2.DistributorStatusReq.SerializeToString,
-                response_deserializer=training__pb2.DistributorStatusRsp.FromString,
+                '/rl.training.v1.SamplePoolIngressService/GetStatus',
+                request_serializer=training__pb2.SamplePoolStatusReq.SerializeToString,
+                response_deserializer=training__pb2.SamplePoolStatusRsp.FromString,
                 _registered_method=True)
 
 
-class SampleDistributorServiceServicer:
+class SamplePoolIngressServiceServicer:
     """Missing associated documentation comment in .proto file."""
-
-    def UpsertSampleDemand(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ReleaseSampleDemand(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetSampleDemandStatus(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def AcquireSampleCredit(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ReleaseSampleCredit(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def PushSamples(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
+
+    def GetStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_SamplePoolIngressServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'PushSamples': grpc.unary_unary_rpc_method_handler(
+                    servicer.PushSamples,
+                    request_deserializer=training__pb2.PushSamplesReq.FromString,
+                    response_serializer=training__pb2.PushSamplesRsp.SerializeToString,
+            ),
+            'GetStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetStatus,
+                    request_deserializer=training__pb2.SamplePoolStatusReq.FromString,
+                    response_serializer=training__pb2.SamplePoolStatusRsp.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'rl.training.v1.SamplePoolIngressService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('rl.training.v1.SamplePoolIngressService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class SamplePoolIngressService:
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def PushSamples(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.SamplePoolIngressService/PushSamples',
+            training__pb2.PushSamplesReq.SerializeToString,
+            training__pb2.PushSamplesRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.SamplePoolIngressService/GetStatus',
+            training__pb2.SamplePoolStatusReq.SerializeToString,
+            training__pb2.SamplePoolStatusRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class SamplePoolConsumerServiceStub:
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.GetBatch = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/GetBatch',
+                request_serializer=training__pb2.GetBatchReq.SerializeToString,
+                response_deserializer=training__pb2.GetBatchRsp.FromString,
+                _registered_method=True)
+        self.AckBatch = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/AckBatch',
+                request_serializer=training__pb2.AckBatchReq.SerializeToString,
+                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                _registered_method=True)
+        self.NackBatch = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/NackBatch',
+                request_serializer=training__pb2.NackBatchReq.SerializeToString,
+                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                _registered_method=True)
+        self.RenewLease = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/RenewLease',
+                request_serializer=training__pb2.RenewLeaseReq.SerializeToString,
+                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                _registered_method=True)
+        self.GetStatus = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/GetStatus',
+                request_serializer=training__pb2.SamplePoolStatusReq.SerializeToString,
+                response_deserializer=training__pb2.SamplePoolStatusRsp.FromString,
+                _registered_method=True)
+
+
+class SamplePoolConsumerServiceServicer:
+    """Missing associated documentation comment in .proto file."""
 
     def GetBatch(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -429,38 +478,8 @@ class SampleDistributorServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
 
-def add_SampleDistributorServiceServicer_to_server(servicer, server):
+def add_SamplePoolConsumerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'UpsertSampleDemand': grpc.unary_unary_rpc_method_handler(
-                    servicer.UpsertSampleDemand,
-                    request_deserializer=training__pb2.UpsertSampleDemandReq.FromString,
-                    response_serializer=training__pb2.SampleDemandRsp.SerializeToString,
-            ),
-            'ReleaseSampleDemand': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReleaseSampleDemand,
-                    request_deserializer=training__pb2.ReleaseSampleDemandReq.FromString,
-                    response_serializer=training__pb2.SampleDemandRsp.SerializeToString,
-            ),
-            'GetSampleDemandStatus': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetSampleDemandStatus,
-                    request_deserializer=training__pb2.GetSampleDemandStatusReq.FromString,
-                    response_serializer=training__pb2.SampleDemandStatusRsp.SerializeToString,
-            ),
-            'AcquireSampleCredit': grpc.unary_unary_rpc_method_handler(
-                    servicer.AcquireSampleCredit,
-                    request_deserializer=training__pb2.AcquireSampleCreditReq.FromString,
-                    response_serializer=training__pb2.SampleCreditGrant.SerializeToString,
-            ),
-            'ReleaseSampleCredit': grpc.unary_unary_rpc_method_handler(
-                    servicer.ReleaseSampleCredit,
-                    request_deserializer=training__pb2.ReleaseSampleCreditReq.FromString,
-                    response_serializer=training__pb2.ReleaseSampleCreditRsp.SerializeToString,
-            ),
-            'PushSamples': grpc.unary_unary_rpc_method_handler(
-                    servicer.PushSamples,
-                    request_deserializer=training__pb2.PushSamplesReq.FromString,
-                    response_serializer=training__pb2.PushSamplesRsp.SerializeToString,
-            ),
             'GetBatch': grpc.unary_unary_rpc_method_handler(
                     servicer.GetBatch,
                     request_deserializer=training__pb2.GetBatchReq.FromString,
@@ -483,181 +502,19 @@ def add_SampleDistributorServiceServicer_to_server(servicer, server):
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
-                    request_deserializer=training__pb2.DistributorStatusReq.FromString,
-                    response_serializer=training__pb2.DistributorStatusRsp.SerializeToString,
+                    request_deserializer=training__pb2.SamplePoolStatusReq.FromString,
+                    response_serializer=training__pb2.SamplePoolStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'rl.training.v1.SampleDistributorService', rpc_method_handlers)
+            'rl.training.v1.SamplePoolConsumerService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('rl.training.v1.SampleDistributorService', rpc_method_handlers)
+    server.add_registered_method_handlers('rl.training.v1.SamplePoolConsumerService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class SampleDistributorService:
+class SamplePoolConsumerService:
     """Missing associated documentation comment in .proto file."""
-
-    @staticmethod
-    def UpsertSampleDemand(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/UpsertSampleDemand',
-            training__pb2.UpsertSampleDemandReq.SerializeToString,
-            training__pb2.SampleDemandRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ReleaseSampleDemand(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/ReleaseSampleDemand',
-            training__pb2.ReleaseSampleDemandReq.SerializeToString,
-            training__pb2.SampleDemandRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetSampleDemandStatus(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/GetSampleDemandStatus',
-            training__pb2.GetSampleDemandStatusReq.SerializeToString,
-            training__pb2.SampleDemandStatusRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def AcquireSampleCredit(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/AcquireSampleCredit',
-            training__pb2.AcquireSampleCreditReq.SerializeToString,
-            training__pb2.SampleCreditGrant.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ReleaseSampleCredit(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/ReleaseSampleCredit',
-            training__pb2.ReleaseSampleCreditReq.SerializeToString,
-            training__pb2.ReleaseSampleCreditRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def PushSamples(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.SampleDistributorService/PushSamples',
-            training__pb2.PushSamplesReq.SerializeToString,
-            training__pb2.PushSamplesRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
 
     @staticmethod
     def GetBatch(request,
@@ -673,7 +530,7 @@ class SampleDistributorService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.SampleDistributorService/GetBatch',
+            '/rl.training.v1.SamplePoolConsumerService/GetBatch',
             training__pb2.GetBatchReq.SerializeToString,
             training__pb2.GetBatchRsp.FromString,
             options,
@@ -700,7 +557,7 @@ class SampleDistributorService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.SampleDistributorService/AckBatch',
+            '/rl.training.v1.SamplePoolConsumerService/AckBatch',
             training__pb2.AckBatchReq.SerializeToString,
             training__pb2.DeliveryRsp.FromString,
             options,
@@ -727,7 +584,7 @@ class SampleDistributorService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.SampleDistributorService/NackBatch',
+            '/rl.training.v1.SamplePoolConsumerService/NackBatch',
             training__pb2.NackBatchReq.SerializeToString,
             training__pb2.DeliveryRsp.FromString,
             options,
@@ -754,7 +611,7 @@ class SampleDistributorService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.SampleDistributorService/RenewLease',
+            '/rl.training.v1.SamplePoolConsumerService/RenewLease',
             training__pb2.RenewLeaseReq.SerializeToString,
             training__pb2.DeliveryRsp.FromString,
             options,
@@ -781,9 +638,9 @@ class SampleDistributorService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.SampleDistributorService/GetStatus',
-            training__pb2.DistributorStatusReq.SerializeToString,
-            training__pb2.DistributorStatusRsp.FromString,
+            '/rl.training.v1.SamplePoolConsumerService/GetStatus',
+            training__pb2.SamplePoolStatusReq.SerializeToString,
+            training__pb2.SamplePoolStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,

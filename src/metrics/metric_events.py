@@ -20,8 +20,8 @@ from proto import common_pb2, training_pb2, training_pb2_grpc
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-METRIC_SCHEMA_ID = "maze.metrics.v2"
-METRIC_SCHEMA_VERSION = 2
+METRIC_SCHEMA_ID = "maze.metrics.v3"
+METRIC_SCHEMA_VERSION = 3
 
 
 class MetricEventContractError(ValueError):
@@ -38,6 +38,13 @@ def _copy_message(message):
     result = type(message)()
     result.CopyFrom(message)
     return result
+
+
+def _has_field(message, name: str) -> bool:
+    try:
+        return bool(message.HasField(name))
+    except (AttributeError, ValueError):
+        return False
 
 
 def _source_key(source: common_pb2.ServiceInstanceIdentity) -> str:
@@ -117,8 +124,8 @@ class MetricSchemaCatalog:
 
     @classmethod
     def load(cls, directory: Path) -> "MetricSchemaCatalog":
-        catalog_path = directory / "maze.metrics.v2.json"
-        digest_path = directory / "maze.metrics.v2.sha256"
+        catalog_path = directory / "maze.metrics.v3.json"
+        digest_path = directory / "maze.metrics.v3.sha256"
         catalog_bytes = catalog_path.read_bytes()
         actual_digest = hashlib.sha256(catalog_bytes).hexdigest()
         declared_digest = digest_path.read_text(encoding="utf-8").strip()
@@ -148,7 +155,7 @@ def default_metric_schema_directory() -> Path:
         return Path(configured).resolve()
     repository = Path(__file__).resolve().parents[2]
     local = repository / "schemas"
-    if (local / "maze.metrics.v2.json").is_file():
+    if (local / "maze.metrics.v3.json").is_file():
         return local
     sibling_contracts = repository.parent / "rl-contracts" / "schemas"
     return sibling_contracts
@@ -165,7 +172,7 @@ def _validate_sum_counts(
     for item in values:
         if item.field_id not in allowed_fields:
             raise MetricEventContractError(
-                f"{owner} field_id is outside maze.metrics.v2: {item.field_id}"
+                f"{owner} field_id is outside maze.metrics.v3: {item.field_id}"
             )
         if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
             raise MetricEventContractError(
@@ -190,8 +197,7 @@ def _validate_event(
     if fact == "episode":
         episode = event.episode
         if not (
-            episode.task_id
-            and episode.environment_instance_id
+            episode.environment_instance_id
             and episode.episode_id
             and episode.agents
         ):
@@ -209,11 +215,13 @@ def _validate_event(
                     "agent episode behavior lineage is missing"
                 )
             if (
-                int(agent.behavior_model_version_min)
-                > int(agent.behavior_model_version_max)
+                not _has_field(agent, "minimum_behavior_model_step")
+                or not _has_field(agent, "maximum_behavior_model_step")
+                or int(agent.minimum_behavior_model_step)
+                > int(agent.maximum_behavior_model_step)
             ):
                 raise MetricEventContractError(
-                    "agent episode behavior version range is invalid"
+                    "agent episode behavior step range is invalid"
                 )
             if not math.isfinite(float(agent.episode_return)):
                 raise MetricEventContractError("agent episode return is non-finite")
@@ -250,16 +258,21 @@ def _validate_event(
             and int(update.train_update_sequence) > 0
             and update.delivery_id
             and update.published_model.model_lineage_id
+            and _has_field(update.published_model, "model_step")
             and update.behavior_model_lineage_id
             and int(update.actual_batch_size) > 0
         ):
             raise MetricEventContractError("train update metric fact is incomplete")
         if (
-            int(update.behavior_model_version_min)
-            > int(update.behavior_model_version_max)
+            not _has_field(update, "minimum_behavior_model_step")
+            or not _has_field(update, "maximum_behavior_model_step")
+            or int(update.minimum_behavior_model_step)
+            > int(update.maximum_behavior_model_step)
+            or int(update.published_model.model_step)
+            != int(update.train_update_sequence)
         ):
             raise MetricEventContractError(
-                "train update behavior version range is invalid"
+                "train update model step contract is invalid"
             )
         _validate_sum_counts(
             update.ppo_statistics,
@@ -546,6 +559,14 @@ class RawMetricBatchStore:
     ) -> training_pb2.MetricBatchCursor:
         with self._lock:
             return self._row_cursor(self._source_row(source), pending=False)
+
+    def committed_watermark_unix_ms(
+        self, source: common_pb2.ServiceInstanceIdentity
+    ) -> int:
+        with self._lock:
+            return int(
+                self._source_row(source)["committed_watermark_unix_ms"]
+            )
 
     def pending_cursor(
         self, source: common_pb2.ServiceInstanceIdentity
@@ -891,8 +912,8 @@ def _empty_episode_statistics() -> dict:
         "path_ratio_count": 0,
         "reward_components": {},
         "termination_counts": {},
-        "behavior_model_version_min": None,
-        "behavior_model_version_max": None,
+        "minimum_behavior_model_step": None,
+        "maximum_behavior_model_step": None,
         "behavior_model_lineages": set(),
     }
 
@@ -902,11 +923,11 @@ def _empty_train_statistics() -> dict:
         "train_update_count": 0,
         "actual_batch_size_sum": 0,
         "latest_train_update_sequence": 0,
-        "latest_model_version": 0,
+        "latest_model_step": 0,
         "latest_cumulative_trained_samples": 0,
         "ppo": {},
-        "behavior_model_version_min": None,
-        "behavior_model_version_max": None,
+        "minimum_behavior_model_step": None,
+        "maximum_behavior_model_step": None,
         "behavior_model_lineages": set(),
     }
 
@@ -956,14 +977,14 @@ def _merge_episode_statistics(target: dict, source: dict) -> None:
         target["termination_counts"][reason] = (
             target["termination_counts"].get(reason, 0) + count
         )
-    if source["behavior_model_version_min"] is not None:
-        target["behavior_model_version_min"] = _merge_minimum(
-            target["behavior_model_version_min"],
-            source["behavior_model_version_min"],
+    if source["minimum_behavior_model_step"] is not None:
+        target["minimum_behavior_model_step"] = _merge_minimum(
+            target["minimum_behavior_model_step"],
+            source["minimum_behavior_model_step"],
         )
-        target["behavior_model_version_max"] = _merge_maximum(
-            target["behavior_model_version_max"],
-            source["behavior_model_version_max"],
+        target["maximum_behavior_model_step"] = _merge_maximum(
+            target["maximum_behavior_model_step"],
+            source["maximum_behavior_model_step"],
         )
     target["behavior_model_lineages"].update(
         source["behavior_model_lineages"]
@@ -976,7 +997,7 @@ def _merge_train_statistics(target: dict, source: dict) -> None:
     if source["latest_train_update_sequence"] >= target["latest_train_update_sequence"]:
         for key in (
             "latest_train_update_sequence",
-            "latest_model_version",
+            "latest_model_step",
             "latest_cumulative_trained_samples",
         ):
             target[key] = source[key]
@@ -984,14 +1005,14 @@ def _merge_train_statistics(target: dict, source: dict) -> None:
         item = target["ppo"].setdefault(name, {"sum": 0.0, "count": 0})
         item["sum"] += counts["sum"]
         item["count"] += counts["count"]
-    if source["behavior_model_version_min"] is not None:
-        target["behavior_model_version_min"] = _merge_minimum(
-            target["behavior_model_version_min"],
-            source["behavior_model_version_min"],
+    if source["minimum_behavior_model_step"] is not None:
+        target["minimum_behavior_model_step"] = _merge_minimum(
+            target["minimum_behavior_model_step"],
+            source["minimum_behavior_model_step"],
         )
-        target["behavior_model_version_max"] = _merge_maximum(
-            target["behavior_model_version_max"],
-            source["behavior_model_version_max"],
+        target["maximum_behavior_model_step"] = _merge_maximum(
+            target["maximum_behavior_model_step"],
+            source["maximum_behavior_model_step"],
         )
     target["behavior_model_lineages"].update(
         source["behavior_model_lineages"]
@@ -1030,13 +1051,13 @@ def _episode_event_statistics(
         result["termination_counts"][agent.termination_reason] = (
             result["termination_counts"].get(agent.termination_reason, 0) + 1
         )
-        result["behavior_model_version_min"] = _merge_minimum(
-            result["behavior_model_version_min"],
-            int(agent.behavior_model_version_min),
+        result["minimum_behavior_model_step"] = _merge_minimum(
+            result["minimum_behavior_model_step"],
+            int(agent.minimum_behavior_model_step),
         )
-        result["behavior_model_version_max"] = _merge_maximum(
-            result["behavior_model_version_max"],
-            int(agent.behavior_model_version_max),
+        result["maximum_behavior_model_step"] = _merge_maximum(
+            result["maximum_behavior_model_step"],
+            int(agent.maximum_behavior_model_step),
         )
         result["behavior_model_lineages"].add(
             agent.behavior_model_lineage_id
@@ -1080,15 +1101,15 @@ def _train_event_statistics(fact: training_pb2.TrainUpdateMetricFact) -> dict:
     result["train_update_count"] = 1
     result["actual_batch_size_sum"] = int(fact.actual_batch_size)
     result["latest_train_update_sequence"] = int(fact.train_update_sequence)
-    result["latest_model_version"] = int(fact.published_model.model_version)
+    result["latest_model_step"] = int(fact.published_model.model_step)
     result["latest_cumulative_trained_samples"] = int(
         fact.cumulative_trained_samples
     )
-    result["behavior_model_version_min"] = int(
-        fact.behavior_model_version_min
+    result["minimum_behavior_model_step"] = int(
+        fact.minimum_behavior_model_step
     )
-    result["behavior_model_version_max"] = int(
-        fact.behavior_model_version_max
+    result["maximum_behavior_model_step"] = int(
+        fact.maximum_behavior_model_step
     )
     result["behavior_model_lineages"].add(fact.behavior_model_lineage_id)
     for statistic in fact.ppo_statistics:
@@ -1186,7 +1207,7 @@ def _render_train_statistics(
             "latest_train_update_sequence": int(
                 raw["latest_train_update_sequence"]
             ),
-            "latest_model_version": int(raw["latest_model_version"]),
+            "latest_model_step": int(raw["latest_model_step"]),
             "latest_cumulative_trained_samples": int(
                 raw["latest_cumulative_trained_samples"]
             ),
@@ -1472,6 +1493,38 @@ class LocalTrainUpdateMetricWriter:
         if pending is not None and cursor is not None:
             self.store.mark_acknowledged(pending, cursor)
 
+    def _append_gap(
+        self,
+        *,
+        first_event_sequence: int,
+        last_event_sequence: int,
+        watermark_unix_ms: int,
+    ) -> None:
+        if not 0 < first_event_sequence <= last_event_sequence:
+            raise MetricEventContractError(
+                "learner metric sequence gap bounds are invalid"
+            )
+        committed = self.store.committed_cursor(self.source)
+        batch = training_pb2.MetricBatch(
+            contract=self.store.contract,
+            schema_identity=self.store.catalog.schema_identity(),
+            source=self.source,
+            batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
+            created_at_unix_ms=max(1, int(time.time() * 1000)),
+            first_event_sequence=first_event_sequence,
+            last_event_sequence=last_event_sequence,
+            gap=training_pb2.MetricSequenceGap(
+                first_unavailable_event_sequence=first_event_sequence,
+                last_unavailable_event_sequence=last_event_sequence,
+                oldest_available_event_sequence=last_event_sequence + 1,
+                reason="learner_train_update_fact_unavailable",
+            ),
+            event_time_watermark_unix_ms=watermark_unix_ms,
+        )
+        batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
+        cursor = self.store.persist_batch("learner", batch)
+        self.store.mark_acknowledged(batch, cursor)
+
     def append(
         self,
         fact: training_pb2.TrainUpdateMetricFact,
@@ -1487,10 +1540,39 @@ class LocalTrainUpdateMetricWriter:
                 + int(committed.acknowledged_event_sequence)
                 + 1
             )
-            if int(fact.train_update_sequence) != expected_update_sequence:
+            actual_update_sequence = int(fact.train_update_sequence)
+            if actual_update_sequence < expected_update_sequence:
                 raise MetricEventContractError(
-                    "train update sequence differs from learner event sequence"
+                    "train update sequence is behind learner event sequence"
                 )
+            previous_watermark = self.store.committed_watermark_unix_ms(
+                self.source
+            )
+            if actual_update_sequence > expected_update_sequence:
+                first_missing_event = (
+                    int(committed.acknowledged_event_sequence) + 1
+                )
+                last_missing_event = (
+                    actual_update_sequence
+                    - self._initial_train_update_sequence
+                    - 1
+                )
+                self._append_gap(
+                    first_event_sequence=first_missing_event,
+                    last_event_sequence=last_missing_event,
+                    watermark_unix_ms=previous_watermark,
+                )
+                committed = self.store.committed_cursor(self.source)
+
+            committed_at = int(committed_at_unix_ms)
+            if committed_at <= 0:
+                raise MetricEventContractError(
+                    "learner metric committed_at must be positive"
+                )
+            previous_watermark = self.store.committed_watermark_unix_ms(
+                self.source
+            )
+            committed_at = max(committed_at, previous_watermark)
             event_sequence = int(committed.acknowledged_event_sequence) + 1
             batch_sequence = int(committed.acknowledged_batch_sequence) + 1
             event = training_pb2.MetricEvent(
@@ -1498,7 +1580,7 @@ class LocalTrainUpdateMetricWriter:
                 schema_identity=self.store.catalog.schema_identity(),
                 source=self.source,
                 event_sequence=event_sequence,
-                committed_at_unix_ms=int(committed_at_unix_ms),
+                committed_at_unix_ms=committed_at,
                 train_update=fact,
             )
             batch = training_pb2.MetricBatch(
@@ -1510,7 +1592,7 @@ class LocalTrainUpdateMetricWriter:
                 first_event_sequence=event_sequence,
                 last_event_sequence=event_sequence,
                 events=[event],
-                event_time_watermark_unix_ms=int(committed_at_unix_ms),
+                event_time_watermark_unix_ms=committed_at,
             )
             batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
@@ -1522,18 +1604,22 @@ class LocalTrainUpdateMetricWriter:
                 return
             self._settle_pending()
             committed = self.store.committed_cursor(self.source)
+            watermark = max(
+                int(time.time() * 1000),
+                self.store.committed_watermark_unix_ms(self.source),
+            )
             batch = training_pb2.MetricBatch(
                 contract=self.store.contract,
                 schema_identity=self.store.catalog.schema_identity(),
                 source=self.source,
                 batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
-                created_at_unix_ms=int(time.time() * 1000),
+                created_at_unix_ms=max(1, int(time.time() * 1000)),
                 heartbeat=True,
                 source_final=True,
                 final_event_sequence=int(
                     committed.acknowledged_event_sequence
                 ),
-                event_time_watermark_unix_ms=int(time.time() * 1000),
+                event_time_watermark_unix_ms=watermark,
             )
             batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
@@ -1547,6 +1633,8 @@ class AIServerMetricRelay:
     GET_WAIT_TIMEOUT_MS = 5_000
     GET_RPC_TIMEOUT_SEC = 6.5
     ACK_RPC_TIMEOUT_SEC = 2.0
+    INITIAL_RETRY_DELAY_SEC = 0.5
+    MAX_RETRY_DELAY_SEC = 5.0
 
     def __init__(
         self,
@@ -1567,6 +1655,12 @@ class AIServerMetricRelay:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_source: common_pb2.ServiceInstanceIdentity | None = None
+        self._state_lock = threading.Lock()
+        self._transport_state = "starting"
+        self._transport_failure_count = 0
+        self._transport_unavailable_since = 0.0
+        self._transport_last_error = ""
+        self._ever_connected = False
 
     def start(self) -> "AIServerMetricRelay":
         if self._thread is not None:
@@ -1578,6 +1672,85 @@ class AIServerMetricRelay:
         )
         self._thread.start()
         return self
+
+    @staticmethod
+    def _rpc_error_text(error: grpc.RpcError) -> str:
+        details = getattr(error, "details", None)
+        if callable(details):
+            try:
+                value = details()
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        return str(error)
+
+    def _record_transport_unavailable(self, error: grpc.RpcError) -> None:
+        now = time.monotonic()
+        message = self._rpc_error_text(error)
+        with self._state_lock:
+            self._transport_failure_count += 1
+            self._transport_last_error = message
+            if self._transport_state in {"waiting", "unavailable"}:
+                return
+            self._transport_unavailable_since = now
+            if self._ever_connected:
+                self._transport_state = "unavailable"
+                self.logger.warning(
+                    "AIServer metric relay became unavailable; training "
+                    "continues and reconnect runs in background: %s",
+                    message,
+                )
+            else:
+                self._transport_state = "waiting"
+                self.logger.info(
+                    "AIServer metric relay is waiting for AIServer metric "
+                    "service; training continues"
+                )
+
+    def _record_transport_connected(self) -> None:
+        now = time.monotonic()
+        with self._state_lock:
+            prior_state = self._transport_state
+            if prior_state == "connected":
+                return
+            failure_count = self._transport_failure_count
+            unavailable_since = self._transport_unavailable_since
+            elapsed = (
+                max(0.0, now - unavailable_since)
+                if unavailable_since > 0.0
+                else 0.0
+            )
+            if prior_state == "unavailable":
+                self.logger.info(
+                    "AIServer metric relay recovered after %.1fs and %d "
+                    "retry attempt(s)",
+                    elapsed,
+                    failure_count,
+                )
+            elif prior_state == "waiting":
+                self.logger.info(
+                    "AIServer metric relay connected after waiting %.1fs "
+                    "and %d retry attempt(s)",
+                    elapsed,
+                    failure_count,
+                )
+            else:
+                self.logger.info("AIServer metric relay connected")
+            self._transport_state = "connected"
+            self._transport_failure_count = 0
+            self._transport_unavailable_since = 0.0
+            self._transport_last_error = ""
+            self._ever_connected = True
+
+    def snapshot(self) -> dict:
+        with self._state_lock:
+            return {
+                "state": self._transport_state,
+                "ever_connected": self._ever_connected,
+                "retry_count": self._transport_failure_count,
+                "last_error": self._transport_last_error,
+            }
 
     def _discover_source(self) -> common_pb2.ServiceInstanceIdentity:
         status = self.status_stub.GetAIServerStatus(
@@ -1686,7 +1859,7 @@ class AIServerMetricRelay:
         return False
 
     def _run(self) -> None:
-        retry_delay = 0.1
+        retry_delay = self.INITIAL_RETRY_DELAY_SEC
         while not self._stop.is_set():
             try:
                 source = self._discover_source()
@@ -1702,16 +1875,16 @@ class AIServerMetricRelay:
                 self.store.activate_source("aiserver", source)
                 self._active_source = source
                 source_final = self._pull_once(source)
-                retry_delay = 0.1
+                self._record_transport_connected()
+                retry_delay = self.INITIAL_RETRY_DELAY_SEC
                 if source_final:
                     self._stop.wait(1.0)
             except grpc.RpcError as error:
-                self.logger.warning(
-                    "AIServer metric relay RPC unavailable: %s",
-                    error.details() or str(error),
-                )
+                self._record_transport_unavailable(error)
                 self._stop.wait(retry_delay)
-                retry_delay = min(5.0, retry_delay * 2.0)
+                retry_delay = min(
+                    self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
+                )
             except MetricEventContractError as error:
                 if self._active_source is not None:
                     try:
@@ -1723,16 +1896,22 @@ class AIServerMetricRelay:
                         pass
                 self.logger.error("AIServer metric relay rejected history: %s", error)
                 self._stop.wait(retry_delay)
-                retry_delay = min(5.0, retry_delay * 2.0)
+                retry_delay = min(
+                    self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
+                )
             except Exception as error:
                 self.logger.error("AIServer metric relay failed: %s", error)
                 self._stop.wait(retry_delay)
-                retry_delay = min(5.0, retry_delay * 2.0)
+                retry_delay = min(
+                    self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
+                )
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=self.GET_RPC_TIMEOUT_SEC + 1.0)
+        with self._state_lock:
+            self._transport_state = "stopped"
         if self._active_source is not None:
             try:
                 if not self.store.is_final(self._active_source):

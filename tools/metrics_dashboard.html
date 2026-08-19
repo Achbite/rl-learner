@@ -122,6 +122,12 @@
     }
     .pod-count { font-variant-numeric: tabular-nums; font-weight: 600; }
     .pod-state { min-height: 25px; padding: 3px 8px; color: var(--secondary); }
+    .pod-detail {
+      margin-top: 8px;
+      color: var(--secondary);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
     .depth-strip {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -143,29 +149,12 @@
       border-bottom: 1px solid var(--separator);
     }
     .toolbar-group { flex-wrap: wrap; gap: 7px; }
-    .toolbar-label, .toggle { color: var(--secondary); }
-    .segmented {
+    .toggle {
       display: inline-flex;
-      padding: 3px;
-      background: var(--soft);
-      border: 1px solid var(--separator);
-      border-radius: 9px;
-    }
-    .segment {
-      min-height: 27px;
-      padding: 3px 9px;
+      align-items: center;
+      gap: 6px;
       color: var(--secondary);
-      background: transparent;
-      border: 0;
-      border-radius: 7px;
-      cursor: pointer;
     }
-    .segment[aria-pressed="true"] {
-      color: var(--label);
-      background: var(--surface);
-      box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, .12), rgba(0, 0, 0, .35));
-    }
-    .toggle { display: inline-flex; align-items: center; gap: 6px; }
     .smoothing { width: 118px; accent-color: var(--blue); }
     .select {
       min-height: 31px;
@@ -302,6 +291,7 @@
           <div class="pod-identity"><span class="pod-icon" aria-hidden="true">S</span><span class="pod-name">Server Pod</span></div>
           <div><span id="server-count" class="pod-count">0 / 1</span> <span id="server-state" class="pod-state" data-state="wait">等待</span></div>
         </div>
+        <div id="server-model-sync" class="pod-detail">等待模型信息</div>
       </article>
     </div>
   </section>
@@ -316,12 +306,6 @@
 
   <section class="toolbar" aria-label="曲线控制">
     <div class="toolbar-group">
-      <span class="toolbar-label">显示点</span>
-      <div class="segmented" aria-label="可见数据点范围">
-        <button class="segment" type="button" data-range="20" aria-pressed="false">20 点</button>
-        <button class="segment" type="button" data-range="48" aria-pressed="true">48 点</button>
-        <button class="segment" type="button" data-range="all" aria-pressed="false">全部</button>
-      </div>
       <label class="toggle">指标窗口
         <select id="metric-window" class="select" aria-label="真实指标聚合窗口">
           <option value="25">最近 25 局</option>
@@ -330,7 +314,7 @@
           <option value="1m">1 分钟</option>
           <option value="1h">1 小时</option>
           <option value="24h">24 小时</option>
-          <option value="all">本 Run 全部</option>
+          <option value="all">本次训练全部</option>
         </select>
       </label>
       <label class="toggle">平滑 <input id="smoothing" class="smoothing" type="range" min="0" max="90" value="0" aria-label="平滑比例"> <output id="smoothing-output">0.00</output></label>
@@ -415,8 +399,7 @@
         "sample.flow.produced.total.v1",
         "sample.flow.accepted.total.v1",
         "sample.flow.acknowledged.total.v1",
-        "sample.flow.trained.total.v1",
-        "sample.flow.producer_stale_before_ingress.total.v1"
+        "sample.flow.trained.total.v1"
       ]
     },
     {
@@ -446,7 +429,6 @@
     recordLimit: 4096,
     cursor: 0,
     sourceId: "",
-    range: 48,
     metricWindow: "100",
     smoothing: 0,
     axis: "model",
@@ -583,10 +565,6 @@
           hour: "2-digit", minute: "2-digit", second: "2-digit"
         })
       : formatInteger(value);
-  };
-  const visibleRecords = () => {
-    const records = state.records;
-    return state.range === "all" ? records : records.slice(-state.range);
   };
   const ema = values => {
     if (!values.length || state.smoothing <= 0) return values.slice();
@@ -729,7 +707,7 @@
     if (!panel) return;
     const svg = panel.querySelector("svg");
     svg.replaceChildren();
-    const records = visibleRecords();
+    const records = state.records;
     const selected = state.focus[group.id];
     const keys = selected === "all" ? group.keys : selected ? [selected] : [];
     const series = keys.map(fieldId => {
@@ -983,6 +961,10 @@
   };
   const ingest = records => {
     if (!Array.isArray(records) || !records.length) return;
+    records = records.filter(record =>
+      !record.metrics_source_id || record.metrics_source_id === state.sourceId
+    );
+    if (!records.length) return;
     const bySequence = new Map(
       state.records.map(record => [
         Number(record.sequence || record.train_step || 0),
@@ -1009,8 +991,25 @@
     const stale = status?.stale !== false;
     const serverPresent = Boolean(actor.instance_id) && !stale;
     const clientConnected = actor.client_session_recent === true;
-    const serverReady = serverPresent && actor.ready === true &&
-      !actor.error && clientConnected;
+    const activeModelStep = finiteNumber(actor?.model_identity?.model_step);
+    const stagedModelStep = finiteNumber(
+      actor?.staged_model_identity?.model_step
+    );
+    const latestModelStep = finiteNumber(
+      record?.model?.latest_available_model_step ??
+      record?.model?.latest_model_identity?.model_step ??
+      record?.learner?.model_step
+    );
+    const hasActiveModel = Boolean(actor?.model_identity?.model_lineage_id) &&
+      activeModelStep !== null;
+    const lifecycleReady = actor.state === "AISERVER_STATE_READY" ||
+      (!actor.state && actor.ready === true);
+    const projectedServerReady = record?.chain?.server_pod?.ready;
+    const serverReady = serverPresent && (
+      projectedServerReady === true ||
+      (projectedServerReady === undefined && lifecycleReady &&
+        !actor.error && clientConnected && hasActiveModel)
+    );
     byId("learner-count").textContent = learnerConnected ? "1 / 1" : "0 / 1";
     byId("server-count").textContent = serverPresent ? "1 / 1" : "0 / 1";
     setStatus(
@@ -1021,24 +1020,56 @@
     setStatus(
       byId("server-state"),
       serverReady ? "运行中" :
-        actor.error ? "异常" :
         stale && actor.instance_id ? "状态过期" :
-        serverPresent && actor.ready !== true ? "模型同步中" :
-        serverPresent ? "等待 Client" : "未连接",
+        actor.error ? "异常" :
+        !serverPresent ? "未连接" :
+        actor.state === "AISERVER_STATE_DRAINING" ? "正在停止" :
+        actor.state === "AISERVER_STATE_STOPPED" ? "已停止" :
+        !hasActiveModel ? "模型同步中" :
+        !clientConnected ? "等待 Client" : "启动中",
       serverReady ? "ok" : actor.error ? "bad" : "wait"
     );
-    const chainReady = record?.chain?.ready === true;
+    let modelSyncText = "等待模型信息";
+    if (!serverPresent) {
+      modelSyncText = "等待 AIServer 与 Client";
+    } else if (!hasActiveModel) {
+      modelSyncText = "等待首个可用模型";
+    } else if (latestModelStep === null) {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)}`;
+    } else if (activeModelStep < latestModelStep) {
+      const staged = stagedModelStep !== null &&
+        stagedModelStep > activeModelStep
+        ? ` · 已暂存 step ${formatInteger(stagedModelStep)}`
+        : "";
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)}` + staged +
+        ` · 最新 step ${formatInteger(latestModelStep)}` +
+        ` · 追赶 ${formatInteger(latestModelStep - activeModelStep)}`;
+    } else if (activeModelStep === latestModelStep) {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 已同步`;
+    } else {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 分发状态待刷新`;
+    }
+    byId("server-model-sync").textContent = modelSyncText;
     setStatus(
       byId("live-status"),
       !learnerConnected ? "连接失败" :
-        stale ? "指标已过期" :
-        chainReady ? "实时 · 1 秒" : "等待链路",
-      !learnerConnected ? "bad" : stale || !chainReady ? "wait" : "ok"
+        stale ? "指标已过期" : "实时 · 1 秒",
+      !learnerConnected ? "bad" : stale ? "wait" : "ok"
     );
     byId("run-context").textContent =
       `Learner / ${status?.metrics_source_id || "等待训练实例"}`;
+    const eventViewStatus = record?.metric_event_views?.status;
+    const latestEventUpdate = finiteNumber(
+      record?.metric_event_views?.train_updates?.latest?.values?.latest_train_update_sequence
+    );
+    const eventNote = eventViewStatus === "incomplete"
+      ? ` · 历史事件存在缺口${latestEventUpdate === null ? "" :
+          `，最新 Update ${formatInteger(latestEventUpdate)}`}`
+      : eventViewStatus === "unavailable" ? " · 历史事件不可用" : "";
     byId("stream-status").textContent =
-      `指标流：${status?.stream || "—"} · stale=${String(status?.stale ?? true)} · sequence ${formatInteger(status?.latest_sequence || 0)}`;
+      `指标流：${status?.stream || "—"} · ` +
+      `stale=${String(status?.stale ?? true)} · ` +
+      `sequence ${formatInteger(status?.latest_sequence || 0)}` + eventNote;
   };
   const renderSummary = record => {
     const modelStep = metricValue(record, MODEL_STEP_ID);
@@ -1101,17 +1132,6 @@
     }
   };
 
-  document.querySelectorAll(".segment").forEach(button => {
-    button.addEventListener("click", () => {
-      state.range = button.dataset.range === "all"
-        ? "all"
-        : Number(button.dataset.range);
-      document.querySelectorAll(".segment").forEach(item => {
-        item.setAttribute("aria-pressed", String(item === button));
-      });
-      renderAllPanels();
-    });
-  });
   byId("smoothing").addEventListener("input", event => {
     state.smoothing = Number(event.target.value) / 100;
     byId("smoothing-output").textContent = state.smoothing.toFixed(2);

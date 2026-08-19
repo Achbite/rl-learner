@@ -68,43 +68,43 @@ def samples() -> list[dict]:
 
 def publish_update(trainer, publisher, behavior) -> dict:
     stats = trainer.train_on_batch(
-        samples(), behavior_model_version=behavior["model_version"]
+        samples(), behavior_model_step=behavior["model_step"]
     )
-    update_id = f"update-v{trainer.model_version}"
+    update_id = f"update-v{trainer.model_step}"
     publisher.commit_optimizer_checkpoint(
         trainer,
         train_update_id=update_id,
         behavior_model=behavior,
-        batch_ids=[f"batch-{trainer.model_version}"],
+        batch_ids=[f"batch-{trainer.model_step}"],
         stats=stats,
         sample_count=2,
-        train_updates=trainer.model_version,
-        trained_samples=trainer.model_version * 2,
+        train_updates=trainer.model_step,
+        trained_samples=trainer.model_step * 2,
     )
     return publisher.publish_runtime(
         trainer,
         train_update_id=update_id,
         behavior_model=behavior,
-        batch_ids=[f"batch-{trainer.model_version}"],
+        batch_ids=[f"batch-{trainer.model_step}"],
         stats=stats,
         sample_count=2,
-        train_updates=trainer.model_version,
-        trained_samples=trainer.model_version * 2,
+        train_updates=trainer.model_step,
+        trained_samples=trainer.model_step * 2,
         checkpoint_precommitted=True,
     )
 
 
 class LightweightTrainer:
     def __init__(self, version: int = 0):
-        self.model_version = version
+        self.model_step = version
 
     def export_onnx(self, path: str) -> None:
-        Path(path).write_bytes(f"onnx-v{self.model_version}".encode())
+        Path(path).write_bytes(f"onnx-v{self.model_step}".encode())
 
     def save_checkpoint(self, path: str, metadata: dict) -> None:
         torch.save(
             {
-                "model_version": self.model_version,
+                "model_step": self.model_step,
                 "metadata": copy.deepcopy(metadata),
             },
             path,
@@ -113,8 +113,13 @@ class LightweightTrainer:
 
 class ModelCommitContractTest(unittest.TestCase):
     def test_config_is_complete_and_old_environment_alias_is_ignored(self):
-        document = load_config(str(ROOT / "configs" / "learner_config.yaml"))
-        self.assertEqual(document["contract"]["package_version"], "0.11.0")
+        with mock.patch.dict(
+            "os.environ", {"RL_MODEL_LINEAGE_ID": "maze-test-model"}
+        ):
+            document = load_config(
+                str(ROOT / "configs" / "learner_config.yaml")
+            )
+        self.assertEqual(document["contract"]["package_version"], "0.13.0")
         self.assertEqual(document["model"]["obs_dim"], 17)
         self.assertEqual(
             document["training_semantics"]["reward_schema"]["schema_id"],
@@ -122,13 +127,14 @@ class ModelCommitContractTest(unittest.TestCase):
         )
         self.assertNotIn("map_id", document)
         self.assertNotIn("reward", document)
-        sample = document["sample_distributor"]
-        self.assertGreaterEqual(
-            sample["demand_max_fragments"],
-            sample["max_train_batch_size"],
-        )
+        sample = document["sample_pool"]
 
-    def test_archive_interval_uses_only_canonical_runtime_override(self):
+    def test_runtime_config_requires_a_bound_internal_lineage(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "fresh internal"):
+                load_config(str(ROOT / "configs" / "learner_config.yaml"))
+
+    def test_archive_interval_uses_only_effective_config(self):
         document = config(Path("/tmp/learner-archive-override"), 200)
         with mock.patch.dict(
             "os.environ",
@@ -139,7 +145,7 @@ class ModelCommitContractTest(unittest.TestCase):
             clear=False,
         ):
             publisher = ModelPublisher(document)
-        self.assertEqual(publisher.archive_interval_updates, 2)
+        self.assertEqual(publisher.archive_interval_updates, 200)
 
         with mock.patch.dict(
             "os.environ",
@@ -163,13 +169,10 @@ class ModelCommitContractTest(unittest.TestCase):
         )
 
         base_digest = (
-            "b8a98bd14abc5f09e57c65516ff1eae8"
-            "222b9515b058d76c34af4a88dee7551f"
+            "ba719ca401ca9bb496b2a209078c019be"
+            "f6014cdc2fc53d4d39433e8e22e9931"
         )
-        self.assertEqual(
-            document["identity"]["training_config_digest"],
-            base_digest,
-        )
+        self.assertNotIn("training_config_digest", document["identity"])
         self.assertEqual(
             canonical_config_digest(training_config_document(document)),
             base_digest,
@@ -181,10 +184,9 @@ class ModelCommitContractTest(unittest.TestCase):
         seed_one["training"]["seed"] = 1
         seed_one["model"]["bootstrap_seed"] = 1
         seed_one_digest = (
-            "f61cdd19203538269fc18aa5ba349d4b"
-            "877bdbc5103b763acab71300289ab2e0"
+            "8a7fd4b63fc116e30bc55f26ed50110"
+            "020428e878913270debc268471a7be335"
         )
-        seed_one["identity"]["training_config_digest"] = seed_one_digest
         self.assertEqual(
             canonical_config_digest(training_config_document(seed_one)),
             seed_one_digest,
@@ -195,22 +197,34 @@ class ModelCommitContractTest(unittest.TestCase):
         )
         validate_config(seed_one)
 
-        stale_seed_one = copy.deepcopy(seed_one)
-        stale_seed_one["identity"]["training_config_digest"] = base_digest
-        with self.assertRaisesRegex(ValueError, "does not match"):
+        expected_seed_one = copy.deepcopy(seed_one)
+        expected_seed_one["identity"][
+            "expected_training_config_digest"
+        ] = seed_one_digest
+        validate_config(expected_seed_one)
+
+        stale_seed_one = copy.deepcopy(expected_seed_one)
+        stale_seed_one["identity"][
+            "expected_training_config_digest"
+        ] = base_digest
+        with self.assertRaisesRegex(
+            ValueError, "expected_training_config_digest"
+        ):
             validate_config(stale_seed_one)
 
-        missing_declaration = copy.deepcopy(seed_one)
-        del missing_declaration["identity"]["training_config_digest"]
-        with self.assertRaisesRegex(ValueError, "is required"):
-            validate_config(missing_declaration)
+        implicit_initial_model = copy.deepcopy(document)
+        implicit_initial_model["model"]["initial_model_dir"] = (
+            "models/save/002355"
+        )
+        with self.assertRaisesRegex(ValueError, "retired model"):
+            validate_config(implicit_initial_model)
 
     def test_prepare_rejects_unclean_local_train_data(self):
         with tempfile.TemporaryDirectory() as directory:
             first = ModelPublisher(config(Path(directory)))
             first.prepare()
             first.state_path.write_text("{}\n")
-            with self.assertRaisesRegex(RuntimeError, "incomplete transaction"):
+            with self.assertRaisesRegex(RuntimeError, "previous state"):
                 ModelPublisher(config(Path(directory))).prepare()
 
     def test_prepare_ignores_optional_metrics_history(self):
@@ -253,11 +267,29 @@ class ModelCommitContractTest(unittest.TestCase):
                 behavior_model=None,
                 batch_ids=[],
             )
-            self.assertEqual(manifest["contract"]["package_version"], "0.11.0")
+            self.assertEqual(manifest["contract"]["package_version"], "0.13.0")
             self.assertEqual(manifest["observation_schema"]["schema_id"], "maze.observation.v3")
             self.assertEqual(manifest["input_shape"], [1, 17])
             wire = manifest_message(TrainingRuntime._manifest_for_wire(manifest))
-            self.assertEqual(wire.identity.model_version, 0)
+            self.assertEqual(wire.identity.model_step, 0)
+            self.assertIsNotNone(publisher.complete_manifest(0))
+            metadata_path = publisher.metadata_path(0)
+            metadata = read_json(metadata_path)
+            self.assertEqual(
+                metadata["training_config_digest"],
+                manifest["training_config_digest"],
+            )
+            metadata["training_config_digest"] = "f" * 64
+            metadata_path.write_text(
+                json.dumps(metadata, sort_keys=True), encoding="utf-8"
+            )
+            self.assertIsNone(publisher.complete_manifest(0))
+            metadata["training_config_digest"] = manifest[
+                "training_config_digest"
+            ]
+            metadata_path.write_text(
+                json.dumps(metadata, sort_keys=True), encoding="utf-8"
+            )
             self.assertIsNotNone(publisher.complete_manifest(0))
             with publisher.model_path(0).open("ab") as stream:
                 stream.write(b"corrupt")
@@ -287,8 +319,8 @@ class ModelCommitContractTest(unittest.TestCase):
             self.assertNotIn("train_update_id", wire_document)
             self.assertEqual(manifest["retention"]["class"], "rolling")
             trainer = LightweightTrainer()
-            for version in range(1, 103):
-                trainer.model_version = version
+            for version in range(1, 104):
+                trainer.model_step = version
                 publisher.publish_runtime(
                     trainer,
                     train_update_id=f"update-v{version}",
@@ -297,57 +329,57 @@ class ModelCommitContractTest(unittest.TestCase):
                     train_updates=version,
                     trained_samples=version,
                 )
-            publisher.mark_permanent(0)
-            with mock.patch.object(
-                publisher,
-                "complete_manifest",
-                wraps=publisher.complete_manifest,
-            ) as validator:
-                self.assertEqual(publisher.prune_publications(101), [])
-            validator.assert_not_called()
-            self.assertTrue(publisher.archive_path(0).is_dir())
-            with mock.patch.object(
-                publisher,
-                "complete_manifest",
-                wraps=publisher.complete_manifest,
-            ) as validator:
-                self.assertEqual(publisher.prune_publications(102), [1])
+            permanent_metadata = publisher.metadata_path(2).read_bytes()
             self.assertEqual(
-                [call.args[0] for call in validator.call_args_list], [1]
+                publisher.complete_manifest(2)["retention"],
+                {"class": "permanent", "reason": "interval"},
             )
-            self.assertTrue(publisher.archive_path(0).is_dir())
-            self.assertFalse(publisher.archive_path(1).exists())
+            with mock.patch.object(
+                publisher,
+                "complete_manifest",
+                wraps=publisher.complete_manifest,
+            ) as validator:
+                self.assertEqual(publisher.prune_publications(103), [0, 1])
+            self.assertEqual(
+                [call.args[0] for call in validator.call_args_list], [0, 1, 2]
+            )
+            self.assertFalse(publisher.publication_path(0).exists())
+            self.assertFalse(publisher.publication_path(1).exists())
+            self.assertTrue(publisher.publication_path(2).is_dir())
+            self.assertEqual(
+                publisher.metadata_path(2).read_bytes(), permanent_metadata
+            )
             self.assertEqual(
                 [
-                    item["identity"]["model_version"]
+                    item["identity"]["model_step"]
                     for item in publisher.complete_manifests()
                     if item["retention"]["class"] == "rolling"
                 ],
-                list(range(2, 103)),
+                list(range(3, 104, 2)),
             )
-            archive = publisher.archive_path(102)
+            publication = publisher.publication_path(103)
             self.assertEqual(
-                {path.name for path in archive.iterdir()},
+                {path.name for path in publication.iterdir()},
                 {
                     "SaveModel.onnx",
-                    "checkpoint.pt",
                     "manifest.json",
                     "metadata.json",
                 },
             )
+            self.assertTrue(publisher.checkpoint_path(103).is_file())
 
-    def test_version_name_is_minimum_width_six_without_wraparound(self):
-        self.assertEqual(ModelPublisher.version_name(0), "000000")
-        self.assertEqual(ModelPublisher.version_name(999999), "999999")
-        self.assertEqual(ModelPublisher.version_name(1000000), "1000000")
+    def test_step_name_is_minimum_width_seven_without_wraparound(self):
+        self.assertEqual(ModelPublisher.step_name(0), "0000000")
+        self.assertEqual(ModelPublisher.step_name(9999999), "9999999")
+        self.assertEqual(ModelPublisher.step_name(10000000), "10000000")
         self.assertEqual(
-            ModelPublisher.version_name((1 << 64) - 1),
+            ModelPublisher.step_name((1 << 64) - 1),
             "18446744073709551615",
         )
         for value in (True, -1, 1 << 64, 1.0, "1"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    ModelPublisher.version_name(value)
+                    ModelPublisher.step_name(value)
 
     def test_failed_export_leaves_no_visible_or_private_publication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -364,33 +396,38 @@ class ModelCommitContractTest(unittest.TestCase):
                     behavior_model=None,
                     batch_ids=[],
                 )
-            self.assertFalse(publisher.archive_path(0).exists())
-            self.assertEqual(list(publisher.archive_dir.iterdir()), [])
+            self.assertFalse(publisher.publication_path(0).exists())
+            self.assertEqual(publisher._canonical_step_directories(), [])
 
-    def test_prepare_recovers_only_known_private_archive_directories(self):
+    def test_prepare_recovers_only_known_private_publication_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             publisher = ModelPublisher(config(root))
-            publisher.archive_dir.mkdir(parents=True)
+            publisher.publication_dir.mkdir(parents=True)
             for name in (
-                ".publication-000001-crash.tmp",
-                ".prune-000002-crash",
-                ".rollback-delete-000003-crash",
+                ".publication-0000001-crash.tmp",
+                ".prune-0000002-crash",
+                ".rollback-delete-0000003-crash",
             ):
-                path = publisher.archive_dir / name
+                path = publisher.publication_dir / name
                 path.mkdir()
                 (path / "partial").write_bytes(b"partial")
             publisher.prepare()
-            self.assertEqual(list(publisher.archive_dir.iterdir()), [])
+            self.assertFalse(
+                any(
+                    path.name.startswith(".")
+                    for path in publisher.publication_dir.iterdir()
+                )
+            )
 
-            unknown = publisher.archive_dir / ".unowned-entry"
+            unknown = publisher.publication_dir / ".unowned-entry"
             unknown.mkdir()
             second = ModelPublisher(config(root))
             with self.assertRaisesRegex(RuntimeError, "requires review"):
                 second.prepare()
             self.assertTrue(unknown.is_dir())
 
-    def test_state_write_failure_hides_publication_and_keeps_staged_checkpoint(self):
+    def test_state_write_failure_hides_publication_and_keeps_private_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             publisher = ModelPublisher(config(Path(directory)))
             publisher.prepare()
@@ -398,9 +435,12 @@ class ModelCommitContractTest(unittest.TestCase):
             checkpoint = publisher.commit_optimizer_checkpoint(
                 trainer,
                 train_update_id="update-v1",
-                behavior_model={"model_version": 0},
+                behavior_model={
+                    "minimum_model_step": 0,
+                    "maximum_model_step": 0,
+                },
                 batch_ids=["batch-v1"],
-                stats={"policy_loss": 0.0},
+                stats={},
                 sample_count=2,
                 train_updates=1,
                 trained_samples=2,
@@ -422,20 +462,21 @@ class ModelCommitContractTest(unittest.TestCase):
                     publisher.publish_runtime(
                         trainer,
                         train_update_id="update-v1",
-                        behavior_model={"model_version": 0},
+                        behavior_model={
+                            "minimum_model_step": 0,
+                            "maximum_model_step": 0,
+                        },
                         batch_ids=["batch-v1"],
-                        stats={"policy_loss": 0.0},
+                        stats={},
                         sample_count=2,
                         train_updates=1,
                         trained_samples=2,
                         checkpoint_precommitted=True,
                     )
-            self.assertFalse(publisher.archive_path(1).exists())
+            self.assertFalse(publisher.publication_path(1).exists())
             self.assertFalse(publisher.state_path.exists())
             self.assertTrue(checkpoint.is_file())
-            self.assertEqual(
-                [path for path in publisher.archive_dir.iterdir()], []
-            )
+            self.assertEqual(publisher._canonical_step_directories(), [])
 
     def test_complete_manifest_rejects_mutated_wire_identity_and_shape(self):
         mutations = (
@@ -472,28 +513,3 @@ class ModelCommitContractTest(unittest.TestCase):
                         json.dumps(metadata, sort_keys=True), encoding="utf-8"
                     )
                     self.assertIsNone(publisher.complete_manifest(0))
-
-    def test_checkpoint_restores_optimizer_and_rng(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = config(Path(directory))
-            trainer = PPOTrainer(cfg)
-            publisher = ModelPublisher(cfg)
-            publisher.prepare()
-            publisher.publish_runtime(
-                trainer,
-                train_update_id="bootstrap-v0",
-                behavior_model=None,
-                batch_ids=[],
-            )
-            expected = trainer.train_on_batch(samples(), behavior_model_version=0)
-            expected_state = copy.deepcopy(trainer.model.state_dict())
-            retry = PPOTrainer(cfg)
-            self.assertTrue(retry.load_checkpoint(str(publisher.checkpoint_path(0))))
-            actual = retry.train_on_batch(samples(), behavior_model_version=0)
-            self.assertEqual(actual, expected)
-            for key, value in expected_state.items():
-                self.assertTrue(torch.equal(value, retry.model.state_dict()[key]))
-
-
-if __name__ == "__main__":
-    unittest.main()

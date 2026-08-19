@@ -12,7 +12,6 @@ from src.contracts.identity import (
     contract_document,
     contract_identity,
     finalize_manifest_digest,
-    manifest_message,
     policy_spec_digest,
     schema_document,
     semantics_document,
@@ -36,11 +35,11 @@ def model_document(cfg, version=0):
     semantics = training_semantics(cfg)
     return finalize_manifest_digest(
         {
-            "manifest_schema_version": 1,
+            "manifest_schema_version": 2,
             "contract": contract_document(contract_identity(cfg)),
             "identity": {
                 "model_lineage_id": cfg["identity"]["model_lineage_id"],
-                "model_version": version,
+                "model_step": version,
                 "artifact_digest": chr(ord("a") + version) * 64,
                 "manifest_digest": "0" * 64,
             },
@@ -57,8 +56,8 @@ def model_document(cfg, version=0):
             "model_file": "model.onnx",
             "size_bytes": 1,
             "seed": 0,
-            "train_updates": 0,
-            "trained_samples": 0,
+            "train_updates": version,
+            "trained_samples": version,
             "training_config_digest": training_config_digest(cfg).hex,
             "training_semantics": semantics_document(semantics),
             "published_at_unix_ms": 1,
@@ -70,7 +69,7 @@ def model_document(cfg, version=0):
 def _batch(runtime, version, first_step, sample_count):
     policy = training_pb2.BehaviorPolicyReference(
         model_lineage_id=runtime.publisher.lineage_id,
-        model_version=version,
+        model_step=version,
         distribution_schema_id=(
             runtime.semantics.policy_distribution_schema_id
         ),
@@ -78,7 +77,7 @@ def _batch(runtime, version, first_step, sample_count):
     )
     created_at = int(time.time() * 1000)
     batch = training_pb2.SampleBatch(
-        batch_id=f"batch-{version}",
+        batch_id=f"batch-{version}-{first_step}",
         actor_session_id="session-1",
         trajectory_id=f"trajectory-{version}",
         actor_id=version,
@@ -100,7 +99,7 @@ def _batch(runtime, version, first_step, sample_count):
     for step in range(first_step, first_step + sample_count):
         sample = batch.samples.add(
             action=step % 9,
-            reward=0.01,
+            reward=0.0,
             old_log_probability=-2.0,
             old_value_prediction=0.1,
             end_kind=training_pb2.TRANSITION_END_KIND_CONTINUING,
@@ -118,8 +117,11 @@ def _batch(runtime, version, first_step, sample_count):
     return batch
 
 
-def delivery(runtime):
-    batches = [_batch(runtime, 0, 1, 256), _batch(runtime, 1, 257, 256)]
+def delivery(runtime, versions=(1, 1)):
+    batches = [
+        _batch(runtime, versions[0], 1, 256),
+        _batch(runtime, versions[1], 257, 256),
+    ]
     created = [batch.created_at_unix_ms for batch in batches]
     return training_pb2.GetBatchRsp(
         result=training_pb2.GET_BATCH_RESULT_LEASED,
@@ -127,8 +129,8 @@ def delivery(runtime):
         returned_samples=512,
         actual_batch_size=512,
         returned_fragments=2,
-        minimum_behavior_model_version=0,
-        maximum_behavior_model_version=1,
+        minimum_behavior_model_step=min(versions),
+        maximum_behavior_model_step=max(versions),
         oldest_sample_created_at_unix_ms=min(created),
         newest_sample_created_at_unix_ms=max(created),
         batches=batches,
@@ -136,7 +138,7 @@ def delivery(runtime):
 
 
 def partial_delivery(runtime):
-    batches = [_batch(runtime, 0, 1, 248), _batch(runtime, 1, 249, 248)]
+    batches = [_batch(runtime, 1, 1, 248), _batch(runtime, 1, 249, 248)]
     created = [batch.created_at_unix_ms for batch in batches]
     return training_pb2.GetBatchRsp(
         result=training_pb2.GET_BATCH_RESULT_LEASED,
@@ -144,8 +146,8 @@ def partial_delivery(runtime):
         returned_samples=496,
         actual_batch_size=496,
         returned_fragments=2,
-        minimum_behavior_model_version=0,
-        maximum_behavior_model_version=1,
+        minimum_behavior_model_step=1,
+        maximum_behavior_model_step=1,
         oldest_sample_created_at_unix_ms=min(created),
         newest_sample_created_at_unix_ms=max(created),
         batches=batches,
@@ -163,7 +165,7 @@ class DeliveryContractTest(unittest.TestCase):
             lineage_id=cfg["identity"]["model_lineage_id"],
             training_digest=training_config_digest(cfg),
         )
-        runtime.trainer = SimpleNamespace(model_version=1, max_policy_lag=2)
+        runtime.trainer = SimpleNamespace(model_step=1, max_policy_lag=2)
         runtime.train_batch_size = 512
         runtime.max_train_batch_size = 639
         runtime.max_sample_age_ms = 120000
@@ -172,11 +174,11 @@ class DeliveryContractTest(unittest.TestCase):
         }
         return runtime
 
-    def test_bounded_multi_version_delivery_passes(self):
+    def test_bounded_single_version_delivery_passes(self):
         runtime = self.runtime()
         summary = runtime._validate_delivery(delivery(runtime))
-        self.assertEqual(summary["minimum_model_version"], 0)
-        self.assertEqual(summary["maximum_model_version"], 1)
+        self.assertEqual(summary["minimum_model_step"], 1)
+        self.assertEqual(summary["maximum_model_step"], 1)
 
     def test_partial_delivery_is_accepted_only_for_explicit_final_drain(self):
         runtime = self.runtime()
@@ -184,13 +186,18 @@ class DeliveryContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bounded batch assembly"):
             runtime._validate_delivery(response)
         summary = runtime._validate_delivery(response, allow_partial=True)
-        self.assertEqual(summary["minimum_model_version"], 0)
-        self.assertEqual(summary["maximum_model_version"], 1)
+        self.assertEqual(summary["minimum_model_step"], 1)
+        self.assertEqual(summary["maximum_model_step"], 1)
+
+    def test_mixed_behavior_steps_fail_closed(self):
+        runtime = self.runtime()
+        with self.assertRaisesRegex(ValueError, "exactly one behavior"):
+            runtime._validate_delivery(delivery(runtime, versions=(0, 1)))
 
     def test_payload_or_policy_identity_drift_fails(self):
         runtime = self.runtime()
         response = delivery(runtime)
-        response.batches[0].samples[0].reward = 9.0
+        response.batches[0].samples[0].action = 8
         with self.assertRaisesRegex(ValueError, "payload digest"):
             runtime._validate_delivery(response)
         response = delivery(runtime)
@@ -204,7 +211,3 @@ class DeliveryContractTest(unittest.TestCase):
         response.batches[0].producer.component = "rl-aiserver"
         with self.assertRaisesRegex(ValueError, "sample batch identity"):
             runtime._validate_delivery(response)
-
-
-if __name__ == "__main__":
-    unittest.main()

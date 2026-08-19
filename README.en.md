@@ -2,94 +2,113 @@
 
 [简体中文](README.md) | English
 
-The Learner container runs PPO, Sample Pool, Model Distributor, and the optional monitor. Start the full three-component chain from [rl-framework](../rl-framework/README.en.md).
+The Learner container runs PPO, LocalSampleService, ModelDistributor, and the optional monitor. For the complete local three-component chain, start Learner, AIServer, and Client separately; Framework provides read-only diagnostics and does not orchestrate runtime processes.
 
-## 1. Prepare artifacts
-
-From the directory containing all repositories, run:
+## 1. Component development environment
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh)
-(cd rl-sample-pool && bash build_artifact.sh)
-(cd rl-model-distributor && bash build_artifact.sh)
-(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
-```
-
-Build the Learner image. This command also creates the matching smoke model:
-
-```bash
-RL_LEARNER_IMAGE_TAG=training-001 bash build_image.sh
-```
-
-## 2. Component development environment
-
-```bash
-# Build the development image from the training-001 runtime image
-LEARNER_IMAGE_TAG=training-001 make dev-image
-
-# Enter the source-mounted container
+# Host: prepare dirty-capable dependencies, build or reuse the dev image, and enter it
 make shell
 
-# Run the Python compile check
+# Host: reuse the same development image and dependency identity for builds
 make build
 
-# Run tests
-make test
+# Container: the only test entrypoint (the allowlist is governed by TCRs)
+bash ./test.sh
 ```
 
-## 3. Start Learner-side services
+The development path does not depend on an old runtime image, formal 0.13
+artifacts, or clean source. Development dependencies remain under
+`.workspace/dev-artifacts` and cannot feed a formal image. Run `make shell` only
+on the host.
 
-A new Run clears the Learner-owned `models/local-train` and starts at model version zero:
+## 2. Start Learner-side services
+
+Inside the container, edit the config and start Learner directly. Learner has
+only the training workload and accepts no positional workload:
 
 ```bash
-bash scripts/dev_container.sh training --new-run
+./run.sh --help
+./run.sh --config configs/learner_config.yaml
 ```
 
-To continue the same Run after a normal stop, omit `--new-run`:
+`--help` prints the supported overrides and their config fields without
+starting Sample Pool, Model Distributor, PPO, or the monitor.
 
-```bash
-bash scripts/dev_container.sh training
-```
+`configs/learner_config.yaml` is the complete default source. Startup applies
+allowlisted PPO/training environment overrides and then CLI overrides before
+validation. `--initial-model`, `--model-distributor`, `--aiserver`, and
+`--metrics-port` only override existing config fields. The supervisor and PPO
+runtime share the same parser/loader, and relative paths are resolved against
+the selected config file.
 
-This starts only Learner-side services and waits when no AIServer or Client is connected. Use Framework for full training.
+Every invocation is a new task-neutral training. Learner sees only its direct
+`models/train`, receives no platform `task_id/run_id`, and starts `model_step`,
+updates, sample count, and optimizer state at zero. After taking the sibling
+workspace lock, `run.sh` clears the configured `model.local_train_dir`, creates
+a new internal lineage, and publishes random `0000000`. The directory must end
+in `/train` and must not be a symlink; cleanup is restricted to its children.
+Copy any model that must survive or seed the next invocation outside this
+directory before starting again.
+
+Without AIServer, Learner keeps Sample Pool, Model Distributor, and monitoring
+alive while waiting without a deadline for the exact bootstrap-model ACK. The
+wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
+`aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
+diagnostic. Client can start after AIServer is ready.
 
 The launcher prints the monitor URL for that invocation. Port `9005` is optional observability; a monitor or port failure does not stop PPO.
 
-## 4. Start a new Run from an existing model
+## 3. Start fresh training from an existing model
 
-Place the complete savepoint outside `models/local-train` at a path visible inside the container, for example:
+Select an explicit `SaveModel.onnx` file:
 
 ```text
-models/import/000200/
+models/save/0002355/
   SaveModel.onnx
-  checkpoint.pt
-  manifest.json
-  metadata.json
 ```
 
 Start the Run:
 
 ```bash
-bash scripts/dev_container.sh training \
-  --new-run \
-  --initial-model-dir /workspace/rl-learner/models/import/000200
+./run.sh --config configs/learner_config.yaml \
+  --initial-model /workspace/rl-learner/models/save/0002355/SaveModel.onnx
 ```
 
-This inherits only model weights and provenance. The new lineage starts model version, optimizer, RNG, update count, and sample count from zero.
+This reads only the selected file's weights. It is still an independent fresh training invocation, and the launcher generates a new internal model lineage; `model_step`, optimizer, RNG, update count, and sample count start at zero.
+`model.initial_model_path` defaults to `null`. Setting it in config or overriding
+it with `--initial-model` enables the same weight-only warm start. The value
+must name a regular, non-symlink `SaveModel.onnx` outside the fresh training
+workspace.
 
-## 5. Archive and resume
+## 4. Training model package
 
-Every complete publication uses one layout:
+Every complete publication uses one public layout. Checkpoints remain only in
+that training invocation's private runtime:
 
 ```text
-models/local-train/archive/000200/
+models/train/0000200/
   SaveModel.onnx
-  checkpoint.pt
   manifest.json
   metadata.json
+
+models/train/runtime/checkpoints/
+  publication-0000200.checkpoint.pt
 ```
 
-A normal stop preserves the archive and runtime state. A later start without `--new-run` resumes the same Run. Only explicit `--new-run` removes Learner-local Run data.
+A normal stop preserves public model packages until the next `run.sh` clears the
+same `model.local_train_dir`. A private checkpoint is not part of a model package
+and cannot start later training. To preserve or inherit a model, first place its
+`SaveModel.onnx` outside the training directory, then select it explicitly in
+config or with `--initial-model`. Later training never restores the previous
+update counter automatically.
+
+## 5. Formal artifacts and image
+
+Only after Level 1/2 pass, user review, and clean savepoints may the host build
+formal Contracts/Pool/Distributor artifacts, synchronize runtime dependencies,
+and run `bash build_image.sh`. Formal scripts never consume
+`.workspace/dev-artifacts` or a mutable development-container build directory.
 
 ## 6. Ports
 
