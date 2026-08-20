@@ -1,2 +1,1 @@
-# RL-Learner/proto 包初始化
-# 由 gen_proto.sh 生成的 maze_pb2.py 和 maze_pb2_grpc.py 放在此目录下
+"""Generated rl.common.v1 and rl.training.v1 bindings."""

@@ -1,45 +1,52 @@
-"""Register an atomically published model with the local distributor."""
+"""Register an exact 0.8 model manifest with the local distributor."""
 
 import argparse
 import json
 import time
 
 import grpc
-from google.protobuf.json_format import ParseDict
 
-from proto import maze_pb2, maze_pb2_grpc
+from main.training_runtime import TrainingRuntime
+from proto import training_pb2, training_pb2_grpc
+from src.contracts.identity import manifest_message, model_identity_document
 
 
 def register(manifest_path: str, address: str, timeout: float) -> dict:
     with open(manifest_path, "r", encoding="utf-8") as stream:
         document = json.load(stream)
-    manifest = ParseDict(document, maze_pb2.ModelArtifactManifest())
+    manifest = manifest_message(TrainingRuntime._manifest_for_wire(document))
     deadline = time.monotonic() + timeout
     last_error = ""
     with grpc.insecure_channel(address) as channel:
-        stub = maze_pb2_grpc.ModelDistributorServiceStub(channel)
+        stub = training_pb2_grpc.ModelDistributorServiceStub(channel)
         while time.monotonic() < deadline:
             try:
                 response = stub.RegisterModel(
-                    maze_pb2.RegisterModelReq(manifest=manifest), timeout=2.0
+                    training_pb2.RegisterModelReq(manifest=manifest), timeout=2.0
                 )
                 if response.result in (
-                    maze_pb2.MODEL_REGISTER_RESULT_REGISTERED,
-                    maze_pb2.MODEL_REGISTER_RESULT_ALREADY_REGISTERED,
+                    training_pb2.MODEL_REGISTER_RESULT_REGISTERED,
+                    training_pb2.MODEL_REGISTER_RESULT_ALREADY_REGISTERED,
                 ):
                     return {
-                        "result": maze_pb2.ModelRegisterResult.Name(response.result),
-                        "run_id": response.manifest.run_id,
-                        "model_version": response.manifest.model_version,
-                        "sha256": response.manifest.sha256,
-                        "distributor_instance_id": response.distributor_instance_id,
+                        "result": training_pb2.ModelRegisterResult.Name(
+                            response.result
+                        ),
+                        "model": model_identity_document(
+                            response.manifest.identity
+                        ),
+                        "distributor_instance_id": (
+                            response.distributor.instance_id
+                        ),
                     }
-                raise RuntimeError(response.message or "model registration rejected")
-            except grpc.RpcError as exc:
-                last_error = exc.details() or str(exc)
+                raise RuntimeError(
+                    response.message or "model registration rejected"
+                )
+            except grpc.RpcError as error:
+                last_error = error.details() or str(error)
             time.sleep(0.2)
     raise RuntimeError(
-        f"ModelDistributor registration timeout at {address}: {last_error}"
+        f"model distributor registration timeout at {address}: {last_error}"
     )
 
 
@@ -48,9 +55,14 @@ def main() -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--address", default="127.0.0.1:9200")
     parser.add_argument("--timeout", type=float, default=30.0)
-    args = parser.parse_args()
-    result = register(args.manifest, args.address, args.timeout)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    arguments = parser.parse_args()
+    print(
+        json.dumps(
+            register(arguments.manifest, arguments.address, arguments.timeout),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

@@ -1,44 +1,154 @@
 # RL Learner
 
-English | [简体中文](README.md)
+[简体中文](README.md) | English
 
-Local PPO training service. It consumes samples, updates models, starts ModelDistributor, and exposes the training metrics API on `9005`.
+The Learner container runs PPO, SamplePoolService, ModelDistributor, and the
+optional monitor. For local training, start Learner first, followed by AIServer
+and Client.
 
-## Quick Start
-
-Build Contracts and ModelDistributor, then stage the binary:
-
-```bash
-(cd ../rl-contracts && bash build_artifact.sh)
-(cd ../rl-model-distributor && bash build_artifact.sh)
-cp -R ../.workspace/artifacts/rl-model-distributor/0.2.0/linux-arm64/. \
-  model-distributor/
-```
-
-Build the image:
+## 1. Component development environment
 
 ```bash
-LEARNER_IMAGE_TAG=training-001 bash build_image.sh
-```
-
-Enter the development container and start the service:
-
-```bash
+# Host: prepare dirty-capable dependencies, build or reuse the dev image, and enter it
 make shell
-bash ./run.sh training
+
+# Host: reuse the same development image and dependency identity for builds
+make build
+
+# Container: unified test entrypoint
+bash ./test.sh
 ```
 
-Use `rl-framework` to start the complete three-container training workflow:
+The development path does not depend on an old runtime image, formal 0.14
+artifacts, or clean source. Development dependencies remain under
+`.workspace/dev-artifacts` and cannot feed a formal image. Run `make shell` only
+on the host.
+
+## 2. Start Learner-side services
+
+Inside the container, edit the config and start Learner directly. Learner has
+only the training workload and accepts no positional workload:
 
 ```bash
-../rl-framework/framework local-test --profile training --json
+./run.sh --help
+./run.sh --config configs/learner_config.yaml
 ```
 
-## Tests
+`--help` prints the supported overrides and their config fields without
+starting Sample Pool, Model Distributor, PPO, or the monitor.
+
+`configs/learner_config.yaml` is the complete default source. Startup applies
+allowlisted PPO/training environment overrides and then CLI overrides before
+validation. `--initial-model`, `--model-distributor`, `--aiserver`, and
+`--metrics-port` only override existing config fields. The supervisor and PPO
+runtime share the same parser/loader, and relative paths are resolved against
+the selected config file.
+
+Every invocation is a new task-neutral training. Learner sees only its direct
+`models/train`, receives no platform `task_id/run_id`, and starts `model_step`,
+updates, sample count, and optimizer state at zero. After taking the sibling
+workspace lock, `run.sh` clears the configured `model.local_train_dir`, creates
+a new internal lineage, and publishes random `0000000`. The directory must end
+in `/train` and must not be a symlink; cleanup is restricted to its children.
+Copy any model that must survive or seed the next invocation outside this
+directory before starting again.
+
+Without AIServer, Learner keeps Sample Pool, Model Distributor, and monitoring
+alive while waiting without a deadline for the exact bootstrap-model ACK. The
+wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
+`aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
+diagnostic. Client can start after AIServer is ready.
+
+The launcher prints the monitor URL for that invocation. MetricsServer uses a
+dedicated background thread to tail the current JSONL continuously: it drains
+backlog without waiting and switches to periodic polling only after catching
+up. HTTP requests read the in-memory projection and do not control file-read
+progress. `/api/status` exposes the tail, backlog, and error facts. Port `9005`
+is optional observability; a monitor or port failure does not stop PPO.
+
+Learner does not consume raw trajectories or compute GAE. It
+asks SamplePool to draw `training.train_batch_size` READY processed transitions
+uniformly without replacement, normalizes advantages once over the full batch,
+then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
+batch may contain multiple behavior-model steps; each transition retains exact
+lineage, step, and digest provenance for lag observation.
+
+## 3. Start fresh training from an existing model
+
+Select an explicit `SaveModel.onnx` file:
+
+```text
+models/save/0002355/
+  SaveModel.onnx
+```
+
+Start the Run:
 
 ```bash
-make test
+./run.sh --config configs/learner_config.yaml \
+  --initial-model /workspace/rl-learner/models/save/0002355/SaveModel.onnx
 ```
+
+This reads only the selected file's weights. It is still an independent fresh training invocation, and the launcher generates a new internal model lineage; `model_step`, optimizer, RNG, update count, and sample count start at zero.
+`model.initial_model_path` defaults to `null`. Setting it in config or overriding
+it with `--initial-model` enables the same weight-only warm start. The value
+must name a regular, non-symlink `SaveModel.onnx` outside the fresh training
+workspace.
+
+## 4. Training model package
+
+Every complete publication uses one public layout. Checkpoints remain only in
+that training invocation's private runtime:
+
+```text
+models/train/0000200/
+  SaveModel.onnx
+  manifest.json
+  metadata.json
+
+models/train/runtime/checkpoints/
+  publication-0000200.checkpoint.pt
+```
+
+A normal stop preserves public model packages until the next `run.sh` clears the
+same `model.local_train_dir`. A private checkpoint is not part of a model package
+and cannot start later training. To preserve or inherit a model, first place its
+`SaveModel.onnx` outside the training directory, then select it explicitly in
+config or with `--initial-model`. Later training never restores the previous
+update counter automatically.
+
+## 5. Build the runtime image
+
+The runtime image accepts only clean source and formal Contracts, Sample Pool,
+and Model Distributor artifacts. Synchronize the runtime dependencies and build
+from the host:
+
+```bash
+bash scripts/sync_runtime_artifacts.sh
+bash build_image.sh
+```
+
+The scripts never consume `.workspace/dev-artifacts` or a mutable development
+container build directory. The build prints the image reference derived from
+the current stack source identity.
+
+## 6. Ports
+
+| Port | Service |
+| ---: | --- |
+| `9100` | Sample Pool |
+| `9200` | Model Distributor |
+| `9005` | Optional Learner Monitor |
+
+Monitor endpoints: `/monitor`, `/api/status`, `/api/metrics/catalog`, `/api/metrics/latest`, and `/api/metrics`.
+
+## 7. Remove the development container
+
+```bash
+make dev-clean
+```
+
+This removes `learner-dev` and launcher-owned forwarding only. It never terminates unknown host processes.
 
 ## License
 

@@ -24,15 +24,25 @@ RUN pip install --no-cache-dir \
 WORKDIR /opt/rl/learner
 COPY . /opt/rl/learner
 RUN cp -a _deps/contracts/python/. proto/ && \
+    cp -a _deps/contracts/schemas/. schemas/ && \
+    cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
     cp -a _deps/model-distributor /opt/rl/learner/model-distributor && \
     mkdir -p /opt/rl/identity && \
     cp _deps/identity/contracts.json /opt/rl/identity/contracts.json && \
+    cp _deps/identity/sample-pool.json \
+        /opt/rl/identity/sample-pool.json && \
     cp _deps/identity/model-distributor.json \
         /opt/rl/identity/model-distributor.json && \
+    cp _deps/identity/stack-source.json \
+        /opt/rl/identity/stack-source.json && \
     rm -rf _deps && \
     chmod +x run.sh scripts/entrypoint.sh && \
+    chmod +x /opt/rl/learner/sample-pool/bin/maze_sample_pool && \
     chmod +x /opt/rl/learner/model-distributor/bin/maze_model_distributor && \
     python3 -m compileall -q main proto src tools
 
-EXPOSE 9005 9200
+EXPOSE 9005 9100 9200
+HEALTHCHECK --interval=2s --timeout=2s --start-period=20s --retries=30 \
+    CMD ["python3", "/opt/rl/learner/scripts/healthcheck.py"]
 ENTRYPOINT ["/opt/rl/learner/scripts/entrypoint.sh"]
+CMD ["--config", "configs/learner_config.yaml"]

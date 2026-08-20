@@ -1,0 +1,1239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Learner 本地训练监控</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --window: light-dark(#f5f5f7, #121214);
+      --chrome: light-dark(rgba(255, 255, 255, .84), rgba(34, 34, 37, .86));
+      --surface: light-dark(#fff, #202023);
+      --raised: light-dark(#fbfbfd, #29292d);
+      --soft: light-dark(#f0f1f4, #2d2d31);
+      --label: light-dark(#1d1d1f, #f5f5f7);
+      --secondary: light-dark(#68686d, #aaaab1);
+      --separator: light-dark(rgba(60, 60, 67, .16), rgba(235, 235, 245, .14));
+      --separator-strong: light-dark(rgba(60, 60, 67, .25), rgba(235, 235, 245, .23));
+      --grid: light-dark(rgba(60, 60, 67, .1), rgba(235, 235, 245, .1));
+      --blue: light-dark(#007aff, #0a84ff);
+      --green: light-dark(#248a3d, #30d158);
+      --orange: light-dark(#c93400, #ff9f0a);
+      --red: light-dark(#d70015, #ff453a);
+      --purple: light-dark(#8944ab, #bf5af2);
+      --teal: light-dark(#008299, #64d2ff);
+      --pink: light-dark(#d30f45, #ff375f);
+      --indigo: light-dark(#3634a3, #5e5ce6);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--window);
+      color: var(--label);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: var(--window); color: var(--label); }
+    button, select, input { font: inherit; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--blue);
+      outline-offset: 2px;
+    }
+    .app { width: 100%; min-height: 100vh; }
+    .titlebar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 18px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--separator);
+    }
+    .title-leading, .brand-line, .pod-head, .toolbar, .toolbar-group,
+    .footer, .tag, .live-badge, .pod-state {
+      display: flex;
+      align-items: center;
+    }
+    .title-leading { min-width: 0; gap: 12px; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      flex: 0 0 34px;
+      width: 34px;
+      height: 34px;
+      color: #fff;
+      background: var(--blue);
+      border-radius: 9px;
+      font-weight: 600;
+    }
+    .brand-copy { min-width: 0; }
+    .brand-line { align-items: baseline; flex-wrap: wrap; gap: 8px; }
+    .product-title, .pod-name, .panel-title, .depth-value { font-weight: 600; }
+    .product-context {
+      overflow: hidden;
+      color: var(--secondary);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .live-badge, .pod-state {
+      gap: 6px;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--separator);
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .live-badge::before, .pod-state::before {
+      width: 7px;
+      height: 7px;
+      content: "";
+      background: var(--orange);
+      border-radius: 50%;
+    }
+    .live-badge[data-state="ok"], .pod-state[data-state="ok"] {
+      background: light-dark(rgba(52, 199, 89, .1), rgba(48, 209, 88, .12));
+      border-color: light-dark(rgba(36, 138, 61, .24), rgba(48, 209, 88, .28));
+    }
+    .live-badge[data-state="ok"]::before, .pod-state[data-state="ok"]::before { background: var(--green); }
+    .live-badge[data-state="bad"]::before, .pod-state[data-state="bad"]::before { background: var(--red); }
+    .topology {
+      padding: 14px;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--separator);
+    }
+    .section-title { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+    .pod-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .pod-card {
+      min-width: 0;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--separator);
+      border-radius: 13px;
+    }
+    .pod-head { justify-content: space-between; gap: 12px; }
+    .pod-identity { display: flex; align-items: center; min-width: 0; gap: 9px; }
+    .pod-icon {
+      display: grid;
+      place-items: center;
+      flex: 0 0 32px;
+      width: 32px;
+      height: 32px;
+      color: var(--blue);
+      background: light-dark(rgba(0, 122, 255, .1), rgba(10, 132, 255, .14));
+      border-radius: 9px;
+      font-weight: 600;
+    }
+    .pod-count { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .pod-state { min-height: 25px; padding: 3px 8px; color: var(--secondary); }
+    .pod-detail {
+      margin-top: 8px;
+      color: var(--secondary);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .depth-strip {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 1px;
+      background: var(--separator);
+      border-bottom: 1px solid var(--separator);
+    }
+    .depth-item { min-width: 0; padding: 12px 14px; background: var(--surface); }
+    .depth-label { color: var(--secondary); }
+    .depth-value { margin-top: 3px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .depth-item:first-child .depth-value { color: var(--blue); }
+    .not-available { color: var(--orange); }
+    .toolbar {
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 9px 14px;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--separator);
+    }
+    .toolbar-group { flex-wrap: wrap; gap: 7px; }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--secondary);
+    }
+    .select {
+      min-height: 31px;
+      padding: 4px 28px 4px 9px;
+      color: var(--label);
+      background: var(--surface);
+      border: 1px solid var(--separator-strong);
+      border-radius: 8px;
+    }
+    .panel-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 12px;
+      align-items: start;
+    }
+    .panel {
+      min-width: 0;
+      overflow: hidden;
+      background: var(--surface);
+      border: 1px solid var(--separator);
+      border-radius: 13px;
+      box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, .04), rgba(0, 0, 0, .24));
+    }
+    .panel-head { padding: 12px 13px 9px; }
+    .panel-title { margin: 0; font-size: 14px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; min-height: 38px; padding: 0 13px 10px; }
+    .tag, .add-metric {
+      min-height: 28px;
+      padding: 4px 8px;
+      color: var(--secondary);
+      background: var(--raised);
+      border: 1px solid var(--separator);
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .tag { gap: 6px; }
+    .tag[aria-pressed="true"], .add-metric[aria-expanded="true"] {
+      color: var(--label);
+      border-color: var(--blue);
+      background: light-dark(rgba(0, 122, 255, .08), rgba(10, 132, 255, .12));
+    }
+    .swatch { width: 11px; height: 4px; background: currentColor; border-radius: 999px; }
+    .add-metric { display: inline-grid; place-items: center; min-width: 28px; }
+    .registry-picker {
+      display: grid;
+      gap: 5px;
+      margin: 0 13px 10px;
+      padding: 6px;
+      background: var(--soft);
+      border: 1px solid var(--separator);
+      border-radius: 9px;
+    }
+    .registry-picker[hidden] { display: none; }
+    .registry-option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+      padding: 7px 8px;
+      color: var(--label);
+      text-align: left;
+      background: var(--surface);
+      border: 1px solid var(--separator);
+      border-radius: 7px;
+      cursor: pointer;
+    }
+    .registry-id {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--secondary);
+      font: 12px ui-monospace, "SFMono-Regular", Menlo, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .registry-empty { padding: 5px 7px; color: var(--secondary); }
+    .chart-wrap { padding: 0 8px 7px; }
+    .chart { display: block; width: 100%; min-height: 220px; overflow: hidden; }
+    .chart-grid { stroke: var(--grid); stroke-width: 1; }
+    .chart-axis { fill: var(--secondary); font-size: 12px; }
+    .chart-raw {
+      fill: none;
+      stroke-width: 2.25;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      opacity: .78;
+      vector-effect: non-scaling-stroke;
+    }
+    .chart-point { fill: var(--surface); stroke-width: 2.75; vector-effect: non-scaling-stroke; }
+    .empty-chart { fill: var(--secondary); font-size: 14px; }
+    .footer {
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 9px 14px;
+      color: var(--secondary);
+      background: var(--chrome);
+      border-top: 1px solid var(--separator);
+      font-variant-numeric: tabular-nums;
+    }
+    @media (max-width: 850px) {
+      .pod-grid, .panel-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 620px) {
+      .titlebar { grid-template-columns: 1fr; }
+      .product-context { display: none; }
+      .depth-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar { align-items: flex-start; }
+      .registry-option { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header class="titlebar">
+    <div class="title-leading">
+      <div class="brand-mark" aria-hidden="true">RL</div>
+      <div class="brand-copy">
+        <div class="brand-line">
+          <span class="product-title">本地训练监控</span>
+          <span id="run-context" class="product-context">Learner / 等待训练实例</span>
+        </div>
+      </div>
+    </div>
+    <span id="live-status" class="live-badge" data-state="wait">正在连接</span>
+  </header>
+
+  <section class="topology" aria-label="本地训练运行拓扑">
+    <h1 class="section-title">运行拓扑</h1>
+    <div class="pod-grid">
+      <article class="pod-card" aria-label="Learner Pod">
+        <div class="pod-head">
+          <div class="pod-identity"><span class="pod-icon" aria-hidden="true">L</span><span class="pod-name">Learner Pod</span></div>
+          <div><span id="learner-count" class="pod-count">— / 1</span> <span id="learner-state" class="pod-state" data-state="wait">等待</span></div>
+        </div>
+      </article>
+      <article class="pod-card" aria-label="Server Pod，由 AIServer 与 Client 组成">
+        <div class="pod-head">
+          <div class="pod-identity"><span class="pod-icon" aria-hidden="true">S</span><span class="pod-name">Server Pod</span></div>
+          <div><span id="server-count" class="pod-count">— / 1</span> <span id="server-state" class="pod-state" data-state="wait">等待</span></div>
+        </div>
+        <div id="server-model-sync" class="pod-detail">等待模型信息</div>
+      </article>
+    </div>
+  </section>
+
+  <section class="depth-strip" aria-label="训练状态">
+    <div class="depth-item"><div class="depth-label">Model Step</div><div id="model-step" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Train Update</div><div id="train-update" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Trained Transitions</div><div id="trained-samples" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Produced Transitions</div><div id="produced-samples" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Workload</div><div id="training-workload" class="depth-value">Training</div></div>
+  </section>
+
+  <section class="toolbar" aria-label="曲线控制">
+    <div class="toolbar-group">
+      <label class="toggle">指标窗口
+        <select id="metric-window" class="select" aria-label="指标显示与聚合窗口">
+          <option value="25">最近 25 局</option>
+          <option value="100" selected>最近 100 局</option>
+          <option value="5s">5 秒</option>
+          <option value="1m">1 分钟</option>
+          <option value="1h">1 小时</option>
+          <option value="24h">24 小时</option>
+          <option value="all">本次训练全部</option>
+        </select>
+      </label>
+    </div>
+    <div class="toolbar-group">
+      <label class="toggle">横轴
+        <select id="axis" class="select">
+          <option value="model">Model Step</option>
+          <option value="update">Train Update</option>
+          <option value="episode">Training Episode</option>
+          <option value="time">Wall Time</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <main id="panel-grid" class="panel-grid" aria-label="本地训练指标曲线"></main>
+
+  <footer class="footer">
+    <span id="stream-status">指标流：等待连接</span>
+    <span id="last-refresh">尚未刷新</span>
+  </footer>
+</div>
+
+<script>
+  "use strict";
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const COLORS = ["--blue", "--green", "--orange", "--red", "--purple", "--teal", "--pink", "--indigo"];
+  const MODEL_STEP_ID = "learner.model_step.v1";
+  const TRAIN_UPDATE_ID = "learner.train_update.total.v1";
+  const TRAINED_SAMPLES_ID = "learner.trained_samples.total.v1";
+  const TRAINING_EPISODE_ID = "server.training.episode.completed.total.v1";
+  const PRODUCED_SAMPLES_ID = "sample.flow.produced.total.v1";
+  const TIME_WINDOW_SECONDS = new Map([
+    ["5s", 5],
+    ["1m", 60],
+    ["1h", 60 * 60],
+    ["24h", 24 * 60 * 60]
+  ]);
+  const REWARD_COMPONENT_IDS = [
+    "server.training.reward.component.goal_reward.episode_mean.v1",
+    "server.training.reward.component.timeout_penalty.episode_mean.v1",
+    "server.training.reward.component.geodesic_progress.episode_mean.v1",
+    "server.training.reward.component.first_visit_bonus.episode_mean.v1",
+    "server.training.reward.component.wasted_action_penalty.episode_mean.v1"
+  ];
+  const groups = [
+    {
+      id: "loss", title: "Loss", catalogGroup: "loss",
+      initial: ["learner.loss.policy.v1", "learner.loss.value.v1"]
+    },
+    {
+      id: "episode-return", title: "Agent Episode Return", catalogGroup: "episode_return",
+      initial: [
+        "server.training.episode.learning_return.mean.v1",
+        "server.training.episode.learning_return.latest_mean.v1"
+      ]
+    },
+    {
+      id: "reward-components", title: "Reward Components", catalogGroup: "reward_components",
+      initial: REWARD_COMPONENT_IDS
+    },
+    {
+      id: "episode-success", title: "Episode Success", catalogGroup: "episode_success",
+      initial: [
+        "server.training.episode.success.agent_rate.v1",
+        "server.training.episode.success.any_rate.v1",
+        "server.training.episode.success.all_rate.v1",
+        "server.training.episode.path_ratio.mean.v1",
+        "server.training.episode.step.mean.v1",
+        "server.training.episode.unique_cells.mean.v1",
+        "server.training.episode.blocked_move_rate.v1"
+      ]
+    },
+    {
+      id: "sample-throughput", title: "Sample Throughput", catalogGroup: "sample_throughput",
+      initial: [
+        "sample.throughput.produced_per_second.v1",
+        "sample.throughput.accepted_per_second.v1",
+        "sample.throughput.trained_per_second.v1"
+      ]
+    },
+    {
+      id: "sample-flow", title: "Sample Flow", catalogGroup: "sample_flow",
+      initial: [
+        "sample.flow.produced.total.v1",
+        "sample.flow.accepted.total.v1",
+        "sample.flow.acknowledged.total.v1",
+        "sample.flow.trained.total.v1"
+      ]
+    },
+    {
+      id: "latency", title: "Latency", catalogGroup: "latency",
+      initial: [
+        "server.latency.sample_send.mean_ms.v1",
+        "server.latency.inference.mean_ms.v1",
+        "server.latency.inference.max_ms.v1"
+      ]
+    },
+    {
+      id: "ppo-stability", title: "PPO Stability", catalogGroup: "ppo_stability",
+      initial: [
+        "learner.ppo.entropy.v1",
+        "learner.ppo.approx_kl.v1",
+        "learner.ppo.clip_fraction.v1",
+        "learner.value.prediction_mean.v1",
+        "learner.value.return_target_mean.v1",
+        "learner.value.explained_variance.v1"
+      ]
+    }
+  ].map(group => ({...group, keys: [], initialized: false}));
+  const groupById = new Map(groups.map(group => [group.id, group]));
+  const registry = new Map();
+  const state = {
+    records: [],
+    recordLimit: 4096,
+    cursor: 0,
+    sourceId: "",
+    metricWindow: "100",
+    axis: "model",
+    focus: {},
+    domains: new Map(),
+    catalogFetchedAt: 0,
+    polling: false,
+    status: null
+  };
+
+  const byId = id => document.getElementById(id);
+  const finiteNumber = value => {
+    if (typeof value === "boolean" || value === null || value === "") return null;
+    const converted = Number(value);
+    return Number.isFinite(converted) ? converted : null;
+  };
+  const metricValue = (record, fieldId) => finiteNumber(record?.metric_values?.[fieldId]);
+  const nested = (object, path) => path.reduce(
+    (value, key) => value && value[key] !== undefined ? value[key] : undefined,
+    object
+  );
+  const colorFor = fieldId => {
+    let hash = 0;
+    for (let index = 0; index < fieldId.length; index += 1) {
+      hash = ((hash << 5) - hash + fieldId.charCodeAt(index)) | 0;
+    }
+    return COLORS[Math.abs(hash) % COLORS.length];
+  };
+  const setStatus = (element, text, value) => {
+    element.textContent = text;
+    element.dataset.state = value;
+  };
+  const formatInteger = value => {
+    const number = finiteNumber(value);
+    return number === null ? "—" : number.toLocaleString("zh-CN", {
+      maximumFractionDigits: 20
+    });
+  };
+  const formatScalar = value => {
+    if (value === null || !Number.isFinite(value)) return "—";
+    const absolute = Math.abs(value);
+    if (absolute > 0 && absolute < .001) return value.toExponential(2);
+    if (absolute >= 1000) return value.toLocaleString("zh-CN", {
+      maximumFractionDigits: 12
+    });
+    const digits = absolute < .1 ? 4 : absolute < 10 ? 2 : 1;
+    return `${value > 0 ? "+" : ""}${value.toFixed(digits)}`;
+  };
+  const formatMetric = (metric, value) => {
+    if (!metric || value === null || !Number.isFinite(value)) return "—";
+    if (metric.unit === "%") return `${value.toFixed(1)}%`;
+    if (metric.unit === "ms") return `${formatScalar(value)} ms`;
+    if (["samples/s", "transitions/s"].includes(metric.unit)) {
+      return `${formatScalar(value)}/s`;
+    }
+    if (["samples", "transitions", "step", "update", "version"].includes(metric.unit)) {
+      return formatInteger(value);
+    }
+    return formatScalar(value);
+  };
+  const fieldIdsForGroup = group => [...registry.values()]
+    .filter(metric => metric.group === group.catalogGroup)
+    .map(metric => metric.field_id);
+  const groupSupportsAll = group => {
+    if (group.keys.length < 2) return false;
+    const dimensions = new Set(
+      group.keys.map(fieldId => registry.get(fieldId)?.dimension).filter(Boolean)
+    );
+    return dimensions.size === 1;
+  };
+  const normalizeFocus = group => {
+    const current = state.focus[group.id];
+    if (current === "all" && groupSupportsAll(group)) return;
+    if (group.keys.includes(current)) return;
+    state.focus[group.id] = groupSupportsAll(group) ? "all" : group.keys[0];
+  };
+
+  const applyCatalog = document => {
+    if (document?.schema_version !== 1 || document?.catalog_version !== 1 ||
+        !Array.isArray(document.fields)) {
+      throw new Error("metrics catalog contract mismatch");
+    }
+    const nextRegistry = new Map();
+    document.fields.forEach(field => {
+      const required = [
+        "field_id", "label", "group", "dimension", "unit",
+        "scope", "statistic", "value_kind"
+      ];
+      if (!required.every(key => typeof field[key] === "string" && field[key])) return;
+      nextRegistry.set(field.field_id, {...field, color: colorFor(field.field_id)});
+    });
+    registry.clear();
+    nextRegistry.forEach((value, key) => registry.set(key, value));
+    groups.forEach(group => {
+      const available = fieldIdsForGroup(group);
+      const availableSet = new Set(available);
+      if (!group.initialized) {
+        group.keys = group.initial.filter(fieldId => availableSet.has(fieldId));
+        if (!group.keys.length && available.length) group.keys = [available[0]];
+        group.initialized = true;
+      } else {
+        group.keys = group.keys.filter(fieldId => availableSet.has(fieldId));
+        if (!group.keys.length && available.length) {
+          const preferred = group.initial.find(fieldId => availableSet.has(fieldId));
+          group.keys = [preferred || available[0]];
+        }
+      }
+      normalizeFocus(group);
+      refreshPanelControls(group);
+    });
+  };
+
+  const refreshCatalog = async force => {
+    const now = Date.now();
+    if (!force && now - state.catalogFetchedAt < 10000) return;
+    const response = await fetch("/api/metrics/catalog", {cache: "no-store"});
+    if (!response.ok) throw new Error(`catalog HTTP ${response.status}`);
+    applyCatalog(await response.json());
+    state.catalogFetchedAt = now;
+  };
+
+  const svgElement = (name, attributes = {}) => {
+    const element = document.createElementNS(SVG_NS, name);
+    Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, String(value)));
+    return element;
+  };
+  const appendText = (svg, x, y, text, anchor = "start", className = "chart-axis") => {
+    const element = svgElement("text", {x, y, "text-anchor": anchor, class: className});
+    element.textContent = text;
+    svg.appendChild(element);
+  };
+  const axisValue = record => {
+    if (state.axis === "time") return finiteNumber(record.timestamp);
+    if (state.axis === "update") return metricValue(record, TRAIN_UPDATE_ID);
+    if (state.axis === "episode") return metricValue(record, TRAINING_EPISODE_ID);
+    return metricValue(record, MODEL_STEP_ID);
+  };
+  const axisLabel = record => {
+    const value = axisValue(record);
+    if (value === null) return "—";
+    return state.axis === "time"
+      ? formatWallTime(value)
+      : formatInteger(value);
+  };
+  const formatWallTime = timestamp => new Date(timestamp * 1000).toLocaleTimeString(
+    "zh-CN",
+    {hour: "2-digit", minute: "2-digit", second: "2-digit"}
+  );
+  const visibleRecordWindow = () => {
+    const duration = TIME_WINDOW_SECONDS.get(state.metricWindow);
+    if (!duration) {
+      return {records: state.records, timeDomain: null, mode: "unbounded"};
+    }
+    const timestamped = state.records.map(record => ({
+      record,
+      timestamp: finiteNumber(record.timestamp)
+    })).filter(item => item.timestamp !== null);
+    if (!timestamped.length) {
+      return {records: [], timeDomain: null, mode: "unavailable"};
+    }
+    const firstMetricTimestamp = Math.min(
+      ...timestamped.map(item => item.timestamp)
+    );
+    const latestMetricTimestamp = Math.max(
+      ...timestamped.map(item => item.timestamp)
+    );
+    const reportedStart = finiteNumber(state.status?.started_at);
+    const streamStart = reportedStart === null
+      ? firstMetricTimestamp
+      : Math.min(reportedStart, firstMetricTimestamp);
+    const warmingUp = latestMetricTimestamp - streamStart < duration;
+    const domainStart = warmingUp
+      ? streamStart
+      : latestMetricTimestamp - duration;
+    const domainEnd = domainStart + duration;
+    const epsilon = 1e-9;
+    const records = timestamped.filter(item =>
+      item.timestamp >= domainStart - epsilon &&
+      item.timestamp <= domainEnd + epsilon
+    ).map(item => item.record);
+    const firstVisibleTimestamp = records.length
+      ? finiteNumber(records[0].timestamp)
+      : null;
+    const safeDomainStart = firstVisibleTimestamp === null
+      ? domainStart
+      : Math.min(domainStart, firstVisibleTimestamp);
+    return {
+      records,
+      timeDomain: {minimum: safeDomainStart, maximum: domainEnd},
+      mode: warmingUp ? "warming-up" : "rolling"
+    };
+  };
+  const observedExtent = values => {
+    const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
+    if (!sorted.length) return null;
+    return {minimum: sorted[0], maximum: sorted[sorted.length - 1]};
+  };
+  const niceCeil = value => {
+    if (!(value > 0)) return 0;
+    const exponent = Math.floor(Math.log10(value));
+    const magnitude = 10 ** exponent;
+    const fraction = value / magnitude;
+    const step = [1, 2, 2.5, 5, 10].find(candidate => candidate >= fraction) || 10;
+    return step * magnitude;
+  };
+  const niceFloor = value => {
+    if (!(value > 0)) return 0;
+    const exponent = Math.floor(Math.log10(value));
+    const magnitude = 10 ** exponent;
+    const fraction = value / magnitude;
+    const candidates = [1, 2, 2.5, 5, 10].filter(candidate => candidate <= fraction);
+    return (candidates[candidates.length - 1] || 1) * magnitude;
+  };
+  const niceLower = value => value < 0 ? -niceCeil(Math.abs(value)) : niceFloor(value);
+  const niceUpper = value => value < 0 ? -niceFloor(Math.abs(value)) : niceCeil(value);
+  const targetDomain = (metric, values) => {
+    if (metric.dimension === "percentage") {
+      return {minimum: 0, maximum: 100, observedMinimum: 0, observedMaximum: 100, fixed: true};
+    }
+    const observed = observedExtent(values);
+    if (!observed) {
+      return {minimum: 0, maximum: 1, observedMinimum: 0, observedMaximum: 1, fixed: false};
+    }
+    const rawSpan = Math.max(observed.maximum - observed.minimum, 0);
+    const scale = Math.max(Math.abs(observed.minimum), Math.abs(observed.maximum), 1e-9);
+    const padding = Math.max(rawSpan * .08, scale * .04, 1e-9);
+    const zeroFloor = [
+      "sample_count", "sample_rate", "duration", "environment_step",
+      "cell_count"
+    ].includes(metric.dimension);
+    const zeroBaseline = metric.dimension === "loss";
+    let minimum;
+    let maximum;
+    if (zeroFloor) {
+      minimum = 0;
+      maximum = niceCeil(Math.max(observed.maximum + padding, 1e-9));
+    } else if (zeroBaseline) {
+      minimum = observed.minimum < 0
+        ? -niceCeil(Math.abs(observed.minimum - padding))
+        : 0;
+      maximum = observed.maximum > 0
+        ? niceCeil(observed.maximum + padding)
+        : 0;
+      if (minimum === maximum) {
+        minimum = -niceCeil(padding);
+        maximum = niceCeil(padding);
+      }
+    } else {
+      minimum = niceLower(observed.minimum - padding);
+      maximum = niceUpper(observed.maximum + padding);
+      if (minimum === maximum) {
+        const margin = niceCeil(Math.max(scale * .1, 1e-9));
+        minimum -= margin;
+        maximum += margin;
+      }
+    }
+    return {
+      minimum,
+      maximum,
+      observedMinimum: observed.minimum,
+      observedMaximum: observed.maximum,
+      fixed: false
+    };
+  };
+  const stableDomain = (group, keys, metric, values) => {
+    const target = targetDomain(metric, values);
+    if (target.fixed) return [target.minimum, target.maximum];
+    const domainKey = `${state.sourceId}|${group.id}|${keys.join(",")}`;
+    const now = Date.now();
+    let current = state.domains.get(domainKey);
+    if (!current) {
+      current = {minimum: target.minimum, maximum: target.maximum, insideSince: null};
+      state.domains.set(domainKey, current);
+      return [current.minimum, current.maximum];
+    }
+    const expands = target.minimum < current.minimum || target.maximum > current.maximum;
+    if (expands) {
+      current.minimum = Math.min(current.minimum, target.minimum);
+      current.maximum = Math.max(current.maximum, target.maximum);
+      current.insideSince = null;
+      return [current.minimum, current.maximum];
+    }
+    const span = current.maximum - current.minimum;
+    const innerMinimum = current.minimum + span * .2;
+    const innerMaximum = current.maximum - span * .2;
+    const inside = target.observedMinimum >= innerMinimum &&
+      target.observedMaximum <= innerMaximum;
+    if (!inside) {
+      current.insideSince = null;
+      return [current.minimum, current.maximum];
+    }
+    if (current.insideSince === null) current.insideSince = now;
+    if (now - current.insideSince >= 30000) {
+      current.minimum = target.minimum;
+      current.maximum = target.maximum;
+      current.insideSince = null;
+    }
+    return [current.minimum, current.maximum];
+  };
+  const pathFor = points => points.map(
+    (point, index) => `${index ? "L" : "M"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`
+  ).join(" ");
+
+  const renderPanel = group => {
+    const panel = document.querySelector(`[data-group="${group.id}"]`);
+    if (!panel) return;
+    const svg = panel.querySelector("svg");
+    svg.replaceChildren();
+    const visibleWindow = visibleRecordWindow();
+    const records = visibleWindow.records;
+    const selected = state.focus[group.id];
+    const keys = selected === "all" ? group.keys : selected ? [selected] : [];
+    const series = keys.map(fieldId => {
+      const metric = registry.get(fieldId);
+      const points = records.map((record, index) => ({
+        index,
+        record,
+        value: metricValue(record, fieldId)
+      })).filter(point => point.value !== null);
+      return {metric, points};
+    }).filter(item => item.metric && item.points.length);
+    panel.dataset.focus = selected || "";
+    svg.setAttribute(
+      "aria-label",
+      `${group.title} 曲线，横轴 ${
+        state.axis === "time" ? "Wall Time" :
+        state.axis === "update" ? "Train Update" :
+        state.axis === "episode" ? "Training Episode" : "Model Step"
+      }`
+    );
+    if (!records.length || !series.length) {
+      delete panel.dataset.yMin;
+      delete panel.dataset.yMax;
+      delete panel.dataset.xMin;
+      delete panel.dataset.xMax;
+      delete panel.dataset.windowMode;
+      appendText(svg, 340, 132, "等待指标", "middle", "empty-chart");
+      return;
+    }
+
+    const width = 680;
+    const height = 260;
+    const left = 72;
+    const right = 18;
+    const top = 15;
+    const bottom = 39;
+    const chartWidth = width - left - right;
+    const chartHeight = height - top - bottom;
+    const rawValues = series.flatMap(item => item.points.map(point => point.value));
+    const [minimum, maximum] = stableDomain(
+      group, keys, series[0].metric, rawValues
+    );
+    panel.dataset.yMin = String(minimum);
+    panel.dataset.yMax = String(maximum);
+    const yFor = value => top + (maximum - value) / (maximum - minimum) * chartHeight;
+    const observedTimeDomain = state.axis === "time" && !visibleWindow.timeDomain
+      ? observedExtent(records.map(record => finiteNumber(record.timestamp)))
+      : null;
+    const timeDomain = state.axis === "time"
+      ? visibleWindow.timeDomain || (observedTimeDomain && {
+          minimum: observedTimeDomain.minimum,
+          maximum: observedTimeDomain.maximum
+        })
+      : null;
+    if (timeDomain) {
+      panel.dataset.xMin = String(timeDomain.minimum);
+      panel.dataset.xMax = String(timeDomain.maximum);
+      panel.dataset.windowMode = visibleWindow.mode;
+    } else {
+      delete panel.dataset.xMin;
+      delete panel.dataset.xMax;
+      delete panel.dataset.windowMode;
+    }
+    const xFor = (record, index) => {
+      if (!timeDomain) {
+        return records.length === 1
+          ? left + chartWidth / 2
+          : left + index / (records.length - 1) * chartWidth;
+      }
+      const timestamp = finiteNumber(record.timestamp);
+      const span = timeDomain.maximum - timeDomain.minimum;
+      if (timestamp === null || !(span > 0)) return left;
+      const ratio = Math.max(
+        0,
+        Math.min(1, (timestamp - timeDomain.minimum) / span)
+      );
+      return left + ratio * chartWidth;
+    };
+    const axisMetric = series[0].metric;
+
+    for (let tick = 0; tick < 5; tick += 1) {
+      const ratio = tick / 4;
+      const y = top + ratio * chartHeight;
+      svg.appendChild(svgElement("line", {
+        x1: left, y1: y, x2: width - right, y2: y, class: "chart-grid"
+      }));
+      appendText(
+        svg,
+        left - 8,
+        y + 4,
+        formatMetric(axisMetric, maximum - ratio * (maximum - minimum)),
+        "end"
+      );
+    }
+    if (timeDomain) {
+      for (let tick = 0; tick < 4; tick += 1) {
+        const ratio = tick / 3;
+        appendText(
+          svg,
+          left + ratio * chartWidth,
+          height - 12,
+          formatWallTime(
+            timeDomain.minimum + ratio * (timeDomain.maximum - timeDomain.minimum)
+          ),
+          tick === 0 ? "start" : tick === 3 ? "end" : "middle"
+        );
+      }
+    } else {
+      const tickIndices = [...new Set([
+        0,
+        Math.round((records.length - 1) / 3),
+        Math.round(2 * (records.length - 1) / 3),
+        records.length - 1
+      ])];
+      tickIndices.forEach((index, tick) => appendText(
+        svg,
+        xFor(records[index], index),
+        height - 12,
+        axisLabel(records[index]),
+        tick === 0 ? "start" : tick === tickIndices.length - 1 ? "end" : "middle"
+      ));
+    }
+
+    const clipId = `plot-${group.id}`;
+    const defs = svgElement("defs");
+    const clipPath = svgElement("clipPath", {id: clipId});
+    clipPath.appendChild(svgElement("rect", {
+      x: left, y: top, width: chartWidth, height: chartHeight
+    }));
+    defs.appendChild(clipPath);
+    svg.appendChild(defs);
+    series.forEach(item => {
+      const rawPoints = item.points.map(point => ({
+        x: xFor(point.record, point.index), y: yFor(point.value)
+      }));
+      const color = `var(${item.metric.color})`;
+      svg.appendChild(svgElement("path", {
+        d: pathFor(rawPoints), class: "chart-raw", stroke: color,
+        "clip-path": `url(#${clipId})`
+      }));
+      const latest = rawPoints[rawPoints.length - 1];
+      svg.appendChild(svgElement("circle", {
+        cx: latest.x, cy: latest.y, r: 4.5, class: "chart-point",
+        stroke: color, "clip-path": `url(#${clipId})`
+      }));
+    });
+  };
+
+  const renderAllPanels = () => groups.forEach(renderPanel);
+  const closeAllPickers = () => {
+    document.querySelectorAll(".registry-picker").forEach(element => {
+      element.hidden = true;
+    });
+    document.querySelectorAll(".add-metric").forEach(element => {
+      element.setAttribute("aria-expanded", "false");
+    });
+  };
+  const catalogCandidates = group => {
+    const tracked = new Set(group.keys);
+    return fieldIdsForGroup(group).filter(fieldId => !tracked.has(fieldId));
+  };
+
+  function refreshPanelControls(group) {
+    const panel = document.querySelector(`[data-group="${group.id}"]`);
+    if (!panel) return;
+    normalizeFocus(group);
+    const tags = panel.querySelector(".tags");
+    const picker = panel.querySelector(".registry-picker");
+    tags.replaceChildren();
+    const addTag = (fieldId, label, color) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "tag";
+      button.dataset.metric = fieldId;
+      button.setAttribute("aria-pressed", String(state.focus[group.id] === fieldId));
+      button.setAttribute(
+        "aria-label",
+        fieldId === "all"
+          ? `显示 ${group.title} 全部曲线`
+          : `在 ${group.title} 聚焦 ${label}`
+      );
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.color = color;
+      const text = document.createElement("span");
+      text.textContent = label;
+      button.append(swatch, text);
+      button.addEventListener("click", () => {
+        state.focus[group.id] = fieldId;
+        refreshPanelControls(group);
+        renderPanel(group);
+      });
+      tags.appendChild(button);
+    };
+    if (groupSupportsAll(group)) addTag("all", "全部", "var(--secondary)");
+    group.keys.forEach(fieldId => {
+      const metric = registry.get(fieldId);
+      if (metric) addTag(fieldId, metric.label, `var(${metric.color})`);
+    });
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "add-metric";
+    add.textContent = "＋";
+    add.setAttribute("aria-label", `向 ${group.title} 添加追踪变量`);
+    add.setAttribute("aria-expanded", "false");
+    add.addEventListener("click", () => {
+      const open = picker.hidden;
+      closeAllPickers();
+      picker.hidden = !open;
+      add.setAttribute("aria-expanded", String(open));
+      if (open) refreshPicker(group, picker);
+    });
+    tags.appendChild(add);
+  }
+
+  const refreshPicker = (group, picker) => {
+    picker.replaceChildren();
+    const candidates = catalogCandidates(group);
+    if (!candidates.length) {
+      const empty = document.createElement("div");
+      empty.className = "registry-empty";
+      empty.textContent = "暂无可添加变量";
+      picker.appendChild(empty);
+      return;
+    }
+    candidates.forEach(fieldId => {
+      const metric = registry.get(fieldId);
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "registry-option";
+      option.setAttribute(
+        "aria-label",
+        `添加 ${metric.label}，字段 ID ${metric.field_id}`
+      );
+      const label = document.createElement("span");
+      label.textContent = metric.label;
+      const id = document.createElement("span");
+      id.className = "registry-id";
+      id.textContent = metric.field_id;
+      option.append(label, id);
+      option.addEventListener("click", () => {
+        if (!group.keys.includes(fieldId)) group.keys.push(fieldId);
+        state.focus[group.id] = fieldId;
+        closeAllPickers();
+        refreshPanelControls(group);
+        renderPanel(group);
+      });
+      picker.appendChild(option);
+    });
+  };
+
+  const buildPanels = () => {
+    const grid = byId("panel-grid");
+    groups.forEach(group => {
+      const panel = document.createElement("section");
+      panel.className = "panel";
+      panel.dataset.group = group.id;
+      panel.setAttribute("aria-label", `${group.title} 独立统计面板`);
+      const head = document.createElement("div");
+      head.className = "panel-head";
+      const title = document.createElement("h2");
+      title.className = "panel-title";
+      title.textContent = group.title;
+      head.appendChild(title);
+      const tags = document.createElement("div");
+      tags.className = "tags";
+      tags.setAttribute("aria-label", `${group.title} 曲线标签`);
+      const picker = document.createElement("div");
+      picker.className = "registry-picker";
+      picker.hidden = true;
+      const wrap = document.createElement("div");
+      wrap.className = "chart-wrap";
+      const chart = svgElement("svg", {
+        class: "chart", viewBox: "0 0 680 260", role: "img"
+      });
+      wrap.appendChild(chart);
+      panel.append(head, tags, picker, wrap);
+      grid.appendChild(panel);
+      refreshPanelControls(group);
+      renderPanel(group);
+    });
+  };
+
+  const resetStream = sourceId => {
+    state.records = [];
+    state.cursor = 0;
+    state.sourceId = sourceId || "";
+    state.domains.clear();
+    state.catalogFetchedAt = 0;
+    renderAllPanels();
+  };
+  const ingest = records => {
+    if (!Array.isArray(records) || !records.length) return;
+    records = records.filter(
+      record => record.metrics_source_id === state.sourceId
+    );
+    if (!records.length) return;
+    const bySequence = new Map(
+      state.records.map(record => [
+        Number(record.sequence),
+        record
+      ])
+    );
+    records.forEach(record => {
+      const sequence = Number(record.sequence);
+      if (sequence > 0) bySequence.set(sequence, record);
+    });
+    state.records = [...bySequence.values()].sort(
+      (left, right) =>
+        Number(left.sequence) - Number(right.sequence)
+    ).slice(-state.recordLimit);
+    const latest = state.records[state.records.length - 1];
+    state.cursor = latest
+      ? Number(latest.sequence)
+      : 0;
+  };
+  const renderStatus = (status, record) => {
+    const actor = record?.actor || {};
+    const metricsAvailable = finiteNumber(status?.latest_sequence) !== null;
+    const learnerConnected = status?.service === "learner-metrics" && metricsAvailable;
+    const stale = status?.stale === true;
+    const freshnessUnavailable = status?.stale === null || status?.stale === undefined;
+    const serverPresent = Boolean(actor.instance_id);
+    const clientConnected = actor.client_session_recent === true;
+    const activeModelStep = finiteNumber(actor?.model_identity?.model_step);
+    const stagedModelStep = finiteNumber(
+      actor?.staged_model_identity?.model_step
+    );
+    const latestModelStep = finiteNumber(
+      record?.model?.latest_available_model_step ??
+      record?.model?.latest_model_identity?.model_step ??
+      record?.learner?.model_step
+    );
+    const hasActiveModel = Boolean(actor?.model_identity?.model_lineage_id) &&
+      activeModelStep !== null;
+    const lifecycleReady = actor.state === "AISERVER_STATE_READY" ||
+      (!actor.state && actor.ready === true);
+    const projectedServerReady = record?.chain?.server_pod?.ready;
+    const serverReady = serverPresent && (
+      projectedServerReady === true ||
+      (projectedServerReady === undefined && lifecycleReady &&
+        !actor.error && clientConnected && hasActiveModel)
+    );
+    byId("learner-count").textContent = learnerConnected ? "1 / 1" : "— / 1";
+    byId("server-count").textContent = !metricsAvailable
+      ? "— / 1"
+      : serverPresent ? "1 / 1" : "0 / 1";
+    setStatus(
+      byId("learner-state"),
+      !learnerConnected ? "指标不可用" : freshnessUnavailable ? "时效未知" : stale ? "等待指标" : "运行中",
+      !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
+    );
+    setStatus(
+      byId("server-state"),
+      serverReady ? "运行中" :
+        stale && actor.instance_id ? "状态过期" :
+        actor.error ? "异常" :
+        !serverPresent ? "未连接" :
+        actor.state === "AISERVER_STATE_DRAINING" ? "正在停止" :
+        actor.state === "AISERVER_STATE_STOPPED" ? "已停止" :
+        !hasActiveModel ? "模型同步中" :
+        !clientConnected ? "等待 Client" : "启动中",
+      serverReady ? "ok" : actor.error ? "bad" : "wait"
+    );
+    let modelSyncText = "等待模型信息";
+    if (!serverPresent) {
+      modelSyncText = "等待 AIServer 与 Client";
+    } else if (!hasActiveModel) {
+      modelSyncText = "等待首个可用模型";
+    } else if (latestModelStep === null) {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)}`;
+    } else if (activeModelStep < latestModelStep) {
+      const staged = stagedModelStep !== null &&
+        stagedModelStep > activeModelStep
+        ? ` · 已暂存 step ${formatInteger(stagedModelStep)}`
+        : "";
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)}` + staged +
+        ` · 最新 step ${formatInteger(latestModelStep)}` +
+        ` · 追赶 ${formatInteger(latestModelStep - activeModelStep)}`;
+    } else if (activeModelStep === latestModelStep) {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 已同步`;
+    } else {
+      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 分发状态待刷新`;
+    }
+    byId("server-model-sync").textContent = modelSyncText;
+    setStatus(
+      byId("live-status"),
+      !learnerConnected ? "连接失败" :
+        freshnessUnavailable ? "指标时效不可用" :
+        stale ? "指标已过期" : "实时",
+      !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
+    );
+    byId("run-context").textContent =
+      `Learner / ${status?.metrics_source_id || "等待训练实例"}`;
+    const eventViewStatus = record?.metric_event_views?.status;
+    const latestEventUpdate = finiteNumber(
+      record?.metric_event_views?.train_updates?.latest?.values?.latest_train_update_sequence
+    );
+    const eventNote = eventViewStatus === "incomplete"
+      ? ` · 历史事件存在缺口${latestEventUpdate === null ? "" :
+          `，最新 Update ${formatInteger(latestEventUpdate)}`}`
+      : eventViewStatus === "unavailable" ? " · 历史事件不可用" : "";
+    byId("stream-status").textContent =
+      `指标流：${status?.stream || "—"} · ` +
+      `stale=${status?.stale_status || "unavailable"} · ` +
+      `sequence ${formatInteger(status?.latest_sequence)}` + eventNote;
+  };
+  const renderSummary = record => {
+    const modelStep = metricValue(record, MODEL_STEP_ID);
+    const trainUpdate = metricValue(record, TRAIN_UPDATE_ID);
+    const trainedSamples = metricValue(record, TRAINED_SAMPLES_ID);
+    const producedSamples = metricValue(record, PRODUCED_SAMPLES_ID);
+    byId("model-step").textContent = formatInteger(modelStep);
+    byId("train-update").textContent = formatInteger(trainUpdate);
+    byId("trained-samples").textContent = formatInteger(trainedSamples);
+    byId("produced-samples").textContent =
+      formatInteger(producedSamples);
+  };
+
+  const poll = async () => {
+    if (state.polling) return;
+    state.polling = true;
+    try {
+      const statusResponse = await fetch("/api/status", {cache: "no-store"});
+      if (!statusResponse.ok) {
+        throw new Error(`status HTTP ${statusResponse.status}`);
+      }
+      const status = await statusResponse.json();
+      const retainedRecordLimit = Number(status.retained_record_limit);
+      if (Number.isInteger(retainedRecordLimit) && retainedRecordLimit > 0) {
+        state.recordLimit = retainedRecordLimit;
+        state.records = state.records.slice(-state.recordLimit);
+      }
+      const sourceChanged = state.sourceId !== status.metrics_source_id;
+      if (sourceChanged) resetStream(status.metrics_source_id);
+      await refreshCatalog(sourceChanged || registry.size === 0);
+      const metricsResponse = await fetch(
+        `/api/metrics?after_sequence=${encodeURIComponent(state.cursor)}` +
+        `&window=${encodeURIComponent(state.metricWindow)}`,
+        {cache: "no-store"}
+      );
+      if (!metricsResponse.ok) {
+        throw new Error(`metrics HTTP ${metricsResponse.status}`);
+      }
+      const document = await metricsResponse.json();
+      ingest(document.records || []);
+      state.status = status;
+      const latest = state.records[state.records.length - 1] || {};
+      renderStatus(status, latest);
+      renderSummary(latest);
+      groups.forEach(refreshPanelControls);
+      renderAllPanels();
+      byId("last-refresh").textContent =
+        `最近刷新 ${new Date().toLocaleTimeString("zh-CN")}`;
+    } catch (error) {
+      setStatus(byId("live-status"), "连接失败", "bad");
+      setStatus(byId("learner-state"), "未连接", "bad");
+      setStatus(byId("server-state"), "状态未知", "bad");
+      byId("learner-count").textContent = "— / 1";
+      byId("server-count").textContent = "— / 1";
+      byId("stream-status").textContent = `指标流：${String(error)}`;
+      byId("last-refresh").textContent =
+        `连接中断 ${new Date().toLocaleTimeString("zh-CN")}`;
+    } finally {
+      state.polling = false;
+    }
+  };
+
+  byId("metric-window").addEventListener("change", event => {
+    state.metricWindow = event.target.value;
+    state.records = [];
+    state.cursor = 0;
+    state.domains.clear();
+    renderAllPanels();
+    poll();
+  });
+  byId("axis").addEventListener("change", event => {
+    state.axis = event.target.value;
+    renderAllPanels();
+  });
+
+  state.metricWindow = byId("metric-window").value;
+  state.axis = byId("axis").value;
+  buildPanels();
+  poll();
+  setInterval(poll, 1000);
+</script>
+</body>
+</html>

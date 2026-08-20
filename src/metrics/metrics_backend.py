@@ -24,7 +24,7 @@ class MetricsBackend(abc.ABC):
 
     @abc.abstractmethod
     def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
-        """查询 train_step > since_step 的记录，limit=0 表示不限制"""
+        """查询 sequence > since_step 的记录，limit=0 表示不限制"""
         ...
 
     @abc.abstractmethod
@@ -43,6 +43,29 @@ class MetricsBackend(abc.ABC):
         ...
 
 
+class DisabledMetricsBackend(MetricsBackend):
+    """Fail-open sink used when the optional metrics store is unavailable."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+
+    def write(self, record: dict):
+        del record
+
+    def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
+        del since_step, limit
+        return []
+
+    def latest(self) -> Optional[dict]:
+        return None
+
+    def summary(self) -> dict:
+        return {"enabled": False, "reason": self.reason}
+
+    def close(self):
+        return None
+
+
 class JsonlBackend(MetricsBackend):
     """
     JSON Lines 文件存储后端
@@ -51,7 +74,7 @@ class JsonlBackend(MetricsBackend):
     支持增量读取（尾部追加写入 + 文件偏移缓存），适合长时间训练监控。
     """
 
-    def __init__(self, metrics_dir: str, run_id: str = ""):
+    def __init__(self, metrics_dir: str):
         """
         Args:
             metrics_dir: 指标数据目录（自动创建）
@@ -61,18 +84,15 @@ class JsonlBackend(MetricsBackend):
 
         # 当前写入文件
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        safe_run_id = "".join(
-            ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id
-        ).strip("._")
-        run_part = f"{safe_run_id}_" if safe_run_id else ""
         self._filepath = os.path.join(
-            self._metrics_dir, f"metrics_{run_part}{timestamp}.jsonl"
+            self._metrics_dir, f"metrics_{timestamp}.jsonl"
         )
         self._file = open(self._filepath, "a", encoding="utf-8")
         self._lock = threading.Lock()
 
-        # 内存缓存（用于快速查询，避免每次读文件）
-        self._records: List[dict] = []
+        # 无界训练不能把每秒完整记录永久留在 Learner 内存中。查询按需读 JSONL；
+        # 这里只保留常量空间的 latest 与摘要累加器。
+        self._latest_record: Optional[dict] = None
         self._total_written = 0
 
         print(f"[MetricsBackend] 指标文件: {self._filepath}")
@@ -86,39 +106,48 @@ class JsonlBackend(MetricsBackend):
 
             self._file.flush()
 
-            # 同步到内存缓存
-            self._records.append(record)
+            self._latest_record = json.loads(line)
 
     def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
-        """查询 train_step > since_step 的记录"""
+        """查询 sequence > since_step 的记录"""
         with self._lock:
-            result = [r for r in self._records if r.get("train_step", 0) > since_step]
-            if limit > 0:
-                result = result[:limit]
+            self._file.flush()
+            result = []
+            with open(self._filepath, "r", encoding="utf-8") as source:
+                for raw_line in source:
+                    record = json.loads(raw_line)
+                    sequence = record.get("sequence")
+                    if (
+                        isinstance(sequence, bool)
+                        or not isinstance(sequence, int)
+                        or sequence <= since_step
+                    ):
+                        continue
+                    result.append(record)
+                    if limit > 0 and len(result) >= limit:
+                        break
             return result
 
     def latest(self) -> Optional[dict]:
         """返回最新一条记录"""
         with self._lock:
-            return self._records[-1] if self._records else None
+            return self._latest_record
 
     def summary(self) -> dict:
         """返回统计摘要"""
         with self._lock:
-            if not self._records:
+            if self._latest_record is None:
                 return {
-                    "total_steps": 0,
-                    "best_pass_rate": 0.0,
-                    "best_mean_reward": 0.0,
-                    "latest_loss": 0.0,
+                    "total_records": 0,
+                    "latest_sequence": None,
+                    "latest_timestamp": None,
                     "file": os.path.basename(self._filepath),
                 }
 
             return {
-                "total_steps": len(self._records),
-                "best_pass_rate": max(r.get("pass_rate", 0.0) for r in self._records),
-                "best_mean_reward": max(r.get("mean_episode_reward", 0.0) for r in self._records),
-                "latest_loss": self._records[-1].get("total_loss", 0.0),
+                "total_records": self._total_written,
+                "latest_sequence": self._latest_record.get("sequence"),
+                "latest_timestamp": self._latest_record.get("timestamp"),
                 "file": os.path.basename(self._filepath),
             }
 
@@ -141,10 +170,10 @@ class JsonlBackend(MetricsBackend):
     def record_count(self) -> int:
         """返回当前记录总数"""
         with self._lock:
-            return len(self._records)
+            return self._total_written
 
 
-def create_backend(backend_type: str, metrics_dir: str, run_id: str = "") -> MetricsBackend:
+def create_backend(backend_type: str, metrics_dir: str) -> MetricsBackend:
     """
     工厂函数：根据配置创建存储后端
 
@@ -155,6 +184,6 @@ def create_backend(backend_type: str, metrics_dir: str, run_id: str = "") -> Met
         MetricsBackend 实例
     """
     if backend_type == "jsonl":
-        return JsonlBackend(metrics_dir, run_id=run_id)
+        return JsonlBackend(metrics_dir)
     else:
         raise ValueError(f"不支持的存储后端类型: {backend_type}，当前仅支持 'jsonl'")
