@@ -1,4 +1,4 @@
-"""Task-neutral leased-sample PPO runtime for rl-contracts 0.13.0."""
+"""R-PIN processed-transition PPO runtime for rl-contracts 0.14.0."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ from src.contracts.identity import (
     manifest_message,
     model_identity_document,
     policy_spec_digest,
+    rollout_estimator_profile,
+    rollout_estimator_profile_document,
     schema_document,
     semantics_document,
     service_identity,
@@ -153,9 +155,8 @@ def training_chain_status(
             reasons.append(f"{name}_not_ready")
         if not document.get("instance_id"):
             reasons.append(f"{name}_instance_missing")
-    for field in ("ingress_ready", "pool_ready"):
-        if not sample_pool.get(field):
-            reasons.append(f"sample_pool_{field}_false")
+    if sample_pool.get("ingress_ready") is not True:
+        reasons.append("sample_pool_ingress_ready_false")
     if actor.get("client_session_recent") is not True:
         reasons.append("client_session_not_recent")
 
@@ -172,21 +173,14 @@ def training_chain_status(
 
     learner_step = int(_identity_dict(learner_model).get("model_step", -1))
     actor_step = int(_identity_dict(actor_model).get("model_step", -1))
-    model_lag = learner_step - actor_step
-    if learner_step < 0 or actor_step < 0 or not 0 <= model_lag <= 1:
-        reasons.append("actor_model_lag_invalid")
-    actual_batch_size = int(learner.get("actual_batch_size", 0) or 0)
-    if actual_batch_size:
-        policy_lag = int(learner.get("policy_lag", -1))
-        maximum = int(learner.get("max_policy_lag", -1))
-        if policy_lag < 0 or maximum < 0 or policy_lag > maximum:
-            reasons.append("training_policy_lag_invalid")
+    model_lag = (
+        None
+        if learner_step < 0 or actor_step < 0
+        else learner_step - actor_step
+    )
 
     actor_state = str(actor.get("state", ""))
-    actor_lifecycle_ready = (
-        actor_state == "AISERVER_STATE_READY"
-        or (not actor_state and actor.get("ready") is True)
-    )
+    actor_lifecycle_ready = actor_state == "AISERVER_STATE_READY"
     server_pod_reasons: list[str] = []
     if actor.get("error"):
         server_pod_reasons.append("actor_status_error")
@@ -265,9 +259,10 @@ class ModelPublisher:
         "schema_version",
         "model_identity",
         "training_config_digest",
+        "rollout_estimator_profile_digest",
         "train_update_id",
         "behavior_model",
-        "batch_ids",
+        "item_ids",
         "stats",
         "sample_count",
         "train_updates",
@@ -292,6 +287,7 @@ class ModelPublisher:
         "trained_samples",
         "training_config_digest",
         "training_semantics",
+        "rollout_estimator_profile",
         "published_at_unix_ms",
         "ready",
     }
@@ -306,6 +302,7 @@ class ModelPublisher:
         self.tensor_dtype = str(model["tensor_dtype"])
         self.contract = contract_identity(config)
         self.semantics = training_semantics(config)
+        self.rollout_profile = rollout_estimator_profile(config)
         self.training_digest = training_config_digest(config)
         self.lineage_id = str(config["identity"]["model_lineage_id"])
         self.local_train_root = Path(str(model["local_train_dir"])).resolve()
@@ -321,13 +318,8 @@ class ModelPublisher:
         )
         if self.archive_interval_updates <= 0:
             raise ValueError("archive_interval_updates must be positive")
-        if (
-            self.publication_retention_steps
-            != self.MIN_ROLLING_PUBLICATIONS
-        ):
-            raise ValueError(
-                "publication_retention_steps must be exactly 101"
-            )
+        if self.publication_retention_steps <= 0:
+            raise ValueError("publication_retention_steps must be positive")
         self.initial_model_provenance: dict = {}
         self._prepared = False
 
@@ -521,7 +513,7 @@ class ModelPublisher:
         *,
         train_update_id: str,
         behavior_model: dict | None,
-        batch_ids: list[str],
+        item_ids: list[str],
         stats: dict,
         sample_count: int,
         train_updates: int,
@@ -530,7 +522,7 @@ class ModelPublisher:
         return {
             "train_update_id": train_update_id,
             "behavior_model": behavior_model or {},
-            "batch_ids": list(batch_ids),
+            "item_ids": list(item_ids),
             "stats": dict(stats),
             "sample_count": int(sample_count),
             "train_updates": int(train_updates),
@@ -543,6 +535,9 @@ class ModelPublisher:
             "model_architecture_id": self.semantics.model_architecture_id,
             "tensor_dtype": self.tensor_dtype,
             "training_config_digest": self.training_digest.hex,
+            "rollout_estimator_profile_digest": (
+                self.rollout_profile.profile_digest.hex
+            ),
             **self.initial_model_provenance,
         }
 
@@ -552,7 +547,7 @@ class ModelPublisher:
         *,
         train_update_id: str,
         behavior_model: dict | None,
-        batch_ids: list[str],
+        item_ids: list[str],
         stats: dict,
         sample_count: int,
         train_updates: int,
@@ -568,7 +563,7 @@ class ModelPublisher:
         metadata = self._checkpoint_metadata(
             train_update_id=train_update_id,
             behavior_model=behavior_model,
-            batch_ids=batch_ids,
+            item_ids=item_ids,
             stats=stats,
             sample_count=sample_count,
             train_updates=train_updates,
@@ -606,7 +601,7 @@ class ModelPublisher:
         *,
         train_update_id: str,
         behavior_model: dict | None,
-        batch_ids: list[str],
+        item_ids: list[str],
         stats: dict | None = None,
         sample_count: int = 0,
         train_updates: int = 0,
@@ -621,24 +616,18 @@ class ModelPublisher:
         if int(trained_samples) < 0 or int(sample_count) < 0:
             raise RuntimeError("training counters must be non-negative")
         if behavior_model:
-            if "model_step" in behavior_model:
-                minimum_behavior_step = behavior_model["model_step"]
-                maximum_behavior_step = behavior_model["model_step"]
-            else:
-                minimum_behavior_step = behavior_model.get(
-                    "minimum_model_step"
-                )
-                maximum_behavior_step = behavior_model.get(
-                    "maximum_model_step"
-                )
+            minimum_behavior_step = behavior_model.get(
+                "minimum_model_step", behavior_model.get("model_step")
+            )
+            maximum_behavior_step = behavior_model.get(
+                "maximum_model_step", behavior_model.get("model_step")
+            )
             if (
                 minimum_behavior_step is None
                 or maximum_behavior_step is None
-                or int(minimum_behavior_step) != int(maximum_behavior_step)
+                or int(minimum_behavior_step) > int(maximum_behavior_step)
             ):
-                raise RuntimeError(
-                    "training publication requires one behavior model step"
-                )
+                raise RuntimeError("behavior model step range is invalid")
         target = self.publication_path(step)
         if target.exists() or target.is_symlink():
             raise RuntimeError(f"model publication already exists: {target}")
@@ -658,7 +647,7 @@ class ModelPublisher:
             metadata = self._checkpoint_metadata(
                 train_update_id=train_update_id,
                 behavior_model=behavior_model,
-                batch_ids=batch_ids,
+                item_ids=item_ids,
                 stats=stats or {},
                 sample_count=sample_count,
                 train_updates=train_updates,
@@ -686,7 +675,7 @@ class ModelPublisher:
                     trainer,
                     train_update_id=train_update_id,
                     behavior_model=behavior_model,
-                    batch_ids=batch_ids,
+                    item_ids=item_ids,
                     stats=stats or {},
                     sample_count=sample_count,
                     train_updates=train_updates,
@@ -699,7 +688,7 @@ class ModelPublisher:
             artifact_digest = sha256_file(temporary_model)
             final_model_path = self.model_path(step)
             document = {
-                "manifest_schema_version": 2,
+                "manifest_schema_version": 3,
                 "contract": contract_document(self.contract),
                 "identity": {
                     "model_lineage_id": self.lineage_id,
@@ -726,17 +715,23 @@ class ModelPublisher:
                 "trained_samples": int(trained_samples),
                 "training_config_digest": self.training_digest.hex,
                 "training_semantics": semantics_document(self.semantics),
+                "rollout_estimator_profile": (
+                    rollout_estimator_profile_document(self.rollout_profile)
+                ),
                 "published_at_unix_ms": int(time.time() * 1000),
                 "ready": True,
             }
             document = finalize_manifest_digest(document)
             local_metadata = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "model_identity": document["identity"],
                 "training_config_digest": self.training_digest.hex,
+                "rollout_estimator_profile_digest": (
+                    self.rollout_profile.profile_digest.hex
+                ),
                 "train_update_id": train_update_id,
                 "behavior_model": behavior_model or {},
-                "batch_ids": list(batch_ids),
+                "item_ids": list(item_ids),
                 "stats": dict(stats or {}),
                 "sample_count": int(sample_count),
                 "train_updates": int(train_updates),
@@ -748,7 +743,7 @@ class ModelPublisher:
                 **document,
                 "train_update_id": train_update_id,
                 "behavior_model": behavior_model or {},
-                "batch_ids": list(batch_ids),
+                "item_ids": list(item_ids),
                 "retention": retention,
                 **self.initial_model_provenance,
             }
@@ -856,7 +851,7 @@ class ModelPublisher:
         expected_checkpoint_metadata = {
             "train_update_id": local_metadata.get("train_update_id"),
             "behavior_model": local_metadata.get("behavior_model", {}),
-            "batch_ids": local_metadata.get("batch_ids", []),
+            "item_ids": local_metadata.get("item_ids", []),
             "stats": local_metadata.get("stats", {}),
             "sample_count": local_metadata.get("sample_count"),
             "train_updates": local_metadata.get("train_updates"),
@@ -869,6 +864,9 @@ class ModelPublisher:
             "model_architecture_id": self.semantics.model_architecture_id,
             "tensor_dtype": self.tensor_dtype,
             "training_config_digest": self.training_digest.hex,
+            "rollout_estimator_profile_digest": (
+                self.rollout_profile.profile_digest.hex
+            ),
             **{
                 key: local_metadata[key]
                 for key in self.PROVENANCE_KEYS
@@ -876,7 +874,7 @@ class ModelPublisher:
             },
         }
         if (
-            document.get("manifest_schema_version") != 2
+            document.get("manifest_schema_version") != 3
             or document.get("contract") != contract_document(self.contract)
             or document.get("identity", {}).get("model_lineage_id")
             != self.lineage_id
@@ -905,15 +903,21 @@ class ModelPublisher:
             or document.get("seed") != self.seed
             or document.get("training_config_digest")
             != self.training_digest.hex
+            or document.get("rollout_estimator_profile")
+            != rollout_estimator_profile_document(self.rollout_profile)
             or not document.get("ready")
             or checkpoint.get("model_step") != version
             or metadata != expected_checkpoint_metadata
-            or local_metadata.get("schema_version") != 2
+            or local_metadata.get("schema_version") != 3
             or local_metadata.get("model_identity") != document.get("identity")
             or local_metadata.get("training_config_digest")
             != document.get("training_config_digest")
             or local_metadata.get("training_config_digest")
             != metadata.get("training_config_digest")
+            or local_metadata.get("rollout_estimator_profile_digest")
+            != self.rollout_profile.profile_digest.hex
+            or local_metadata.get("rollout_estimator_profile_digest")
+            != metadata.get("rollout_estimator_profile_digest")
             or local_metadata.get("train_updates")
             != document.get("train_updates")
             or local_metadata.get("train_updates") != version
@@ -921,7 +925,7 @@ class ModelPublisher:
             != document.get("trained_samples")
             or local_metadata.get("behavior_model")
             != metadata.get("behavior_model")
-            or local_metadata.get("batch_ids") != metadata.get("batch_ids")
+            or local_metadata.get("item_ids") != metadata.get("item_ids")
             or local_metadata.get("stats") != metadata.get("stats")
             or local_metadata.get("sample_count")
             != metadata.get("sample_count")
@@ -953,7 +957,7 @@ class ModelPublisher:
             **document,
             "train_update_id": local_metadata["train_update_id"],
             "behavior_model": local_metadata.get("behavior_model", {}),
-            "batch_ids": local_metadata.get("batch_ids", []),
+            "item_ids": local_metadata.get("item_ids", []),
             "retention": retention,
             **{
                 key: local_metadata[key]
@@ -1172,15 +1176,9 @@ class TrainingRuntime:
         self.contract = contract_identity(config)
         self.semantics = training_semantics(config)
         self.policy_digest = policy_spec_digest(config)
+        self.rollout_profile = rollout_estimator_profile(config)
         self.trainer = PPOTrainer(config)
         self.publisher = ModelPublisher(config)
-        if (
-            self.trainer.max_policy_lag + 1
-            > self.publisher.publication_retention_steps
-        ):
-            raise ValueError(
-                "max_policy_lag requires more retained model publications"
-            )
 
         learner_name = os.environ.get("RL_LEARNER_INSTANCE", "learner-0")
         instance = f"{learner_name}-{os.getpid()}-{int(time.time() * 1000)}"
@@ -1198,7 +1196,15 @@ class TrainingRuntime:
         self.model_manifests: dict[int, dict] = {}
         self._metrics_context = {
             "behavior_model": {},
-            "actual_batch_size": 0,
+            "actual_batch_size": None,
+            "requested_train_batch_size": int(
+                config["training"]["train_batch_size"]
+            ),
+            "pool_draw_slot_count": None,
+            "unique_item_count": None,
+            "duplicate_item_slot_count": None,
+            "sample_evaluation_count": None,
+            "optimizer_step_count": None,
             "disposition": "STARTING",
             "train_update_id": "",
             "error": "",
@@ -1211,12 +1217,13 @@ class TrainingRuntime:
             "train_updates": self.train_updates,
             "run_train_updates": self.train_updates,
             "run_trained_samples": self.trained_samples,
-            "policy_lag": 0,
-            "max_policy_lag": self.trainer.max_policy_lag,
+            "rollout_estimator_profile_digest": (
+                self.rollout_profile.profile_digest.hex
+            ),
         }
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
-        self._rate_snapshot: dict[str, float] = {}
+        self._rate_snapshot: dict[str, object] = {}
         self._last_actor_snapshot: dict = {}
         self._last_sample_pool_snapshot: dict = {}
         self._last_model_snapshot: dict = {}
@@ -1236,14 +1243,9 @@ class TrainingRuntime:
         sample = config["sample_pool"]
         sample_host = str(sample["host"])
         sample_port = int(sample["port"])
-        self.train_batch_size = int(sample["train_batch_size"])
-        self.max_train_batch_size = int(sample["max_train_batch_size"])
-        self.max_sample_age_ms = int(sample["max_sample_age_ms"])
+        self.train_batch_size = int(config["training"]["train_batch_size"])
         self.get_timeout_ms = int(sample["get_timeout_ms"])
         self.lease_timeout_ms = int(sample["lease_timeout_ms"])
-        self.finalize_drain_timeout_ms = int(
-            sample["finalize_drain_timeout_ms"]
-        )
         self.finalize_request_path = Path(sample["finalize_request_path"])
         self.finalize_complete_path = Path(sample["finalize_complete_path"])
         self.finalize_request_path.unlink(missing_ok=True)
@@ -1452,6 +1454,7 @@ class TrainingRuntime:
                 "trained_samples",
                 "training_config_digest",
                 "training_semantics",
+                "rollout_estimator_profile",
                 "published_at_unix_ms",
                 "ready",
             )
@@ -1567,7 +1570,7 @@ class TrainingRuntime:
             response, "available_floor_model_step"
         ) or not cls._has_field(response, "latest_available_model_step"):
             raise RuntimeError(
-                "model manifest response is missing the 0.13 available range"
+                "model manifest response is missing the 0.14 available range"
             )
         floor = int(response.available_floor_model_step)
         latest = int(response.latest_available_model_step)
@@ -1599,7 +1602,7 @@ class TrainingRuntime:
             return None
         if not has_floor or not has_latest:
             raise RuntimeError(
-                "model status is missing the 0.13 available range"
+                "model status is missing the 0.14 available range"
             )
         floor = int(status.available_floor_model_step)
         latest = int(status.latest_available_model_step)
@@ -1684,7 +1687,7 @@ class TrainingRuntime:
         )
         if (
             not manifest.ready
-            or int(manifest.manifest_schema_version) != 2
+            or int(manifest.manifest_schema_version) != 3
             or not _same_message(manifest.contract, self.contract)
             or not _same_message(
                 manifest.training_semantics, self.semantics
@@ -1692,6 +1695,14 @@ class TrainingRuntime:
             or not _same_message(
                 manifest.training_config_digest,
                 self.publisher.training_digest,
+            )
+            or not _same_message(
+                manifest.rollout_estimator_profile,
+                self.rollout_profile,
+            )
+            or not _same_message(
+                manifest.rollout_estimator_profile,
+                self.publisher.rollout_profile,
             )
             or identity.model_lineage_id != self.publisher.lineage_id
             or not self._has_field(identity, "model_step")
@@ -2003,7 +2014,7 @@ class TrainingRuntime:
             self.trainer,
             train_update_id=update_id,
             behavior_model=None,
-            batch_ids=[],
+            item_ids=[],
             train_updates=self.train_updates,
             trained_samples=self.trained_samples,
         )
@@ -2141,9 +2152,9 @@ class TrainingRuntime:
                 "sample pool status has another contract identity"
             )
         authority = self._sample_pool_authority(status.sample_pool)
-        if not status.ready or not status.pool_ready:
+        if not status.ready or not status.ingress_ready or status.finalized:
             raise _SamplePoolUnavailable(
-                "sample pool is not ready for the exact contract"
+                "sample pool service is not accepting the exact contract"
             )
         return authority
 
@@ -2193,21 +2204,6 @@ class TrainingRuntime:
         ):
             return None
         return manifest.identity
-
-    def _effective_max_policy_lag(self) -> int:
-        current_step = int(self.trainer.model_step)
-        if self._resolvable_model_identity(current_step) is None:
-            raise RuntimeError(
-                "current model manifest is not locally resolvable"
-            )
-        configured_max = int(self.trainer.max_policy_lag)
-        effective_max = 0
-        for lag in range(1, configured_max + 1):
-            step = current_step - lag
-            if step < 0 or self._resolvable_model_identity(step) is None:
-                break
-            effective_max = lag
-        return effective_max
 
     def _assert_sample_pool_ready(
         self,
@@ -2265,18 +2261,13 @@ class TrainingRuntime:
                 "GetBatch recovery requires the declared single-consumer "
                 "delivery contract"
             )
-        leased_samples = int(status.leased_samples)
-        leased_fragments = int(status.leased_fragments)
+        leased_transitions = int(status.leased_transitions)
         active_consumers = int(status.active_consumer_count)
         if (
-            leased_samples < 0
-            or leased_fragments < 0
+            leased_transitions < 0
             or active_consumers < 0
-            or (leased_samples == 0 and leased_fragments != 0)
-            or (leased_samples == 0 and active_consumers != 0)
-            or (leased_samples > 0 and leased_fragments == 0)
-            or leased_fragments > leased_samples
-            or (leased_samples > 0 and active_consumers != 1)
+            or (leased_transitions == 0 and active_consumers != 0)
+            or (leased_transitions > 0 and active_consumers != 1)
         ):
             raise RuntimeError(
                 "sample pool returned contradictory lease status while "
@@ -2319,17 +2310,14 @@ class TrainingRuntime:
                     return False
                 continue
 
-            if (
-                not status.ready
-                or not status.pool_ready
-                or int(status.leased_samples) > 0
-            ):
+            if not status.ready or int(status.leased_transitions) > 0:
                 stable_started = None
                 stable_confirmations = 0
                 state = (
-                    f"hidden lease samples={int(status.leased_samples)}"
-                    if int(status.leased_samples) > 0
-                    else "pool not ready"
+                    "hidden lease transitions="
+                    f"{int(status.leased_transitions)}"
+                    if int(status.leased_transitions) > 0
+                    else "sample pool service not ready"
                 )
                 self._mark_sample_wait(
                     "GET_BATCH_OUTCOME_UNKNOWN",
@@ -2381,31 +2369,18 @@ class TrainingRuntime:
 
     def _get_batch(
         self,
-        mode: int = training_pb2.BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
         ready_authority: common_pb2.ServiceInstanceIdentity | None = None,
     ):
-        effective_max_policy_lag = self._effective_max_policy_lag()
         response = self.sample_stub.GetBatch(
             training_pb2.GetBatchReq(
-                assembly=training_pb2.BatchAssemblySpec(
-                    target_samples=self.train_batch_size,
-                    max_samples=self.max_train_batch_size,
-                    mode=mode,
-                ),
+                requested_transitions=self.train_batch_size,
                 timeout_ms=self.get_timeout_ms,
                 consumer=self.learner_service,
                 lease_timeout_ms=self.lease_timeout_ms,
-                freshness=training_pb2.SampleFreshnessPolicy(
-                    model_lineage_id=self.publisher.lineage_id,
-                    reference_model_step=self.trainer.model_step,
-                    max_model_step_lag=effective_max_policy_lag,
-                    max_sample_age_ms=self.max_sample_age_ms,
-                    distribution_schema_id=(
-                        self.semantics.policy_distribution_schema_id
-                    ),
-                    policy_spec_digest=self.policy_digest,
-                ),
                 required_semantics=self.semantics,
+                required_rollout_estimator_profile_digest=(
+                    self.rollout_profile.profile_digest
+                ),
             ),
             timeout=max(2.0, self.get_timeout_ms / 1000.0 + 1.0),
         )
@@ -2426,9 +2401,9 @@ class TrainingRuntime:
                 or not self._same_authority(
                     response_authority, ready_authority
                 )
-                or int(response.leased_samples) <= 0
+                or int(response.leased_transitions) <= 0
                 or bool(response.delivery_id)
-                or len(response.batches) != 0
+                or len(response.items) != 0
             ):
                 raise RuntimeError(
                     "sample pool returned an incoherent busy delivery"
@@ -2447,24 +2422,16 @@ class TrainingRuntime:
         response_authority = self._sample_pool_authority(
             response.sample_pool
         )
-        minimum_samples = (
-            1
-            if mode == training_pb2.BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE
-            else self.train_batch_size
-        )
         if (
             response.ret_code != 0
             or not self._same_authority(
                 response_authority, ready_authority
             )
             or not response.delivery_id
-            or int(response.actual_batch_size) < minimum_samples
-            or int(response.actual_batch_size) > self.max_train_batch_size
-            or int(response.returned_samples)
-            != int(response.actual_batch_size)
-            or int(response.returned_fragments) != len(response.batches)
-            or int(response.leased_samples)
-            != int(response.actual_batch_size)
+            or int(response.actual_transition_count) != self.train_batch_size
+            or int(response.returned_transitions) != self.train_batch_size
+            or int(response.leased_transitions) != self.train_batch_size
+            or len(response.items) != self.train_batch_size
             or int(response.lease_deadline_unix_ms)
             <= int(time.time() * 1000)
         ):
@@ -2476,16 +2443,13 @@ class TrainingRuntime:
     def _get_batch_recovering(
         self,
         *,
-        mode: int = training_pb2.BATCH_ASSEMBLY_MODE_TARGET_BOUNDED,
         ready_authority: common_pb2.ServiceInstanceIdentity,
         deadline: float | None = None,
         ignore_stop: bool = False,
     ):
         expected = self._sample_pool_authority(ready_authority)
         try:
-            response = self._get_batch(
-                mode=mode, ready_authority=expected
-            )
+            response = self._get_batch(ready_authority=expected)
         except grpc.RpcError as error:
             if not self._is_retryable_sample_rpc(error):
                 raise
@@ -2521,183 +2485,226 @@ class TrainingRuntime:
         return response
 
     @staticmethod
-    def _validate_sample(sample: training_pb2.Sample) -> None:
-        values = [
-            *sample.observation,
-            *sample.next_observation,
-            sample.reward,
-            sample.old_log_probability,
-            sample.old_value_prediction,
-        ]
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("sample contains non-finite values")
-        if sample.action < 0 or sample.action >= 9:
-            raise ValueError("sample action is outside maze.action.v1")
-        if len(sample.observation) != 17 or len(sample.next_observation) != 17:
-            raise ValueError("sample does not match maze.observation.v3")
-        if sample.terminated and sample.truncated:
-            raise ValueError("sample cannot be terminated and truncated")
-        expected = (
-            training_pb2.TRANSITION_END_KIND_ENVIRONMENT_TERMINATED
-            if sample.terminated
-            else training_pb2.TRANSITION_END_KIND_EXTERNAL_TRUNCATION
-            if sample.truncated
-            else training_pb2.TRANSITION_END_KIND_CONTINUING
+    def _valid_sha256_digest(digest: common_pb2.ContentDigest) -> bool:
+        return (
+            digest.algorithm == common_pb2.DIGEST_ALGORITHM_SHA256
+            and len(digest.hex) == 64
+            and all(character in "0123456789abcdef" for character in digest.hex)
         )
-        if sample.end_kind != expected:
-            raise ValueError("sample end_kind conflicts with terminal flags")
 
-    def _validate_delivery(
-        self, response, *, allow_partial: bool = False
-    ) -> dict:
-        effective_max_policy_lag = self._effective_max_policy_lag()
-        minimum_samples = 1 if allow_partial else self.train_batch_size
+    def _validate_transition(
+        self, transition: training_pb2.ProcessedTransition
+    ) -> None:
+        values = [
+            *transition.observation,
+            *transition.next_observation,
+            transition.reward,
+            transition.behavior_log_probability,
+            transition.behavior_value,
+            transition.advantage,
+            transition.value_target,
+        ]
+        if self._has_field(transition, "bootstrap_value"):
+            values.append(transition.bootstrap_value)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("processed transition contains non-finite values")
         if (
-            response.result != training_pb2.GET_BATCH_RESULT_LEASED
-            or response.actual_batch_size < minimum_samples
-            or response.actual_batch_size > self.max_train_batch_size
-            or response.returned_samples != response.actual_batch_size
-            or response.returned_fragments != len(response.batches)
-            or not response.delivery_id
+            not transition.item_id
+            or not transition.environment_session_id
+            or not transition.episode_id
+            or not transition.segment_id
+            or int(transition.segment_transition_count) <= 0
+            or int(transition.transition_index)
+            >= int(transition.segment_transition_count)
+            or int(transition.action) < 0
+            or int(transition.action) >= self.publisher.action_dim
+            or len(transition.observation) != self.publisher.obs_dim
+            or len(transition.next_observation) != self.publisher.obs_dim
+            or int(transition.created_at_unix_ms) <= 0
         ):
-            raise ValueError("sample delivery violates bounded batch assembly")
-        sample_count = 0
-        behavior_steps: set[int] = set()
-        oldest_created_at = 0
-        newest_created_at = 0
-        now_ms = int(time.time() * 1000)
-        for batch in response.batches:
-            behavior = batch.behavior_policy
-            step = int(behavior.model_step)
-            lag = self.trainer.model_step - step
-            full_identity = self._resolvable_model_identity(step)
-            if (
-                not batch.batch_id
-                or not batch.trajectory_id
-                or not _same_message(batch.contract, self.contract)
-                or not _same_message(batch.training_semantics, self.semantics)
-                or behavior.model_lineage_id != self.publisher.lineage_id
-                or not self._has_field(behavior, "model_step")
-                or behavior.distribution_schema_id
-                != self.semantics.policy_distribution_schema_id
-                or not _same_message(
-                    behavior.policy_spec_digest, self.policy_digest
-                )
-                or lag < 0
-                or lag > effective_max_policy_lag
-                or full_identity is None
-                or batch.created_at_unix_ms <= 0
-                or now_ms - int(batch.created_at_unix_ms)
-                > self.max_sample_age_ms
-                or not batch.producer.instance_id
-                or batch.producer.component != "aiserver"
-                or batch.first_action_step > batch.last_action_step
-            ):
-                raise ValueError("sample batch identity is invalid")
-            if (
-                full_identity.model_lineage_id != behavior.model_lineage_id
-                or int(full_identity.model_step) != step
-            ):
-                raise ValueError("behavior policy cannot resolve to a model artifact")
-            behavior_steps.add(step)
-            created_at = int(batch.created_at_unix_ms)
-            oldest_created_at = (
-                created_at
-                if oldest_created_at == 0
-                else min(oldest_created_at, created_at)
+            raise ValueError("processed transition identity or shape is invalid")
+
+        behavior = transition.behavior_policy
+        if (
+            not behavior.model_lineage_id
+            or behavior.model_lineage_id != self.publisher.lineage_id
+            or not self._has_field(behavior, "model_step")
+            or int(behavior.model_step) > int(self.trainer.model_step)
+            or behavior.distribution_schema_id
+            != self.semantics.policy_distribution_schema_id
+            or not _same_message(behavior.policy_spec_digest, self.policy_digest)
+            or not self._valid_sha256_digest(behavior.artifact_digest)
+            or not self._valid_sha256_digest(behavior.manifest_digest)
+            or not _same_message(
+                transition.rollout_estimator_profile_digest,
+                self.rollout_profile.profile_digest,
             )
-            newest_created_at = max(newest_created_at, created_at)
-            digest_copy = training_pb2.SampleBatch()
-            digest_copy.CopyFrom(batch)
-            supplied = digest_copy.payload_digest.hex
-            digest_copy.ClearField("payload_digest")
-            actual = hashlib.sha256(
-                digest_copy.SerializeToString(deterministic=True)
-            ).hexdigest()
-            if supplied != actual:
-                raise ValueError("sample batch payload digest mismatch")
-            for index, sample in enumerate(batch.samples):
-                self._validate_sample(sample)
-                if index != len(batch.samples) - 1 and (
-                    sample.terminated or sample.truncated
-                ):
-                    raise ValueError("fragment continues after end transition")
-                sample_count += 1
-            terminal = bool(batch.samples and batch.samples[-1].terminated)
-            truncated = bool(batch.samples and batch.samples[-1].truncated)
-            if terminal:
-                if batch.bootstrap_valid or batch.bootstrap_value != 0.0:
-                    raise ValueError("terminated fragment must not bootstrap")
-            elif not batch.bootstrap_valid or not math.isfinite(
-                batch.bootstrap_value
+        ):
+            raise ValueError("processed transition behavior identity is invalid")
+
+        final_index = (
+            int(transition.segment_transition_count) - 1
+        )
+        bootstrap_present = self._has_field(transition, "bootstrap_value")
+        if not transition.segment_boundary:
+            if (
+                int(transition.transition_index) == final_index
+                or transition.environment_terminal
+                or transition.end_kind
+                != training_pb2.TRANSITION_END_KIND_CONTINUING
+                or transition.segment_close_reason
+                != training_pb2.SEGMENT_CLOSE_REASON_UNSPECIFIED
+                or transition.bootstrap_applied
+                or bootstrap_present
             ):
                 raise ValueError(
-                    "continuing or truncated fragment requires bootstrap"
+                    "non-boundary transition has contradictory segment facts"
                 )
-            if batch.trajectory_end != (terminal or truncated):
-                raise ValueError("trajectory_end conflicts with final sample")
-        if sample_count != response.actual_batch_size:
-            raise ValueError("delivery sample count does not match response")
-        if len(behavior_steps) != 1:
-            raise ValueError(
-                "one training delivery must contain exactly one behavior model step"
-            )
+            return
+
+        if int(transition.transition_index) != final_index:
+            raise ValueError("segment boundary is not the final transition")
+        terminal_reasons = {
+            training_pb2.SEGMENT_CLOSE_REASON_GOAL,
+            training_pb2.SEGMENT_CLOSE_REASON_TIME_LIMIT,
+        }
+        cut_reasons = {
+            training_pb2.SEGMENT_CLOSE_REASON_TMAX,
+            training_pb2.SEGMENT_CLOSE_REASON_CLIENT_CONTROLLED_CLOSE,
+            training_pb2.SEGMENT_CLOSE_REASON_CLIENT_RECOVERY_TIMEOUT,
+            training_pb2.SEGMENT_CLOSE_REASON_AISERVER_CONTROLLED_SHUTDOWN,
+        }
+        if transition.segment_close_reason in terminal_reasons:
+            if (
+                not transition.environment_terminal
+                or transition.end_kind
+                != training_pb2.TRANSITION_END_KIND_ENVIRONMENT_TERMINATED
+                or transition.bootstrap_applied
+                or not bootstrap_present
+                or float(transition.bootstrap_value) != 0.0
+            ):
+                raise ValueError("terminal segment has contradictory bootstrap facts")
+            return
+        if transition.segment_close_reason not in cut_reasons:
+            raise ValueError("segment boundary has an unknown close reason")
+        expected_end_kind = (
+            training_pb2.TRANSITION_END_KIND_EXTERNAL_TRUNCATION
+            if transition.segment_close_reason
+            == training_pb2.SEGMENT_CLOSE_REASON_TMAX
+            else training_pb2.TRANSITION_END_KIND_PRODUCER_ABORT
+        )
+        if (
+            transition.environment_terminal
+            or transition.end_kind != expected_end_kind
+            or not transition.bootstrap_applied
+            or not bootstrap_present
+        ):
+            raise ValueError("cut segment has contradictory bootstrap facts")
+
+    def _validate_delivery(self, response) -> dict:
+        if (
+            response.result != training_pb2.GET_BATCH_RESULT_LEASED
+            or int(response.actual_transition_count) != self.train_batch_size
+            or int(response.returned_transitions) != self.train_batch_size
+            or int(response.leased_transitions) != self.train_batch_size
+            or len(response.items) != self.train_batch_size
+            or not response.delivery_id
+        ):
+            raise ValueError("sample delivery violates exact transition batch size")
+
+        item_ids: set[str] = set()
+        behavior_steps: set[int] = set()
+        behavior_models: dict[int, dict] = {}
+        transition_created_at: list[int] = []
+        inserted_at: list[int] = []
+        draw_counts: list[int] = []
+        for item in response.items:
+            transition = item.transition
+            self._validate_transition(transition)
+            if (
+                not transition.item_id
+                or transition.item_id in item_ids
+                or int(item.insert_sequence) <= 0
+                or int(item.inserted_at_unix_ms) <= 0
+                or int(item.draw_count) <= 0
+            ):
+                raise ValueError("sample pool item facts are invalid or duplicated")
+            item_ids.add(transition.item_id)
+            behavior = transition.behavior_policy
+            step = int(behavior.model_step)
+            behavior_steps.add(step)
+            identity = {
+                "model_lineage_id": behavior.model_lineage_id,
+                "model_step": step,
+                "artifact_digest": behavior.artifact_digest.hex,
+                "manifest_digest": behavior.manifest_digest.hex,
+            }
+            previous = behavior_models.setdefault(step, identity)
+            if previous != identity:
+                raise ValueError(
+                    "one behavior model step has conflicting artifact identity"
+                )
+            transition_created_at.append(int(transition.created_at_unix_ms))
+            inserted_at.append(int(item.inserted_at_unix_ms))
+            draw_counts.append(int(item.draw_count))
+
         minimum_step = min(behavior_steps)
         maximum_step = max(behavior_steps)
+        oldest_created_at = min(transition_created_at)
+        newest_created_at = max(transition_created_at)
         if (
             not self._has_field(response, "minimum_behavior_model_step")
             or not self._has_field(response, "maximum_behavior_model_step")
             or response.minimum_behavior_model_step != minimum_step
             or response.maximum_behavior_model_step != maximum_step
-            or response.oldest_sample_created_at_unix_ms
-            != oldest_created_at
-            or response.newest_sample_created_at_unix_ms
-            != newest_created_at
+            or not self._has_field(
+                response, "oldest_transition_created_at_unix_ms"
+            )
+            or not self._has_field(
+                response, "newest_transition_created_at_unix_ms"
+            )
+            or response.oldest_transition_created_at_unix_ms != oldest_created_at
+            or response.newest_transition_created_at_unix_ms != newest_created_at
         ):
-            raise ValueError("delivery summary does not match fragment identities")
-        models = [
-            dict(self.model_manifests[step]["identity"])
-            for step in sorted(behavior_steps)
-        ]
+            raise ValueError("delivery summary does not match transition facts")
         return {
             "model_lineage_id": self.publisher.lineage_id,
             "minimum_model_step": minimum_step,
             "maximum_model_step": maximum_step,
-            "models": models,
+            "models": [behavior_models[step] for step in sorted(behavior_steps)],
+            "oldest_transition_created_at_unix_ms": oldest_created_at,
+            "newest_transition_created_at_unix_ms": newest_created_at,
+            "oldest_inserted_at_unix_ms": min(inserted_at),
+            "newest_inserted_at_unix_ms": max(inserted_at),
+            "draw_count_sum": sum(draw_counts),
+            "draw_count_minimum": min(draw_counts),
+            "draw_count_maximum": max(draw_counts),
         }
 
-    def _training_samples(self, batches) -> list[dict]:
-        result: list[dict] = []
-        for batch in batches:
-            trajectory = [
-                {
-                    "observation": list(sample.observation),
-                    "next_observation": list(sample.next_observation),
-                    "action": int(sample.action),
-                    "reward": float(sample.reward),
-                    "old_log_probability": float(
-                        sample.old_log_probability
-                    ),
-                    "old_value_prediction": float(
-                        sample.old_value_prediction
-                    ),
-                    "terminated": bool(sample.terminated),
-                    "truncated": bool(sample.truncated),
-                    "action_step": int(sample.action_step),
-                }
-                for sample in batch.samples
-            ]
-            processed = self.trainer.compute_gae(
-                trajectory,
-                bootstrap_value=float(batch.bootstrap_value),
-                bootstrap_valid=bool(batch.bootstrap_valid),
-            )
-            for sample in processed:
-                sample["behavior_model_step"] = int(
-                    batch.behavior_policy.model_step
-                )
-            result.extend(processed)
-        return result
+    @staticmethod
+    def _training_samples(items) -> list[dict]:
+        return [
+            {
+                "observation": list(item.transition.observation),
+                "next_observation": list(item.transition.next_observation),
+                "action": int(item.transition.action),
+                "reward": float(item.transition.reward),
+                "old_log_probability": float(
+                    item.transition.behavior_log_probability
+                ),
+                "old_value_prediction": float(
+                    item.transition.behavior_value
+                ),
+                "advantage": float(item.transition.advantage),
+                "value_target": float(item.transition.value_target),
+                "action_step": int(item.transition.action_step),
+                "behavior_model_step": int(
+                    item.transition.behavior_policy.model_step
+                ),
+                "item_id": item.transition.item_id,
+            }
+            for item in items
+        ]
 
     def _ack(
         self,
@@ -2923,24 +2930,28 @@ class TrainingRuntime:
             self.model_manifests.pop(target_step, None)
         self._discard_update_rollback(context)
 
-    def _train_delivery(self, response, *, allow_partial: bool = False) -> None:
-        behavior_identity = self._validate_delivery(
-            response, allow_partial=allow_partial
-        )
+    def _train_delivery(self, response) -> None:
+        behavior_identity = self._validate_delivery(response)
         delivery_authority = self._sample_pool_authority(
             response.sample_pool
         )
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
-        batch_ids = [batch.batch_id for batch in response.batches]
+        item_ids = [item.transition.item_id for item in response.items]
+        pool_draw_slot_count = int(response.actual_transition_count)
+        unique_item_count = len(set(item_ids))
+        duplicate_item_slot_count = len(item_ids) - unique_item_count
         receipt = {
-            "schema_version": 1,
+            "schema_version": 2,
             "train_update_id": update_id,
             "delivery_id": response.delivery_id,
             "behavior_model": behavior_identity,
-            "batch_ids": batch_ids,
+            "item_ids": item_ids,
             "state": "LEASED",
-            "sample_count": int(response.actual_batch_size),
+            "transition_count": int(response.actual_transition_count),
+            "pool_draw_slot_count": pool_draw_slot_count,
+            "unique_item_count": unique_item_count,
+            "duplicate_item_slot_count": duplicate_item_slot_count,
             "sample_pool_authority": self._authority_document(
                 delivery_authority
             ),
@@ -2964,6 +2975,8 @@ class TrainingRuntime:
         stats: dict = {}
         raw_metric_sum_counts: dict[str, dict[str, float | int]] = {}
         training_samples: list[dict] = []
+        sample_evaluation_count: int | None = None
+        optimizer_step_count: int | None = None
         target_updates = self.train_updates
         target_samples = self.trained_samples
         try:
@@ -2973,8 +2986,14 @@ class TrainingRuntime:
                 raise RuntimeError(
                     f"pre-update rollback capture failed: {error}"
                 ) from error
-            training_samples = self._training_samples(response.batches)
+            training_samples = self._training_samples(response.items)
             stats = self.trainer.train_on_batch(training_samples)
+            sample_evaluation_count = int(stats["sample_evaluation_count"])
+            optimizer_step_count = int(stats["optimizer_step_count"])
+            if sample_evaluation_count <= 0 or optimizer_step_count <= 0:
+                raise RuntimeError(
+                    "PPO update returned non-positive execution facts"
+                )
             raw_metric_reader = getattr(
                 self.trainer, "raw_metric_sum_counts", None
             )
@@ -2989,7 +3008,7 @@ class TrainingRuntime:
                 self.trainer,
                 train_update_id=update_id,
                 behavior_model=behavior_identity,
-                batch_ids=batch_ids,
+                item_ids=item_ids,
                 stats=stats,
                 sample_count=len(training_samples),
                 train_updates=target_updates,
@@ -3009,7 +3028,7 @@ class TrainingRuntime:
                 self.trainer,
                 train_update_id=update_id,
                 behavior_model=behavior_identity,
-                batch_ids=batch_ids,
+                item_ids=item_ids,
                 stats=stats,
                 sample_count=len(training_samples),
                 train_updates=target_updates,
@@ -3073,6 +3092,12 @@ class TrainingRuntime:
                     train_updates=target_updates,
                     trained_samples=target_samples,
                     stats=stats,
+                    requested_train_batch_size=self.train_batch_size,
+                    pool_draw_slot_count=pool_draw_slot_count,
+                    unique_item_count=unique_item_count,
+                    duplicate_item_slot_count=duplicate_item_slot_count,
+                    sample_evaluation_count=sample_evaluation_count,
+                    optimizer_step_count=optimizer_step_count,
                 )
                 transaction_complete = True
             self._record_train_update_fact_best_effort(
@@ -3084,22 +3109,13 @@ class TrainingRuntime:
                 trained_samples=target_samples,
                 actual_batch_size=len(training_samples),
                 raw_metric_sum_counts=raw_metric_sum_counts,
+                requested_train_batch_size=self.train_batch_size,
+                pool_draw_slot_count=pool_draw_slot_count,
+                unique_item_count=unique_item_count,
+                duplicate_item_slot_count=duplicate_item_slot_count,
+                sample_evaluation_count=sample_evaluation_count,
+                optimizer_step_count=optimizer_step_count,
             )
-            minimum_protected = max(
-                0,
-                int(self.trainer.model_step)
-                - int(self.trainer.max_policy_lag),
-            )
-            self.publisher.prune_publications(
-                self.trainer.model_step,
-                protected_steps=range(
-                    minimum_protected,
-                    int(self.trainer.model_step) + 1,
-                ),
-            )
-            for version in tuple(self.model_manifests):
-                if version < minimum_protected:
-                    self.model_manifests.pop(version, None)
         except Exception as error:
             failed_state = str(receipt.get("state", "LEASED"))
             if training_succeeded and not model_registered:
@@ -3134,6 +3150,14 @@ class TrainingRuntime:
                             train_updates=target_updates,
                             trained_samples=target_samples,
                             stats=stats,
+                            requested_train_batch_size=self.train_batch_size,
+                            pool_draw_slot_count=pool_draw_slot_count,
+                            unique_item_count=unique_item_count,
+                            duplicate_item_slot_count=(
+                                duplicate_item_slot_count
+                            ),
+                            sample_evaluation_count=sample_evaluation_count,
+                            optimizer_step_count=optimizer_step_count,
                         )
                 else:
                     try:
@@ -3199,6 +3223,12 @@ class TrainingRuntime:
                         train_updates=target_updates,
                         trained_samples=target_samples,
                         stats=stats,
+                        requested_train_batch_size=self.train_batch_size,
+                        pool_draw_slot_count=pool_draw_slot_count,
+                        unique_item_count=unique_item_count,
+                        duplicate_item_slot_count=duplicate_item_slot_count,
+                        sample_evaluation_count=sample_evaluation_count,
+                        optimizer_step_count=optimizer_step_count,
                     )
             elif (
                 not training_succeeded
@@ -3228,10 +3258,14 @@ class TrainingRuntime:
         for item in snapshot.values:
             descriptor = descriptors.get(item.field_id)
             if descriptor is None:
-                continue
+                raise ValueError(
+                    f"metric {item.field_id} has no descriptor"
+                )
             value = float(item.value)
             if not math.isfinite(value):
-                continue
+                raise ValueError(
+                    f"metric {item.field_id} has a non-finite value"
+                )
             values[item.field_id] = value
             labels[item.field_id] = descriptor.label
             descriptor_documents[item.field_id] = {
@@ -3299,6 +3333,21 @@ class TrainingRuntime:
             "timestamp": time.time(),
         }
 
+    @staticmethod
+    def _raw_mean(raw_sum: float, count: int) -> float | None:
+        if count < 0 or not math.isfinite(raw_sum):
+            raise ValueError("raw sum/count metric is invalid")
+        return None if count == 0 else raw_sum / count
+
+    @staticmethod
+    def _metric_boolean(values: dict[str, float], field_id: str) -> bool | None:
+        if field_id not in values:
+            return None
+        value = values[field_id]
+        if value not in (0.0, 1.0):
+            raise ValueError(f"metric {field_id} is not a boolean fact")
+        return value == 1.0
+
     def _actor_snapshot(self) -> dict:
         try:
             status = self.actor_stub.GetAIServerStatus(
@@ -3331,17 +3380,6 @@ class TrainingRuntime:
                     latest_reward_components[
                         field_id[len(prefix) : -len(latest_suffix)]
                     ] = value
-            if not transition_reward_components:
-                legacy_prefix = "server.reward.component."
-                for field_id, value in values.items():
-                    if field_id.startswith(legacy_prefix) and field_id.endswith(
-                        transition_suffix
-                    ):
-                        transition_reward_components[
-                            field_id[
-                                len(legacy_prefix) : -len(transition_suffix)
-                            ]
-                        ] = value
             episode_return = values.get(
                 "server.training.episode.learning_return.mean.v1"
             )
@@ -3351,8 +3389,14 @@ class TrainingRuntime:
             success_value = values.get(
                 "server.training.episode.success.agent_rate.v1"
             )
-            if success_value is not None and success_value > 1.0:
-                success_value /= 100.0
+            inference_count = int(status.inference_count)
+            push_rpc_count = int(status.push_rpc_count)
+            segment_close_counts = {
+                training_pb2.SegmentCloseReason.Name(item.reason): int(
+                    item.count
+                )
+                for item in status.segment_close_counts
+            }
             return {
                 "ready": bool(status.ready),
                 "state": training_pb2.AIServerState.Name(status.state),
@@ -3361,24 +3405,25 @@ class TrainingRuntime:
                 "active_sessions": int(
                     status.active_actor_session_count
                 ),
-                "active_trajectories": int(
-                    status.active_trajectory_count
+                "active_segments": int(status.active_segment_count),
+                "client_session_recent": self._metric_boolean(
+                    values, "server.client.session_recent.v1"
                 ),
-                "client_session_recent": (
-                    values.get("server.client.session_recent.v1") == 1.0
-                ),
-                "client_last_activity_unix_ms": int(
-                    values.get(
-                        "server.client.last_activity_unix_ms.v1", 0.0
-                    )
+                "client_last_activity_unix_ms": values.get(
+                    "server.client.last_activity_unix_ms.v1"
                 ),
                 "model_identity": model_identity_document(status.loaded_model),
                 "staged_model_identity": model_identity_document(
                     status.staged_model
                 ),
-                "produced": int(status.produced_unique_samples),
-                "produced_batches": int(status.produced_unique_batches),
-                "accepted": int(status.accepted_unique_samples),
+                "rollout_estimator_profile_digest": (
+                    status.rollout_estimator_profile_digest.hex or None
+                ),
+                "produced": int(status.produced_unique_transitions),
+                "produced_envelopes": int(
+                    status.produced_unique_envelopes
+                ),
+                "accepted": int(status.accepted_unique_transitions),
                 "push_attempts": int(status.push_attempt_count),
                 "duplicate_push_attempts": int(
                     status.duplicate_push_attempt_count
@@ -3387,20 +3432,63 @@ class TrainingRuntime:
                     status.rejected_push_attempt_count
                 ),
                 "retry_attempts": int(status.retry_attempt_count),
-                "final_drop": int(status.final_drop_unique_samples),
-                "outbound_pending": int(status.outbound_queue_samples),
-                "inference_count": int(status.inference_count),
-                "inference_mean_ms": (
-                    float(status.inference_latency_sum_ms)
-                    / max(1, int(status.inference_count))
+                "final_drop": int(status.final_drop_unique_transitions),
+                "outbound_queue_envelopes": int(
+                    status.outbound_queue_envelopes
                 ),
-                "inference_max_ms": float(status.inference_latency_max_ms),
-                "push_rpc_count": int(status.push_rpc_count),
-                "push_rpc_mean_ms": (
-                    float(status.push_rpc_latency_sum_ms)
-                    / max(1, int(status.push_rpc_count))
+                "outbound_queue_transitions": int(
+                    status.outbound_queue_transitions
                 ),
-                "push_rpc_max_ms": float(status.push_rpc_latency_max_ms),
+                "outbound_queue_estimated_bytes": int(
+                    status.outbound_queue_estimated_bytes
+                ),
+                "outbound_queue_high_watermark": int(
+                    status.outbound_queue_high_watermark
+                ),
+                "inference_count": inference_count,
+                "inference_latency_sum_ms": float(
+                    status.inference_latency_sum_ms
+                ),
+                "inference_mean_ms": self._raw_mean(
+                    float(status.inference_latency_sum_ms), inference_count
+                ),
+                "inference_max_ms": (
+                    None
+                    if inference_count == 0
+                    else float(status.inference_latency_max_ms)
+                ),
+                "push_rpc_count": push_rpc_count,
+                "push_rpc_latency_sum_ms": float(
+                    status.push_rpc_latency_sum_ms
+                ),
+                "push_rpc_mean_ms": self._raw_mean(
+                    float(status.push_rpc_latency_sum_ms), push_rpc_count
+                ),
+                "push_rpc_max_ms": (
+                    None
+                    if push_rpc_count == 0
+                    else float(status.push_rpc_latency_max_ms)
+                ),
+                "closed_segment_count": int(status.closed_segment_count),
+                "segment_close_counts": segment_close_counts,
+                "pending_action_excluded_count": int(
+                    status.pending_action_excluded_count
+                ),
+                "rollout_estimator_failure_count": int(
+                    status.rollout_estimator_failure_count
+                ),
+                "per_agent_model_activation_count": int(
+                    status.per_agent_model_activation_count
+                ),
+                "superseded_without_agent_activation_count": int(
+                    status.superseded_without_agent_activation_count
+                ),
+                "quarantined_transition_count": int(
+                    status.quarantined_transition_count
+                ),
+                "quarantined_envelope_count": int(
+                    status.quarantined_envelope_count
+                ),
                 "metric_source": {
                     "instance_id": status.metrics.source.instance_id,
                     "lifecycle_epoch": int(
@@ -3458,41 +3546,93 @@ class TrainingRuntime:
                 "pool_ready": bool(status.pool_ready),
                 "instance_id": status.sample_pool.instance_id,
                 "lifecycle_epoch": int(status.sample_pool.lifecycle_epoch),
-                "accepted": int(status.accepted_unique_samples),
-                "accepted_batches": int(status.accepted_unique_batches),
-                "acked": int(status.acked_unique_samples),
-                "acked_batches": int(status.acked_unique_batches),
-                "trained": int(status.trained_sample_count),
-                "stale": int(status.stale_sample_count),
-                "invalid": int(status.invalid_sample_count),
+                "backend_type": training_pb2.SampleBackendType.Name(
+                    status.backend_type
+                ),
+                "push_attempt_count": int(status.push_attempt_count),
+                "accepted": int(status.accepted_unique_transitions),
+                "accepted_envelopes": int(
+                    status.accepted_unique_envelopes
+                ),
+                "duplicate_push_attempt_count": int(
+                    status.duplicate_push_attempt_count
+                ),
+                "duplicate_transition_attempts": int(
+                    status.duplicate_transition_attempts
+                ),
+                "rejected_push_attempt_count": int(
+                    status.rejected_push_attempt_count
+                ),
+                "rejected_transition_attempts": int(
+                    status.rejected_transition_attempts
+                ),
+                "acked": int(status.acked_unique_transitions),
+                "acked_deliveries": int(status.acked_unique_deliveries),
+                "trained": int(status.trained_transition_count),
+                "invalid": int(status.invalid_transition_count),
                 "shutdown_untrained": int(
-                    status.shutdown_untrained_sample_count
+                    status.shutdown_untrained_transition_count
                 ),
                 "finalized": bool(status.finalized),
                 "finalization_id": status.finalization_id,
-                "finalized_at_unix_ms": int(
-                    status.finalized_at_unix_ms
+                "finalized_at_unix_ms": (
+                    int(status.finalized_at_unix_ms)
+                    if self._has_field(status, "finalized_at_unix_ms")
+                    else None
                 ),
-                "finalized_samples": int(
-                    status.finalized_sample_count
+                "finalized_transitions": int(
+                    status.finalized_transition_count
                 ),
-                "finalized_fragments": int(
-                    status.finalized_fragment_count
-                ),
-                "ready_samples": int(status.ready_queue_samples),
-                "ready_fragments": int(status.ready_queue_fragments),
-                "leased_samples": int(status.leased_samples),
-                "leased_fragments": int(status.leased_fragments),
-                "resident_samples": int(status.resident_samples),
-                "resident_fragments": int(status.resident_fragments),
+                "ready_transitions": int(status.ready_transitions),
+                "leased_transitions": int(status.leased_transitions),
+                "resident_transitions": int(status.resident_transitions),
+                "resident_envelopes": int(status.resident_envelopes),
                 "resident_estimated_bytes": int(
                     status.resident_estimated_bytes
                 ),
-                "evicted_samples": int(status.evicted_sample_count),
-                "evicted_fragments": int(status.evicted_fragment_count),
+                "capacity_transitions": int(status.capacity_transitions),
+                "capacity_bytes": int(status.capacity_bytes),
+                "pressure_state": training_pb2.PressureState.Name(
+                    status.pressure_state
+                ),
+                "evicted_transitions": int(
+                    status.evicted_transition_count
+                ),
+                "evicted_envelopes": int(status.evicted_envelope_count),
+                "unsampled_evicted_transitions": int(
+                    status.unsampled_evicted_transition_count
+                ),
+                "previously_drawn_evicted_transitions": int(
+                    status.previously_drawn_evicted_transition_count
+                ),
+                "draw_attempt_count": int(status.draw_attempt_count),
+                "drawn_transition_slot_count": int(
+                    status.drawn_transition_slot_count
+                ),
+                "target_hit_count": int(status.target_hit_count),
+                "partial_get_count": int(status.partial_get_count),
+                "empty_timeout_count": int(status.empty_timeout_count),
                 "redelivery_count": int(status.redelivery_count),
                 "nack_count": int(status.nack_count),
                 "expired_lease_count": int(status.expired_lease_count),
+                "lease_renew_count": int(status.lease_renew_count),
+                "oldest_ready_transition_age_ms": (
+                    int(status.oldest_ready_transition_age_ms)
+                    if self._has_field(
+                        status, "oldest_ready_transition_age_ms"
+                    )
+                    else None
+                ),
+                "minimum_ready_model_step": (
+                    int(status.minimum_ready_model_step)
+                    if self._has_field(status, "minimum_ready_model_step")
+                    else None
+                ),
+                "maximum_ready_model_step": (
+                    int(status.maximum_ready_model_step)
+                    if self._has_field(status, "maximum_ready_model_step")
+                    else None
+                ),
                 "last_error": status.last_error,
                 "timestamp": int(status.timestamp_unix_ms) / 1000.0,
             }
@@ -3535,7 +3675,7 @@ class TrainingRuntime:
                 "last_error": status.last_error,
                 "timestamp": int(status.timestamp_unix_ms) / 1000.0,
             }
-        except (grpc.RpcError, RuntimeError) as error:
+        except (grpc.RpcError, RuntimeError, ValueError) as error:
             return self._component_error_snapshot(
                 "model-distributor", str(error)
             )
@@ -3543,39 +3683,110 @@ class TrainingRuntime:
     def _resource_snapshot(self) -> dict:
         now = time.monotonic()
         process_cpu = time.process_time()
-        elapsed = max(now - self._last_resource_time, 1e-6)
-        cpu = max(0.0, (process_cpu - self._last_process_cpu) / elapsed * 100.0)
+        elapsed = now - self._last_resource_time
+        cpu_delta = process_cpu - self._last_process_cpu
+        cpu = None if elapsed <= 0.0 else cpu_delta / elapsed * 100.0
         self._last_resource_time = now
         self._last_process_cpu = process_cpu
         usage = resource.getrusage(resource.RUSAGE_SELF)
         rss_mb = float(usage.ru_maxrss) / 1024.0
         if sys.platform == "darwin":
             rss_mb /= 1024.0
-        return {"cpu_percent": cpu, "memory_mb": rss_mb}
+        return {
+            "cpu_percent": cpu,
+            "process_cpu_seconds_delta": cpu_delta,
+            "window_seconds": elapsed,
+            "memory_mb": rss_mb,
+        }
 
     def _rates(self, actor: dict, sample_pool: dict, timestamp: float) -> dict:
-        counters = {
-            "produced": float(actor.get("produced", 0)),
-            "accepted": float(sample_pool.get("accepted", 0)),
-            "acked": float(sample_pool.get("acked", 0)),
-            "trained": float(sample_pool.get("trained", 0)),
-            "timestamp": timestamp,
+        sources = {
+            "produced": actor,
+            "accepted": sample_pool,
+            "acked": sample_pool,
+            "trained": sample_pool,
         }
+        counters: dict[str, object] = {
+            "timestamp": timestamp,
+            "actor_instance_id": actor.get("instance_id"),
+            "sample_pool_instance_id": sample_pool.get("instance_id"),
+        }
+        missing = [
+            name
+            for name, source in sources.items()
+            if source.get("error") or name not in source
+        ]
+        if missing:
+            return {
+                "available": False,
+                "reason": "missing_counter",
+                "missing_counters": missing,
+                "window_seconds": None,
+            }
+        counters.update(
+            {name: float(source[name]) for name, source in sources.items()}
+        )
         previous = self._rate_snapshot
         self._rate_snapshot = counters
-        elapsed = timestamp - float(previous.get("timestamp", timestamp))
+        if not previous:
+            return {
+                "available": False,
+                "reason": "initial_snapshot",
+                "missing_counters": [],
+                "window_seconds": None,
+            }
+        if (
+            counters["actor_instance_id"]
+            != previous.get("actor_instance_id")
+            or counters["sample_pool_instance_id"]
+            != previous.get("sample_pool_instance_id")
+        ):
+            return {
+                "available": False,
+                "reason": "source_identity_changed",
+                "missing_counters": [],
+                "window_seconds": None,
+                "previous_actor_instance_id": previous.get(
+                    "actor_instance_id"
+                ),
+                "actor_instance_id": counters["actor_instance_id"],
+                "previous_sample_pool_instance_id": previous.get(
+                    "sample_pool_instance_id"
+                ),
+                "sample_pool_instance_id": counters[
+                    "sample_pool_instance_id"
+                ],
+            }
+        elapsed = timestamp - float(previous["timestamp"])
         if elapsed <= 0:
             return {
-                "produced_sps": 0.0,
-                "accepted_sps": 0.0,
-                "acked_sps": 0.0,
-                "trained_sps": 0.0,
+                "available": False,
+                "reason": "non_positive_window",
+                "missing_counters": [],
+                "window_seconds": elapsed,
+            }
+        deltas = {
+            name: counters[name] - float(previous[name])
+            for name in sources
+        }
+        if any(delta < 0.0 for delta in deltas.values()):
+            return {
+                "available": False,
+                "reason": "counter_regression",
+                "missing_counters": [],
+                "window_seconds": elapsed,
+                **{f"{name}_delta": delta for name, delta in deltas.items()},
             }
         return {
-            f"{name}_sps": max(
-                0.0, (counters[name] - float(previous.get(name, counters[name]))) / elapsed
-            )
-            for name in ("produced", "accepted", "acked", "trained")
+            "available": True,
+            "reason": "",
+            "missing_counters": [],
+            "window_seconds": elapsed,
+            **{f"{name}_delta": delta for name, delta in deltas.items()},
+            **{
+                f"{name}_sps": delta / elapsed
+                for name, delta in deltas.items()
+            },
         }
 
     def _commit_learner_metrics(
@@ -3589,6 +3800,12 @@ class TrainingRuntime:
         train_updates: int,
         trained_samples: int,
         stats: dict,
+        requested_train_batch_size: int | None = None,
+        pool_draw_slot_count: int | None = None,
+        unique_item_count: int | None = None,
+        duplicate_item_slot_count: int | None = None,
+        sample_evaluation_count: int | None = None,
+        optimizer_step_count: int | None = None,
     ) -> None:
         identity = dict(manifest["identity"])
         model_step = int(identity["model_step"])
@@ -3614,8 +3831,9 @@ class TrainingRuntime:
             "run_trained_samples": int(
                 trained_samples - self._run_start_trained_samples
             ),
-            "policy_lag": int(stats.get("policy_lag", 0)),
-            "max_policy_lag": self.trainer.max_policy_lag,
+            "rollout_estimator_profile_digest": (
+                self.rollout_profile.profile_digest.hex
+            ),
             **dict(stats),
         }
         with self._metrics_lock:
@@ -3626,6 +3844,12 @@ class TrainingRuntime:
             self._metrics_context = {
                 "behavior_model": dict(behavior_model),
                 "actual_batch_size": int(actual_batch_size),
+                "requested_train_batch_size": requested_train_batch_size,
+                "pool_draw_slot_count": pool_draw_slot_count,
+                "unique_item_count": unique_item_count,
+                "duplicate_item_slot_count": duplicate_item_slot_count,
+                "sample_evaluation_count": sample_evaluation_count,
+                "optimizer_step_count": optimizer_step_count,
                 "disposition": disposition,
                 "train_update_id": train_update_id,
                 "error": "",
@@ -3642,11 +3866,31 @@ class TrainingRuntime:
         trained_samples: int,
         actual_batch_size: int,
         raw_metric_sum_counts: dict[str, dict[str, float | int]],
+        requested_train_batch_size: int,
+        pool_draw_slot_count: int,
+        unique_item_count: int,
+        duplicate_item_slot_count: int,
+        sample_evaluation_count: int,
+        optimizer_step_count: int,
     ) -> None:
         writer = getattr(self, "metric_event_writer", None)
         if writer is None or manifest is None:
             return
         try:
+            if (
+                actual_batch_size <= 0
+                or requested_train_batch_size != actual_batch_size
+                or pool_draw_slot_count != actual_batch_size
+                or unique_item_count < 0
+                or duplicate_item_slot_count < 0
+                or unique_item_count + duplicate_item_slot_count
+                != pool_draw_slot_count
+                or sample_evaluation_count <= 0
+                or optimizer_step_count <= 0
+            ):
+                raise MetricEventContractError(
+                    "TrainUpdate execution facts are contradictory"
+                )
             statistics = []
             for field_id in sorted(raw_metric_sum_counts):
                 statistic = raw_metric_sum_counts[field_id]
@@ -3686,23 +3930,32 @@ class TrainingRuntime:
                     behavior_model_lineage_id=str(
                         behavior_identity["model_lineage_id"]
                     ),
+                    requested_train_batch_size=int(
+                        requested_train_batch_size
+                    ),
+                    pool_draw_slot_count=int(pool_draw_slot_count),
+                    unique_item_count=int(unique_item_count),
+                    duplicate_item_slot_count=int(
+                        duplicate_item_slot_count
+                    ),
+                    sample_evaluation_count=int(sample_evaluation_count),
+                    optimizer_step_count=int(optimizer_step_count),
+                    rollout_estimator_profile_digest=(
+                        self.rollout_profile.profile_digest
+                    ),
                 ),
-                committed_at_unix_ms=int(time.time() * 1000),
+                observed_at_unix_ms=int(time.time() * 1000),
             )
             failure_count = int(
                 getattr(self, "_metric_event_write_failure_count", 0)
             )
             if failure_count:
-                elapsed = max(
-                    0.0,
-                    time.monotonic()
-                    - float(
-                        getattr(
-                            self,
-                            "_metric_event_write_failure_started_at",
-                            time.monotonic(),
-                        )
-                    ),
+                elapsed = time.monotonic() - float(
+                    getattr(
+                        self,
+                        "_metric_event_write_failure_started_at",
+                        time.monotonic(),
+                    )
                 )
                 self.logger.info(
                     "TrainUpdate metric persistence recovered after %d "
@@ -3746,8 +3999,19 @@ class TrainingRuntime:
             **committed,
             "initial_model_step": int(self.initial_model_step),
             "train_batch_size": int(self.train_batch_size),
-            "max_train_batch_size": int(self.max_train_batch_size),
-            "actual_batch_size": int(context.get("actual_batch_size", 0)),
+            "actual_batch_size": context.get("actual_batch_size"),
+            "requested_train_batch_size": context.get(
+                "requested_train_batch_size"
+            ),
+            "pool_draw_slot_count": context.get("pool_draw_slot_count"),
+            "unique_item_count": context.get("unique_item_count"),
+            "duplicate_item_slot_count": context.get(
+                "duplicate_item_slot_count"
+            ),
+            "sample_evaluation_count": context.get(
+                "sample_evaluation_count"
+            ),
+            "optimizer_step_count": context.get("optimizer_step_count"),
             "behavior_model": context.get("behavior_model", {}),
             "disposition": context.get("disposition", ""),
             "train_update_id": context.get("train_update_id", ""),
@@ -3781,7 +4045,12 @@ class TrainingRuntime:
                 "metrics_source_id": self.metrics_source_id,
                 "sequence": sequence,
                 "timestamp": now,
-                "interval_ms": 1000,
+                "interval_ms": (
+                    None
+                    if rates.get("window_seconds") is None
+                    else float(rates["window_seconds"]) * 1000.0
+                ),
+                "configured_poll_interval_ms": 1000,
                 "contract": contract_document(self.contract),
                 "training_semantics": semantics_document(self.semantics),
                 "learner": learner,
@@ -3848,14 +4117,10 @@ class TrainingRuntime:
     @staticmethod
     def _finalization_count_fields(message) -> tuple[int, ...]:
         return (
-            int(message.settled_samples),
-            int(message.settled_fragments),
-            int(message.ready_samples),
-            int(message.ready_fragments),
-            int(message.leased_samples),
-            int(message.leased_fragments),
-            int(message.resident_samples),
-            int(message.resident_fragments),
+            int(message.settled_transitions),
+            int(message.ready_transitions),
+            int(message.leased_transitions),
+            int(message.resident_transitions),
         )
 
     def _validate_finalized_sample_pool_status(
@@ -3877,77 +4142,65 @@ class TrainingRuntime:
         if (
             not status.finalized
             or status.finalization_id != finalization_id
+            or not self._has_field(status, "finalized_at_unix_ms")
+            or not self._has_field(response, "finalized_at_unix_ms")
             or int(status.finalized_at_unix_ms) <= 0
             or int(status.finalized_at_unix_ms)
             != int(response.finalized_at_unix_ms)
-            or int(status.finalized_sample_count)
-            != int(response.settled_samples)
-            or int(status.finalized_fragment_count)
-            != int(response.settled_fragments)
+            or int(status.finalized_transition_count)
+            != int(response.settled_transitions)
         ):
             raise RuntimeError(
                 "sample pool returned contradictory finalization identity"
             )
         counts = {
-            "accepted": int(status.accepted_unique_samples),
-            "accepted_batches": int(status.accepted_unique_batches),
-            "acked": int(status.acked_unique_samples),
-            "acked_batches": int(status.acked_unique_batches),
-            "trained": int(status.trained_sample_count),
-            "stale": int(status.stale_sample_count),
-            "invalid": int(status.invalid_sample_count),
+            "accepted": int(status.accepted_unique_transitions),
+            "acked": int(status.acked_unique_transitions),
+            "trained": int(status.trained_transition_count),
+            "invalid": int(status.invalid_transition_count),
             "shutdown_untrained": int(
-                status.shutdown_untrained_sample_count
+                status.shutdown_untrained_transition_count
             ),
-            "ready": int(status.ready_queue_samples),
-            "ready_fragments": int(status.ready_queue_fragments),
-            "leased": int(status.leased_samples),
-            "leased_fragments": int(status.leased_fragments),
-            "resident": int(status.resident_samples),
-            "resident_fragments": int(status.resident_fragments),
+            "ready": int(status.ready_transitions),
+            "leased": int(status.leased_transitions),
+            "resident": int(status.resident_transitions),
             "resident_bytes": int(status.resident_estimated_bytes),
-            "evicted": int(status.evicted_sample_count),
-            "evicted_fragments": int(status.evicted_fragment_count),
+            "evicted": int(status.evicted_transition_count),
+            "finalized": int(status.finalized_transition_count),
         }
         if min(counts.values()) < 0:
             raise RuntimeError(
                 "sample pool returned negative finalized accounting"
             )
         if (
-            status.ready
-            or status.ingress_ready
+            status.ingress_ready
             or status.pool_ready
             or counts["ready"] != 0
-            or counts["ready_fragments"] != 0
             or counts["leased"] != 0
-            or counts["leased_fragments"] != 0
             or counts["resident"] != 0
-            or counts["resident_fragments"] != 0
             or counts["resident_bytes"] != 0
         ):
             raise RuntimeError(
                 "sample pool retained live data after finalization"
             )
-        if counts["acked"] != (
-            counts["trained"]
-            + counts["stale"]
-            + counts["invalid"]
-            + counts["shutdown_untrained"]
+        acknowledged_shutdown = (
+            counts["shutdown_untrained"] - counts["finalized"]
+        )
+        if acknowledged_shutdown < 0 or counts["acked"] != (
+            counts["trained"] + counts["invalid"] + acknowledged_shutdown
         ):
             raise RuntimeError(
                 "sample pool returned contradictory finalized disposition "
                 "accounting"
             )
-        if counts["accepted"] != counts["acked"] + counts["evicted"]:
-            raise RuntimeError(
-                "sample pool returned contradictory finalized sample "
-                "accounting"
-            )
-        if counts["accepted_batches"] != (
-            counts["acked_batches"] + counts["evicted_fragments"]
+        if counts["accepted"] != (
+            counts["trained"]
+            + counts["invalid"]
+            + counts["shutdown_untrained"]
+            + counts["evicted"]
         ):
             raise RuntimeError(
-                "sample pool returned contradictory finalized fragment "
+                "sample pool returned contradictory finalized transition "
                 "accounting"
             )
 
@@ -4004,7 +4257,7 @@ class TrainingRuntime:
                 response.result
                 == training_pb2.SAMPLE_POOL_FINALIZE_RESULT_REJECTED_ACTIVE_LEASE
             ):
-                if int(response.leased_samples) <= 0:
+                if int(response.leased_transitions) <= 0:
                     raise RuntimeError(
                         "sample pool rejected finalization without an active "
                         "lease"
@@ -4027,7 +4280,8 @@ class TrainingRuntime:
                     f"{response.message}"
                 )
             if (
-                any(response_counts[2:])
+                any(response_counts[1:])
+                or not self._has_field(response, "finalized_at_unix_ms")
                 or int(response.finalized_at_unix_ms) <= 0
             ):
                 raise RuntimeError(
@@ -4053,11 +4307,9 @@ class TrainingRuntime:
             )
             self._clear_sample_wait()
             self.logger.info(
-                "SamplePool finalized: id=%s settled_samples=%d "
-                "settled_fragments=%d",
+                "SamplePool finalized: id=%s settled_transitions=%d",
                 finalization_id,
-                int(response.settled_samples),
-                int(response.settled_fragments),
+                int(response.settled_transitions),
             )
             return
         raise RuntimeError(
@@ -4114,13 +4366,13 @@ class TrainingRuntime:
                 )
                 continue
 
-            ready_samples = int(status.ready_queue_samples)
-            leased_samples = int(status.leased_samples)
-            if min(ready_samples, leased_samples) < 0:
+            ready_transitions = int(status.ready_transitions)
+            leased_transitions = int(status.leased_transitions)
+            if min(ready_transitions, leased_transitions) < 0:
                 raise RuntimeError(
                     "sample pool returned contradictory shutdown counts"
                 )
-            if leased_samples > 0:
+            if leased_transitions > 0:
                 reconciled = self._reconcile_get_batch_outcome(
                     pinned,
                     "shutdown observed an unresolved delivery",
@@ -4138,43 +4390,23 @@ class TrainingRuntime:
         )
 
     def _finalize_training(self) -> None:
-        deadline = (
-            time.monotonic() + self.finalize_drain_timeout_ms / 1000.0
-        )
-        while time.monotonic() < deadline:
-            status = self._sample_pool_status()
-            if (
-                status.ready_queue_samples == 0
-                and status.leased_samples == 0
-            ):
-                with self._metrics_lock:
-                    self._metrics_context["disposition"] = "FINALIZED"
-                self.finalize_complete_path.parent.mkdir(
-                    parents=True, exist_ok=True
-                )
-                self.finalize_complete_path.write_text(
-                    f"{self.train_updates} {self.trained_samples}\n",
-                    encoding="utf-8",
-                )
-                self._finalized = True
-                return
-            authority = self._ready_sample_pool_authority(status)
-            response = self._get_batch_recovering(
-                mode=training_pb2.BATCH_ASSEMBLY_MODE_DRAIN_AVAILABLE,
-                ready_authority=authority,
-                deadline=deadline,
+        status = self._sample_pool_status()
+        if not _same_message(status.contract, self.contract):
+            raise RuntimeError(
+                "sample pool contract changed during explicit finalization"
             )
-            if response is None:
-                continue
-            if response.result == training_pb2.GET_BATCH_RESULT_LEASED:
-                self._train_delivery(response, allow_partial=True)
-                continue
-            if response.result != training_pb2.GET_BATCH_RESULT_TIMEOUT:
-                raise RuntimeError(
-                    f"final sample drain failed: {response.message}"
-                )
-            time.sleep(0.1)
-        raise RuntimeError("final sample drain timed out")
+        authority = self._sample_pool_authority(status.sample_pool)
+        with self._metrics_lock:
+            self._metrics_context["disposition"] = "FINALIZING_UNTRAINED_TAIL"
+        self._shutdown_finalize_sample_pool(authority)
+        self.finalize_complete_path.parent.mkdir(parents=True, exist_ok=True)
+        self.finalize_complete_path.write_text(
+            f"{self.train_updates} {self.trained_samples}\n",
+            encoding="utf-8",
+        )
+        with self._metrics_lock:
+            self._metrics_context["disposition"] = "FINALIZED"
+        self._finalized = True
 
     def run(self) -> int:
         try:

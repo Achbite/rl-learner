@@ -442,8 +442,8 @@ verify_development_artifact_permissions() {
         "${contract_dir}/python/common_pb2.py" \
         "${contract_dir}/python/training_pb2.py" \
         "${contract_dir}/python/training_pb2_grpc.py" \
-        "${contract_dir}/schemas/maze.metrics.v3.json" \
-        "${contract_dir}/schemas/maze.metrics.v3.sha256" \
+        "${contract_dir}/schemas/maze.metrics.v4.json" \
+        "${contract_dir}/schemas/maze.metrics.v4.sha256" \
         "${sample_pool_dir}/bin/maze_sample_pool" \
         "${model_distributor_dir}/bin/maze_model_distributor" <<'PY'
 import os

@@ -3,9 +3,9 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.13.0
-  source_digest: 1fc3866efe7e5869cc1a7ed4bc86d58f9c1abedafd7012b9f5dae08246ff145d
-  artifact_digest: 5ce9dff294e3cab466e2e0f058192f9715530645a41b45851b4d798e19a9a5a7
+  package_version: 0.14.0
+  source_digest: 61d633bde1ad4a8dccc2a5e8505d122bbabc8c8cd69eb1cfa97b253c4c2d4c0d
+  artifact_digest: 4642b1a7e18150f9dfc0b7dba6e6ff3b5f0173cb10dee4c432c0155bfa596779
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
 
@@ -42,15 +42,16 @@ training:
   learning_rate: 0.0003           # Adam step size, (0,1]
   gamma: 0.99                     # reward discount, [0,1]
   gae_lambda: 0.95                # GAE trace decay, [0,1]
+  tmax: 128                       # completed transitions per Agent/pinned segment
   clip_epsilon: 0.2               # PPO policy ratio clip, (0,1]
   value_clip_epsilon: 0.2         # value clip around behavior prediction, (0,1]
   entropy_coef: 0.01              # entropy regularization weight, [0,10]
   value_coef: 0.5                 # value-loss weight, [0,10]
   max_grad_norm: 0.5              # L2 gradient clip, (0,100]
   n_epochs: 4                     # optimizer passes per leased batch, >0
-  mini_batch_size: 64             # samples per optimizer mini-batch, >0
+  train_batch_size: 4096          # processed transitions per Train Update, >0
+  mini_batch_size: 512            # maximum transitions per optimizer step, >0
   normalize_advantage: true
-  max_policy_lag: 2               # accepted behavior-model step lag, >=0
 
 model:
   # null means a fresh random bootstrap. A path or --initial-model selects
@@ -68,13 +69,8 @@ model:
 sample_pool:
   host: 127.0.0.1
   port: 9100
-  train_batch_size: 512            # optimizer target; never split fragments
-  max_fragment_samples: 128        # A3 Pool fragment upper bound
-  max_train_batch_size: 639        # derived again after startup overrides
-  max_sample_age_ms: 120000        # freshness bound at Pool and Learner
   get_timeout_ms: 1000
   lease_timeout_ms: 30000
-  finalize_drain_timeout_ms: 30000  # bounded execution tail is trained only after explicit finalize
   finalize_request_path: /tmp/rl-training-finalize
   finalize_complete_path: /tmp/rl-training-finalized
   shutdown_drain_timeout_ms: 20000

@@ -1,9 +1,9 @@
 """
 PPO 训练器
 
-包含 Actor-Critic 网络定义、GAE 计算、PPO 训练循环、ONNX 模型导出。
-训练架构：AIServer 负责特征提取 + 推理 + 奖励计算 + 样本打包，
-         Learner 负责 GAE 计算 + PPO 训练 + ONNX 导出。
+包含 Actor-Critic 网络定义、PPO 训练循环和 ONNX 模型导出。
+AIServer 负责按 pinned model segment 计算未归一化 GAE/Value Target；
+Learner 只做 batch 级 advantage 归一化、PPO/optimizer 和模型发布。
 """
 
 import copy
@@ -100,13 +100,12 @@ class ActorCritic(nn.Module):
 
 class PPOTrainer:
     """
-    PPO 训练器：管理模型、优化器、GAE 计算、训练循环、ONNX 导出
+    PPO 训练器：管理模型、优化器、训练循环和 ONNX 导出
 
     生命周期：
         1. __init__() 构建网络 + 优化器
-        2. compute_gae() 对每条 trajectory 计算 GAE
-        3. train_on_batch() 执行 PPO 训练
-        4. export_onnx() 定期导出模型
+        2. train_on_batch() 消费 AIServer processed transitions
+        3. export_onnx() 导出公开训练模型
     """
 
     MAX_MODEL_STEP = (1 << 64) - 1
@@ -127,22 +126,18 @@ class PPOTrainer:
         # ---- 读取训练超参 ----
         train_cfg = config["training"]
         self._lr = float(train_cfg["learning_rate"])
-        self._gamma = float(train_cfg["gamma"])
-        self._gae_lambda = float(train_cfg["gae_lambda"])
         self._clip_epsilon = float(train_cfg["clip_epsilon"])
         self._value_clip_epsilon = float(train_cfg["value_clip_epsilon"])
         self._entropy_coef = float(train_cfg["entropy_coef"])
         self._value_coef = float(train_cfg["value_coef"])
         self._max_grad_norm = float(train_cfg["max_grad_norm"])
         self._n_epochs = int(train_cfg["n_epochs"])
+        self._train_batch_size = int(train_cfg["train_batch_size"])
         self._mini_batch_size = int(train_cfg["mini_batch_size"])
         self._normalize_advantage = bool(train_cfg["normalize_advantage"])
-        self._max_policy_lag = int(train_cfg["max_policy_lag"])
         self._seed = int(train_cfg["seed"])
         if self._value_clip_epsilon <= 0.0:
             raise ValueError("value_clip_epsilon must be positive")
-        if self._max_policy_lag < 0:
-            raise ValueError("max_policy_lag must be non-negative")
 
         # ---- 构建网络 + 优化器 ----
         torch.manual_seed(self._seed)
@@ -161,91 +156,11 @@ class PPOTrainer:
             self._obs_dim, self._action_dim, self._hidden_dim, self._device,
         )
         self._logger.info(
-            "超参: lr=%.4f, gamma=%.2f, lambda=%.2f, clip=%.2f, entropy=%.3f, value=%.2f, epochs=%d, mini_batch=%d",
-            self._lr, self._gamma, self._gae_lambda, self._clip_epsilon,
-            self._entropy_coef, self._value_coef, self._n_epochs, self._mini_batch_size,
+            "优化器参数: lr=%.9g, clip=%.9g, entropy=%.9g, value=%.9g, epochs=%d, train_batch=%d, mini_batch=%d",
+            self._lr, self._clip_epsilon,
+            self._entropy_coef, self._value_coef, self._n_epochs,
+            self._train_batch_size, self._mini_batch_size,
         )
-
-    # ---- GAE 计算 ----
-    def compute_gae(
-        self,
-        trajectory: List[dict],
-        bootstrap_value: float,
-        bootstrap_valid: bool,
-    ) -> List[dict]:
-        """
-        对一条 trajectory 计算 GAE 优势值和 TD(λ) 回报
-
-        Args:
-            trajectory: 样本 dict 列表（按时间序列排列）
-            bootstrap_value: fragment 末端 V(s_{t+1})，由行为模型采样时计算
-            bootstrap_valid: bootstrap 是否经过 AIServer 校验
-        Returns:
-            填充了 advantage 和 td_return 的 trajectory
-        """
-        if not trajectory:
-            return trajectory
-        for index, sample in enumerate(trajectory):
-            terminated = bool(sample.get("terminated", False))
-            truncated = bool(sample.get("truncated", False))
-            if terminated and truncated:
-                raise ValueError("transition cannot be terminated and truncated")
-            if index != len(trajectory) - 1 and (terminated or truncated):
-                raise ValueError("trajectory continues after an end transition")
-
-        terminal_end = bool(trajectory[-1].get("terminated", False))
-        if terminal_end:
-            if bootstrap_valid or float(bootstrap_value) != 0.0:
-                raise ValueError("terminated fragment must not bootstrap")
-        elif not bootstrap_valid or not np.isfinite(bootstrap_value):
-            raise ValueError("continuing or truncated fragment requires bootstrap")
-
-        values = np.asarray(
-            [sample["old_value_prediction"] for sample in trajectory],
-            dtype=np.float32,
-        )
-        if not np.all(np.isfinite(values)):
-            raise ValueError(
-                "fragment old_value_prediction contains non-finite values"
-            )
-
-        # ---- 1. 逆序计算 GAE ----
-        rewards = np.array([s["reward"] for s in trajectory], dtype=np.float32)
-        if not np.all(np.isfinite(rewards)):
-            raise ValueError("fragment reward contains non-finite values")
-        T = len(trajectory)
-
-        advantages = np.zeros(T, dtype=np.float32)
-        gae = 0.0
-
-        for t in reversed(range(T)):
-            if t == T - 1:
-                next_val = 0.0 if terminal_end else float(bootstrap_value)
-            else:
-                next_val = values[t + 1]
-
-            nonterminal = 0.0 if trajectory[t].get("terminated", False) else 1.0
-            # δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-            delta = rewards[t] + self._gamma * next_val * nonterminal - values[t]
-            # Â_t = δ_t + γλ * Â_{t+1}
-            gae = (
-                delta
-                + self._gamma
-                * self._gae_lambda
-                * nonterminal
-                * gae
-            )
-            advantages[t] = gae
-
-        # td_return = Â_t + V(s_t)
-        td_returns = advantages + values
-
-        # ---- 2. 填充到样本中 ----
-        for i, sample in enumerate(trajectory):
-            sample["advantage"] = float(advantages[i])
-            sample["td_return"] = float(td_returns[i])
-
-        return trajectory
 
     # ---- PPO 训练 ----
     @staticmethod
@@ -292,48 +207,28 @@ class PPOTrainer:
     def train_on_batch(
         self,
         samples: List[dict],
-        behavior_model_step: int | None = None,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, object]:
         """
-        对一批已计算好 GAE 的样本执行 PPO 训练
+        对一个完整 processed-transition train batch 执行 PPO 训练
 
         Args:
-            samples: 样本 dict 列表（已填充 advantage 和 td_return）
+            samples: AIServer 已填充 advantage/value_target 的样本
         Returns:
             训练统计字典
         """
-        behavior_steps = [
-            int(
-                sample.get(
-                    "behavior_model_step",
-                    self._model_step
-                    if behavior_model_step is None
-                    else behavior_model_step,
-                )
-            )
-            for sample in samples
-        ]
-        if samples and len(set(behavior_steps)) != 1:
+        if len(samples) != self._train_batch_size:
             raise ValueError(
-                "one PPO update must contain exactly one behavior model step"
+                "processed-transition batch size differs from the configured "
+                f"train_batch_size: actual={len(samples)} "
+                f"configured={self._train_batch_size}"
             )
+        behavior_steps = [int(sample["behavior_model_step"]) for sample in samples]
         policy_lags = [
             self._model_step - step for step in behavior_steps
         ]
         if any(lag < 0 for lag in policy_lags):
             raise ValueError("behavior model step is from the future")
-        if any(lag > self._max_policy_lag for lag in policy_lags):
-            raise ValueError(
-                "behavior model step exceeds max_policy_lag: "
-                f"current={self._model_step} "
-                f"behavior=[{min(behavior_steps)},"
-                f"{max(behavior_steps)}] "
-                f"max={self._max_policy_lag}"
-            )
-        policy_lag = max(policy_lags, default=0)
-        if not samples:
-            self._last_raw_metric_sum_counts = {}
-            return self._empty_stats(policy_lag)
+        policy_lag = max(policy_lags)
         if self._model_step >= self.MAX_MODEL_STEP:
             raise RuntimeError(
                 "model step exhausted the uint64 publication space"
@@ -345,7 +240,7 @@ class PPOTrainer:
         old_log_probs = torch.tensor([s["old_log_probability"] for s in samples], dtype=torch.float32, device=self._device)
         old_values = torch.tensor([s["old_value_prediction"] for s in samples], dtype=torch.float32, device=self._device)
         advantages = torch.tensor([s["advantage"] for s in samples], dtype=torch.float32, device=self._device)
-        td_returns = torch.tensor([s["td_return"] for s in samples], dtype=torch.float32, device=self._device)
+        td_returns = torch.tensor([s["value_target"] for s in samples], dtype=torch.float32, device=self._device)
         if (
             not torch.isfinite(obs).all()
             or not torch.isfinite(old_log_probs).all()
@@ -358,21 +253,21 @@ class PPOTrainer:
             raise ValueError("PPO batch contains invalid tensors")
 
         # ---- 2. Advantage 标准化 ----
+        raw_advantage_sum = float(advantages.sum().item())
+        raw_advantage_count = int(advantages.numel())
         if self._normalize_advantage and len(advantages) > 1:
             adv_mean = advantages.mean()
             adv_std = advantages.std(unbiased=False)
-            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+            advantages = advantages - adv_mean
+            if float(adv_std.item()) > 0.0:
+                advantages = advantages / adv_std
 
         # ---- 3. 多轮 mini-batch PPO 训练 ----
         n_samples = len(samples)
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_entropy = 0.0
-        total_clip_fraction = 0.0
-        total_approx_kl = 0.0
         total_gradient_norm = 0.0
-        total_combined_loss = 0.0
         maximum_importance_ratio = 0.0
+        importance_ratio_sum = 0.0
+        importance_ratio_square_sum = 0.0
         total_updates = 0
         raw_sample_evaluation_count = 0
         raw_policy_loss_sum = 0.0
@@ -383,7 +278,7 @@ class PPOTrainer:
         raw_total_loss_sum = 0.0
         value_pred_mean = 0.0
         return_target_mean = 0.0
-        explained_variance = 0.0
+        explained_variance: float | None = None
 
         self._model.train()
         model_snapshot = copy.deepcopy(self._model.state_dict())
@@ -467,6 +362,10 @@ class PPOTrainer:
                         clip_fraction = ((ratio - 1.0).abs() > self._clip_epsilon).float().mean().item()
                         log_ratio = new_log_probs - mb_old_log_probs
                         approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                        if not torch.isfinite(ratio).all():
+                            raise FloatingPointError(
+                                "PPO importance ratio is non-finite"
+                            )
                         maximum_importance_ratio = max(
                             maximum_importance_ratio, ratio.max().item()
                         )
@@ -479,14 +378,12 @@ class PPOTrainer:
                     raw_clip_fraction_sum += clip_fraction * mini_batch_count
                     raw_approx_kl_sum += approx_kl * mini_batch_count
                     raw_total_loss_sum += total_loss.item() * mini_batch_count
+                    importance_ratio_sum += float(ratio.sum().item())
+                    importance_ratio_square_sum += float(
+                        ratio.square().sum().item()
+                    )
 
-                    total_policy_loss += policy_loss.item()
-                    total_value_loss += value_loss.item()
-                    total_entropy += entropy.mean().item()
-                    total_clip_fraction += clip_fraction
-                    total_approx_kl += approx_kl
                     total_gradient_norm += float(gradient_norm)
-                    total_combined_loss += total_loss.item()
                     total_updates += 1
 
             # Use the committed model state for value diagnostics. These
@@ -501,22 +398,22 @@ class PPOTrainer:
                 value_pred_mean = committed_values.mean().item()
                 return_target_mean = td_returns.mean().item()
                 target_variance = td_returns.var(unbiased=False)
-                if target_variance.item() > 1e-12:
+                if target_variance.item() > 0.0:
                     residual_variance = (
                         td_returns - committed_values
                     ).var(unbiased=False)
                     explained_variance = (
                         1.0 - residual_variance / target_variance
                     ).item()
-                else:
-                    explained_variance = 0.0
                 if not all(
                     np.isfinite(value)
                     for value in (
                         value_pred_mean,
                         return_target_mean,
-                        explained_variance,
                     )
+                ) or (
+                    explained_variance is not None
+                    and not np.isfinite(explained_variance)
                 ):
                     raise FloatingPointError(
                         "PPO value diagnostics are non-finite"
@@ -531,8 +428,8 @@ class PPOTrainer:
             raise
 
         # ---- 4. 汇总统计 ----
-        if total_updates == 0:
-            return self._empty_stats(policy_lag)
+        if total_updates == 0 or raw_sample_evaluation_count == 0:
+            raise RuntimeError("PPO update executed no optimizer work")
 
         self._model_step += 1
 
@@ -583,33 +480,54 @@ class PPOTrainer:
             or not np.isfinite(float(value["sum"]))
             for value in self._last_raw_metric_sum_counts.values()
         ):
-            self._logger.error(
-                "PPO raw metric sum/count is invalid; metric fact disabled for "
-                "this committed update"
+            raise FloatingPointError(
+                "PPO raw metric sum/count is invalid"
             )
-            self._last_raw_metric_sum_counts = {}
+
+        if importance_ratio_square_sum <= 0.0 or not all(
+            np.isfinite(value)
+            for value in (
+                importance_ratio_sum,
+                importance_ratio_square_sum,
+                maximum_importance_ratio,
+            )
+        ):
+            raise FloatingPointError("PPO importance-ratio facts are invalid")
+        importance_ratio_ess = (
+            importance_ratio_sum * importance_ratio_sum
+            / importance_ratio_square_sum
+        )
 
         stats = {
-            "policy_loss": round(total_policy_loss / total_updates, 6),
-            "value_loss": round(total_value_loss / total_updates, 6),
-            "total_loss": round(total_combined_loss / total_updates, 6),
-            "entropy": round(total_entropy / total_updates, 6),
-            "clip_fraction": round(total_clip_fraction / total_updates, 4),
-            "approx_kl": round(total_approx_kl / total_updates, 8),
-            "gradient_norm": round(
-                total_gradient_norm / total_updates, 6
+            "policy_loss": raw_policy_loss_sum / raw_sample_evaluation_count,
+            "value_loss": raw_value_loss_sum / raw_sample_evaluation_count,
+            "total_loss": raw_total_loss_sum / raw_sample_evaluation_count,
+            "entropy": raw_entropy_sum / raw_sample_evaluation_count,
+            "clip_fraction": (
+                raw_clip_fraction_sum / raw_sample_evaluation_count
             ),
-            "max_importance_ratio": round(maximum_importance_ratio, 6),
-            "mean_advantage": round(advantages.mean().item(), 6),
-            "value_pred_mean": round(value_pred_mean, 6),
-            "return_target_mean": round(return_target_mean, 6),
-            "explained_variance": round(explained_variance, 6),
+            "approx_kl": raw_approx_kl_sum / raw_sample_evaluation_count,
+            "gradient_norm": total_gradient_norm / total_updates,
+            "max_importance_ratio": maximum_importance_ratio,
+            "importance_ratio_sum": importance_ratio_sum,
+            "importance_ratio_square_sum": importance_ratio_square_sum,
+            "importance_ratio_ess": importance_ratio_ess,
+            "raw_advantage_sum": raw_advantage_sum,
+            "raw_advantage_count": raw_advantage_count,
+            "normalized_advantage_sum": float(advantages.sum().item()),
+            "normalized_advantage_count": int(advantages.numel()),
+            "value_pred_mean": value_pred_mean,
+            "return_target_mean": return_target_mean,
+            "explained_variance": explained_variance,
             "learning_rate": self._lr,
             "policy_lag": policy_lag,
             "minimum_behavior_model_step": min(behavior_steps),
             "maximum_behavior_model_step": max(behavior_steps),
-            "mean_policy_lag": round(float(np.mean(policy_lags)), 6),
-            "max_policy_lag": self._max_policy_lag,
+            "policy_lag_sum": int(sum(policy_lags)),
+            "policy_lag_count": len(policy_lags),
+            "mean_policy_lag": float(np.mean(policy_lags)),
+            "sample_evaluation_count": raw_sample_evaluation_count,
+            "optimizer_step_count": total_updates,
             "model_step": self._model_step,
         }
 
@@ -789,32 +707,6 @@ class PPOTrainer:
     def action_dim(self) -> int:
         return self._action_dim
 
-    @property
-    def max_policy_lag(self) -> int:
-        return self._max_policy_lag
-
     def raw_metric_sum_counts(self) -> dict[str, dict[str, float | int]]:
         """Return raw mergeable statistics from the last committed update."""
         return copy.deepcopy(self._last_raw_metric_sum_counts)
-
-    # ---- 内部工具 ----
-    def _empty_stats(self, policy_lag: int = 0) -> Dict[str, float]:
-        """返回空训练统计（无样本时使用）"""
-        return {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "total_loss": 0.0,
-            "entropy": 0.0,
-            "clip_fraction": 0.0,
-            "approx_kl": 0.0,
-            "gradient_norm": 0.0,
-            "max_importance_ratio": 0.0,
-            "mean_advantage": 0.0,
-            "value_pred_mean": 0.0,
-            "return_target_mean": 0.0,
-            "explained_variance": 0.0,
-            "learning_rate": self._lr,
-            "policy_lag": policy_lag,
-            "max_policy_lag": self._max_policy_lag,
-            "model_step": self._model_step,
-        }

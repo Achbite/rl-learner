@@ -75,6 +75,7 @@ ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
     "RL_PPO_LEARNING_RATE": (("training", "learning_rate"), _floating),
     "RL_PPO_GAMMA": (("training", "gamma"), _floating),
     "RL_PPO_GAE_LAMBDA": (("training", "gae_lambda"), _floating),
+    "RL_PPO_TMAX": (("training", "tmax"), _integer),
     "RL_PPO_CLIP_EPSILON": (("training", "clip_epsilon"), _floating),
     "RL_PPO_VALUE_CLIP_EPSILON": (
         ("training", "value_clip_epsilon"),
@@ -92,9 +93,8 @@ ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
         ("training", "normalize_advantage"),
         _boolean,
     ),
-    "RL_PPO_MAX_POLICY_LAG": (("training", "max_policy_lag"), _integer),
     "RL_PPO_TRAIN_BATCH_SIZE": (
-        ("sample_pool", "train_batch_size"),
+        ("training", "train_batch_size"),
         _integer,
     ),
 }
@@ -137,7 +137,8 @@ CLI_OVERRIDE_FIELDS = {
 _PLATFORM_IDENTITY_KEYS = {"task_id", "run_id", "pod_attempt_id"}
 
 
-def _reject_unknown_environment(environment: Mapping[str, str]) -> None:
+def _environment_warnings(environment: Mapping[str, str]) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
     for name in sorted(environment):
         if (
             name in ENVIRONMENT_OVERRIDES
@@ -149,21 +150,14 @@ def _reject_unknown_environment(environment: Mapping[str, str]) -> None:
             raise ValueError(
                 f"platform control identity is not a Learner input: {name}"
             )
-        if (
-            name in _RETIRED_RUNTIME_ENVIRONMENT
-            or name.startswith(
-                (
-                    "RL_PPO_",
-                    "RL_TASK_",
-                    "RL_AISERVER_",
-                    "RL_MODEL_DISTRIBUTOR_",
-                    "RL_SAMPLE_POOL_",
-                )
+        if name.startswith("RL_"):
+            warnings.append(
+                {
+                    "environment": name,
+                    "reason": "unknown_or_retired_override_ignored",
+                }
             )
-        ):
-            raise ValueError(f"unknown component configuration environment: {name}")
-        if name.startswith("RL_TRAINING_"):
-            raise ValueError(f"unknown Learner environment: {name}")
+    return warnings
 
 
 def _assign(document: dict, path: tuple[str, ...], value: object) -> None:
@@ -238,7 +232,7 @@ def load_effective_config(
 ) -> dict:
     """Apply allowlisted startup overrides and return a validated config."""
     selected_environment = os.environ if environment is None else environment
-    _reject_unknown_environment(selected_environment)
+    environment_warnings = _environment_warnings(selected_environment)
 
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as stream:
@@ -252,6 +246,8 @@ def load_effective_config(
     for name, (target, parser) in ENVIRONMENT_OVERRIDES.items():
         if name not in selected_environment:
             continue
+        if selected_environment[name] == "":
+            raise ValueError(f"{name} must not be empty")
         parsed = parser(name, selected_environment[name])
         _assign(config, target, parsed)
         applied.append(
@@ -266,6 +262,8 @@ def load_effective_config(
     for name, (target, parser) in _INTERNAL_ENVIRONMENT_OVERRIDES.items():
         if name not in selected_environment:
             continue
+        if selected_environment[name] == "":
+            raise ValueError(f"{name} must not be empty")
         parsed = parser(name, selected_environment[name])
         _assign(config, target, parsed)
         internal_applied.append(
@@ -275,10 +273,6 @@ def load_effective_config(
                 "value": parsed,
             }
         )
-
-    if "RL_TRAINING_SEED" in selected_environment:
-        seed = int(config["training"]["seed"])
-        config["model"]["bootstrap_seed"] = seed
 
     cli_applied: list[dict[str, object]] = []
     for target, raw_value in (cli_overrides or {}).items():
@@ -328,13 +322,6 @@ def load_effective_config(
                 "workspace"
             )
 
-    sample = config.get("sample_pool", {})
-    target_samples = int(sample.get("train_batch_size", 0))
-    max_fragment_samples = int(sample.get("max_fragment_samples", 0))
-    sample["max_train_batch_size"] = (
-        target_samples + max_fragment_samples - 1
-    )
-
     config = bind_runtime_lineage(config, selected_environment)
     validate_config(config)
     digest = training_config_digest(config).hex
@@ -343,6 +330,7 @@ def load_effective_config(
         "environment_overrides": applied,
         "internal_environment_overrides": internal_applied,
         "cli_overrides": cli_applied,
+        "warnings": environment_warnings,
         "training_config_digest": digest,
     }
     return config
@@ -363,23 +351,26 @@ def effective_config_log(config: dict) -> dict:
                 "learning_rate",
                 "gamma",
                 "gae_lambda",
+                "tmax",
                 "clip_epsilon",
                 "value_clip_epsilon",
                 "entropy_coef",
                 "value_coef",
                 "max_grad_norm",
                 "n_epochs",
+                "train_batch_size",
                 "mini_batch_size",
                 "normalize_advantage",
-                "max_policy_lag",
             )
         },
         "sample_pool": {
             "host": sample["host"],
             "port": sample["port"],
-            "train_batch_size": sample["train_batch_size"],
-            "max_fragment_samples": sample["max_fragment_samples"],
-            "max_train_batch_size": sample["max_train_batch_size"],
+            "get_timeout_ms": sample["get_timeout_ms"],
+            "lease_timeout_ms": sample["lease_timeout_ms"],
+            "shutdown_drain_timeout_ms": sample[
+                "shutdown_drain_timeout_ms"
+            ],
         },
         "model": {
             "local_train_dir": model["local_train_dir"],

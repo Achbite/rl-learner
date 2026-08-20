@@ -1,4 +1,4 @@
-"""Build and validate the exact rl-contracts 0.13.0 training identities."""
+"""Build and validate the exact rl-contracts 0.14.0 training identities."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.13.0"
+CONTRACT_VERSION = "0.14.0"
 RUNTIME_LINEAGE_PLACEHOLDER = "__FRESH_INTERNAL_LINEAGE_REQUIRED__"
 RUNTIME_LINEAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 REWARD_SCHEMA_ID = "maze.reward.v4"
@@ -56,7 +56,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the selected 0.13.0 artifact")
+        raise ValueError("contract identity is not the selected 0.14.0 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -108,6 +108,93 @@ def policy_spec_digest(config: dict) -> common_pb2.ContentDigest:
     return _digest(config["policy"]["policy_spec_digest"])
 
 
+def rollout_estimator_profile(
+    config: dict,
+) -> training_pb2.RolloutEstimatorProfile:
+    training = config["training"]
+    profile = training_pb2.RolloutEstimatorProfile(
+        profile_schema_version=1,
+        gamma=float(training["gamma"]),
+        gae_lambda=float(training["gae_lambda"]),
+        tmax=int(training["tmax"]),
+        gae_formula_id="gae.backward.v1",
+        terminal_bootstrap_semantics_id=(
+            "maze.timeout-keep-and-cut-bootstrap.v1"
+        ),
+        value_target_formula_id="advantage-plus-behavior-value.v1",
+        value_head_abi_id="scalar-value.float32.v1",
+        reward_semantics_digest=_digest(REWARD_SCHEMA_DIGEST),
+        numeric_dtype="float32",
+        finite_rule_id="reject-nonfinite.v1",
+        model_pin_semantics_id="per-agent-segment-pin.v1",
+    )
+    digest = hashlib.sha256(
+        profile.SerializeToString(deterministic=True)
+    ).hexdigest()
+    profile.profile_digest.CopyFrom(_digest(digest))
+    return profile
+
+
+def rollout_estimator_profile_document(
+    profile: training_pb2.RolloutEstimatorProfile,
+) -> dict:
+    return {
+        "profile_schema_version": int(profile.profile_schema_version),
+        "gamma": float(profile.gamma),
+        "gae_lambda": float(profile.gae_lambda),
+        "tmax": int(profile.tmax),
+        "gae_formula_id": profile.gae_formula_id,
+        "terminal_bootstrap_semantics_id": (
+            profile.terminal_bootstrap_semantics_id
+        ),
+        "value_target_formula_id": profile.value_target_formula_id,
+        "value_head_abi_id": profile.value_head_abi_id,
+        "reward_semantics_digest": profile.reward_semantics_digest.hex,
+        "numeric_dtype": profile.numeric_dtype,
+        "finite_rule_id": profile.finite_rule_id,
+        "model_pin_semantics_id": profile.model_pin_semantics_id,
+        "profile_digest": profile.profile_digest.hex,
+    }
+
+
+def _rollout_estimator_profile_from_document(
+    document: dict,
+) -> training_pb2.RolloutEstimatorProfile:
+    profile = training_pb2.RolloutEstimatorProfile(
+        profile_schema_version=int(document["profile_schema_version"]),
+        gamma=float(document["gamma"]),
+        gae_lambda=float(document["gae_lambda"]),
+        tmax=int(document["tmax"]),
+        gae_formula_id=str(document["gae_formula_id"]),
+        terminal_bootstrap_semantics_id=str(
+            document["terminal_bootstrap_semantics_id"]
+        ),
+        value_target_formula_id=str(document["value_target_formula_id"]),
+        value_head_abi_id=str(document["value_head_abi_id"]),
+        reward_semantics_digest=_digest(
+            document["reward_semantics_digest"]
+        ),
+        numeric_dtype=str(document["numeric_dtype"]),
+        finite_rule_id=str(document["finite_rule_id"]),
+        model_pin_semantics_id=str(document["model_pin_semantics_id"]),
+        profile_digest=_digest(document["profile_digest"]),
+    )
+    expected = rollout_estimator_profile(
+        {
+            "training": {
+                "gamma": profile.gamma,
+                "gae_lambda": profile.gae_lambda,
+                "tmax": profile.tmax,
+            }
+        }
+    )
+    if profile.SerializeToString(deterministic=True) != (
+        expected.SerializeToString(deterministic=True)
+    ):
+        raise ValueError("rollout estimator profile is not canonical")
+    return profile
+
+
 def canonical_config_digest(document: Any) -> str:
     return hashlib.sha256(
         json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
@@ -151,15 +238,16 @@ def training_config_document(config: dict) -> dict:
                 "learning_rate",
                 "gamma",
                 "gae_lambda",
+                "tmax",
                 "clip_epsilon",
                 "value_clip_epsilon",
                 "entropy_coef",
                 "value_coef",
                 "max_grad_norm",
                 "n_epochs",
+                "train_batch_size",
                 "mini_batch_size",
                 "normalize_advantage",
-                "max_policy_lag",
             )
         },
         "model": {
@@ -171,11 +259,6 @@ def training_config_document(config: dict) -> dict:
                 "bootstrap_seed",
                 "tensor_dtype",
             )
-        },
-        "sample": {
-            "train_batch_size": config["sample_pool"][
-                "train_batch_size"
-            ]
         },
     }
 
@@ -208,6 +291,22 @@ def model_identity(document: dict) -> training_pb2.ModelIdentity:
 
 
 def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
+    has_step = message.HasField("model_step")
+    has_any_identity = bool(
+        message.model_lineage_id
+        or has_step
+        or message.artifact_digest.hex
+        or message.manifest_digest.hex
+    )
+    if not has_any_identity:
+        return {}
+    if not (
+        message.model_lineage_id
+        and has_step
+        and message.artifact_digest.hex
+        and message.manifest_digest.hex
+    ):
+        raise ValueError("model identity is partially populated")
     return {
         "model_lineage_id": message.model_lineage_id,
         "model_step": int(message.model_step),
@@ -217,8 +316,8 @@ def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
 
 
 def manifest_message(document: dict) -> training_pb2.ModelArtifactManifest:
-    if int(document["manifest_schema_version"]) != 2:
-        raise ValueError("training manifest_schema_version must be 2")
+    if int(document["manifest_schema_version"]) != 3:
+        raise ValueError("training manifest_schema_version must be 3")
     if "model_version" in document or "model_version" in document.get(
         "identity", {}
     ):
@@ -240,6 +339,11 @@ def manifest_message(document: dict) -> training_pb2.ModelArtifactManifest:
         training_config_digest=_digest(document["training_config_digest"]),
         training_semantics=_semantics_from_document(
             document["training_semantics"]
+        ),
+        rollout_estimator_profile=(
+            _rollout_estimator_profile_from_document(
+                document["rollout_estimator_profile"]
+            )
         ),
         published_at_unix_ms=int(document["published_at_unix_ms"]),
         ready=bool(document["ready"]),
@@ -385,7 +489,7 @@ def validate_config(config: dict) -> None:
         raise ValueError("model.local_train_dir must be configured")
     if (
         int(model["archive_interval_updates"]) <= 0
-        or int(model["publication_retention_steps"]) != 101
+        or int(model["publication_retention_steps"]) <= 0
     ):
         raise ValueError("model publication parameters are invalid")
     if (
@@ -411,42 +515,44 @@ def validate_config(config: dict) -> None:
         or float(policy.get("training_temperature")) != 1.0
     ):
         raise ValueError("policy sampling contract is invalid")
-    numeric_ranges: list[tuple[str, float, float, bool]] = [
-        ("learning_rate", 0.0, 1.0, False),
-        ("gamma", 0.0, 1.0, True),
-        ("gae_lambda", 0.0, 1.0, True),
-        ("clip_epsilon", 0.0, 1.0, False),
-        ("value_clip_epsilon", 0.0, 1.0, False),
-        ("entropy_coef", 0.0, 10.0, True),
-        ("value_coef", 0.0, 10.0, True),
-        ("max_grad_norm", 0.0, 100.0, False),
-    ]
-    for name, minimum, maximum, include_minimum in numeric_ranges:
+    finite_training_values = (
+        "learning_rate",
+        "gamma",
+        "gae_lambda",
+        "clip_epsilon",
+        "value_clip_epsilon",
+        "entropy_coef",
+        "value_coef",
+        "max_grad_norm",
+    )
+    for name in finite_training_values:
         value = float(training[name])
-        if not math.isfinite(value) or value > maximum or (
-            value < minimum if include_minimum else value <= minimum
-        ):
-            raise ValueError(f"training.{name} is outside the locked range")
-    sample = config["sample_pool"]
-    train_batch_size = int(sample["train_batch_size"])
-    max_fragment_samples = int(sample["max_fragment_samples"])
-    max_train_batch_size = int(sample["max_train_batch_size"])
+        if not math.isfinite(value):
+            raise ValueError(f"training.{name} must be finite")
+    if (
+        float(training["learning_rate"]) <= 0.0
+        or not 0.0 <= float(training["gamma"]) <= 1.0
+        or not 0.0 <= float(training["gae_lambda"]) <= 1.0
+        or float(training["clip_epsilon"]) <= 0.0
+        or float(training["value_clip_epsilon"]) <= 0.0
+        or float(training["entropy_coef"]) < 0.0
+        or float(training["value_coef"]) < 0.0
+        or float(training["max_grad_norm"]) <= 0.0
+    ):
+        raise ValueError("training parameters contradict PPO execution")
+    profile = rollout_estimator_profile(config)
     if (
         isinstance(training["normalize_advantage"], bool) is False
         or int(training["seed"]) < 0
         or int(model["bootstrap_seed"]) < 0
-        or int(training["seed"]) != int(model["bootstrap_seed"])
         or int(training["n_epochs"]) <= 0
+        or int(training["train_batch_size"]) <= 0
         or int(training["mini_batch_size"]) <= 0
-        or int(training["max_policy_lag"]) < 0
-        or int(model["publication_retention_steps"])
-        < int(training["max_policy_lag"]) + 1
-        or train_batch_size <= 0
-        or max_fragment_samples <= 0
-        or max_train_batch_size
-        != train_batch_size + max_fragment_samples - 1
-        or int(config["sample_pool"]["max_sample_age_ms"]) <= 0
-        or int(config["sample_pool"]["finalize_drain_timeout_ms"])
+        or int(training["tmax"]) <= 0
+        or not profile.profile_digest.hex
+        or int(config["sample_pool"]["get_timeout_ms"]) <= 0
+        or int(config["sample_pool"]["lease_timeout_ms"]) <= 0
+        or int(config["sample_pool"]["shutdown_drain_timeout_ms"])
         <= 0
         or not str(
             config["sample_pool"]["finalize_request_path"]

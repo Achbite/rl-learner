@@ -155,7 +155,6 @@
       gap: 6px;
       color: var(--secondary);
     }
-    .smoothing { width: 118px; accent-color: var(--blue); }
     .select {
       min-height: 31px;
       padding: 4px 28px 4px 9px;
@@ -197,7 +196,7 @@
       border-color: var(--blue);
       background: light-dark(rgba(0, 122, 255, .08), rgba(10, 132, 255, .12));
     }
-    .swatch { width: 9px; height: 3px; background: currentColor; border-radius: 999px; }
+    .swatch { width: 11px; height: 4px; background: currentColor; border-radius: 999px; }
     .add-metric { display: inline-grid; place-items: center; min-width: 28px; }
     .registry-picker {
       display: grid;
@@ -236,9 +235,15 @@
     .chart { display: block; width: 100%; min-height: 220px; overflow: hidden; }
     .chart-grid { stroke: var(--grid); stroke-width: 1; }
     .chart-axis { fill: var(--secondary); font-size: 12px; }
-    .chart-raw { fill: none; stroke-width: 1; opacity: .24; vector-effect: non-scaling-stroke; }
-    .chart-smooth { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
-    .chart-point { fill: var(--surface); stroke-width: 2; vector-effect: non-scaling-stroke; }
+    .chart-raw {
+      fill: none;
+      stroke-width: 2.25;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      opacity: .78;
+      vector-effect: non-scaling-stroke;
+    }
+    .chart-point { fill: var(--surface); stroke-width: 2.75; vector-effect: non-scaling-stroke; }
     .empty-chart { fill: var(--secondary); font-size: 14px; }
     .footer {
       justify-content: space-between;
@@ -283,13 +288,13 @@
       <article class="pod-card" aria-label="Learner Pod">
         <div class="pod-head">
           <div class="pod-identity"><span class="pod-icon" aria-hidden="true">L</span><span class="pod-name">Learner Pod</span></div>
-          <div><span id="learner-count" class="pod-count">0 / 1</span> <span id="learner-state" class="pod-state" data-state="wait">等待</span></div>
+          <div><span id="learner-count" class="pod-count">— / 1</span> <span id="learner-state" class="pod-state" data-state="wait">等待</span></div>
         </div>
       </article>
       <article class="pod-card" aria-label="Server Pod，由 AIServer 与 Client 组成">
         <div class="pod-head">
           <div class="pod-identity"><span class="pod-icon" aria-hidden="true">S</span><span class="pod-name">Server Pod</span></div>
-          <div><span id="server-count" class="pod-count">0 / 1</span> <span id="server-state" class="pod-state" data-state="wait">等待</span></div>
+          <div><span id="server-count" class="pod-count">— / 1</span> <span id="server-state" class="pod-state" data-state="wait">等待</span></div>
         </div>
         <div id="server-model-sync" class="pod-detail">等待模型信息</div>
       </article>
@@ -297,17 +302,17 @@
   </section>
 
   <section class="depth-strip" aria-label="训练状态">
-    <div class="depth-item"><div class="depth-label">Model Step</div><div id="model-step" class="depth-value">0</div></div>
-    <div class="depth-item"><div class="depth-label">Train Update</div><div id="train-update" class="depth-value">0</div></div>
-    <div class="depth-item"><div class="depth-label">Trained Samples</div><div id="trained-samples" class="depth-value">0</div></div>
-    <div class="depth-item"><div class="depth-label">Produced Samples</div><div id="produced-samples" class="depth-value">0</div></div>
+    <div class="depth-item"><div class="depth-label">Model Step</div><div id="model-step" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Train Update</div><div id="train-update" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Trained Transitions</div><div id="trained-samples" class="depth-value">—</div></div>
+    <div class="depth-item"><div class="depth-label">Produced Transitions</div><div id="produced-samples" class="depth-value">—</div></div>
     <div class="depth-item"><div class="depth-label">Workload</div><div id="training-workload" class="depth-value">Training</div></div>
   </section>
 
   <section class="toolbar" aria-label="曲线控制">
     <div class="toolbar-group">
       <label class="toggle">指标窗口
-        <select id="metric-window" class="select" aria-label="真实指标聚合窗口">
+        <select id="metric-window" class="select" aria-label="指标显示与聚合窗口">
           <option value="25">最近 25 局</option>
           <option value="100" selected>最近 100 局</option>
           <option value="5s">5 秒</option>
@@ -317,10 +322,8 @@
           <option value="all">本次训练全部</option>
         </select>
       </label>
-      <label class="toggle">平滑 <input id="smoothing" class="smoothing" type="range" min="0" max="90" value="0" aria-label="平滑比例"> <output id="smoothing-output">0.00</output></label>
     </div>
     <div class="toolbar-group">
-      <label class="toggle"><input id="outliers" type="checkbox" checked> 忽略异常值</label>
       <label class="toggle">横轴
         <select id="axis" class="select">
           <option value="model">Model Step</option>
@@ -350,6 +353,12 @@
   const TRAINED_SAMPLES_ID = "learner.trained_samples.total.v1";
   const TRAINING_EPISODE_ID = "server.training.episode.completed.total.v1";
   const PRODUCED_SAMPLES_ID = "sample.flow.produced.total.v1";
+  const TIME_WINDOW_SECONDS = new Map([
+    ["5s", 5],
+    ["1m", 60],
+    ["1h", 60 * 60],
+    ["24h", 24 * 60 * 60]
+  ]);
   const REWARD_COMPONENT_IDS = [
     "server.training.reward.component.goal_reward.episode_mean.v1",
     "server.training.reward.component.timeout_penalty.episode_mean.v1",
@@ -430,9 +439,7 @@
     cursor: 0,
     sourceId: "",
     metricWindow: "100",
-    smoothing: 0,
     axis: "model",
-    ignoreOutliers: true,
     focus: {},
     domains: new Map(),
     catalogFetchedAt: 0,
@@ -462,12 +469,19 @@
     element.textContent = text;
     element.dataset.state = value;
   };
-  const formatInteger = value => Math.round(value || 0).toLocaleString("zh-CN");
+  const formatInteger = value => {
+    const number = finiteNumber(value);
+    return number === null ? "—" : number.toLocaleString("zh-CN", {
+      maximumFractionDigits: 20
+    });
+  };
   const formatScalar = value => {
     if (value === null || !Number.isFinite(value)) return "—";
     const absolute = Math.abs(value);
     if (absolute > 0 && absolute < .001) return value.toExponential(2);
-    if (absolute >= 1000) return Math.round(value).toLocaleString("zh-CN");
+    if (absolute >= 1000) return value.toLocaleString("zh-CN", {
+      maximumFractionDigits: 12
+    });
     const digits = absolute < .1 ? 4 : absolute < 10 ? 2 : 1;
     return `${value > 0 ? "+" : ""}${value.toFixed(digits)}`;
   };
@@ -475,8 +489,10 @@
     if (!metric || value === null || !Number.isFinite(value)) return "—";
     if (metric.unit === "%") return `${value.toFixed(1)}%`;
     if (metric.unit === "ms") return `${formatScalar(value)} ms`;
-    if (metric.unit === "samples/s") return `${formatInteger(value)}/s`;
-    if (["samples", "step", "update", "version"].includes(metric.unit)) {
+    if (["samples/s", "transitions/s"].includes(metric.unit)) {
+      return `${formatScalar(value)}/s`;
+    }
+    if (["samples", "transitions", "step", "update", "version"].includes(metric.unit)) {
       return formatInteger(value);
     }
     return formatScalar(value);
@@ -553,48 +569,70 @@
     svg.appendChild(element);
   };
   const axisValue = record => {
-    if (state.axis === "time") return finiteNumber(record.timestamp) || 0;
-    if (state.axis === "update") return metricValue(record, TRAIN_UPDATE_ID) || 0;
-    if (state.axis === "episode") return metricValue(record, TRAINING_EPISODE_ID) || 0;
-    return metricValue(record, MODEL_STEP_ID) || 0;
+    if (state.axis === "time") return finiteNumber(record.timestamp);
+    if (state.axis === "update") return metricValue(record, TRAIN_UPDATE_ID);
+    if (state.axis === "episode") return metricValue(record, TRAINING_EPISODE_ID);
+    return metricValue(record, MODEL_STEP_ID);
   };
   const axisLabel = record => {
     const value = axisValue(record);
+    if (value === null) return "—";
     return state.axis === "time"
-      ? new Date(value * 1000).toLocaleTimeString("zh-CN", {
-          hour: "2-digit", minute: "2-digit", second: "2-digit"
-        })
+      ? formatWallTime(value)
       : formatInteger(value);
   };
-  const ema = values => {
-    if (!values.length || state.smoothing <= 0) return values.slice();
-    const output = [values[0]];
-    for (let index = 1; index < values.length; index += 1) {
-      output.push(
-        state.smoothing * output[index - 1] +
-        (1 - state.smoothing) * values[index]
-      );
+  const formatWallTime = timestamp => new Date(timestamp * 1000).toLocaleTimeString(
+    "zh-CN",
+    {hour: "2-digit", minute: "2-digit", second: "2-digit"}
+  );
+  const visibleRecordWindow = () => {
+    const duration = TIME_WINDOW_SECONDS.get(state.metricWindow);
+    if (!duration) {
+      return {records: state.records, timeDomain: null, mode: "unbounded"};
     }
-    return output;
-  };
-  const quantile = (sorted, ratio) => {
-    if (sorted.length === 1) return sorted[0];
-    const position = (sorted.length - 1) * ratio;
-    const lower = Math.floor(position);
-    const upper = Math.ceil(position);
-    const weight = position - lower;
-    return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+    const timestamped = state.records.map(record => ({
+      record,
+      timestamp: finiteNumber(record.timestamp)
+    })).filter(item => item.timestamp !== null);
+    if (!timestamped.length) {
+      return {records: [], timeDomain: null, mode: "unavailable"};
+    }
+    const firstMetricTimestamp = Math.min(
+      ...timestamped.map(item => item.timestamp)
+    );
+    const latestMetricTimestamp = Math.max(
+      ...timestamped.map(item => item.timestamp)
+    );
+    const reportedStart = finiteNumber(state.status?.started_at);
+    const streamStart = reportedStart === null
+      ? firstMetricTimestamp
+      : Math.min(reportedStart, firstMetricTimestamp);
+    const warmingUp = latestMetricTimestamp - streamStart < duration;
+    const domainStart = warmingUp
+      ? streamStart
+      : latestMetricTimestamp - duration;
+    const domainEnd = domainStart + duration;
+    const epsilon = 1e-9;
+    const records = timestamped.filter(item =>
+      item.timestamp >= domainStart - epsilon &&
+      item.timestamp <= domainEnd + epsilon
+    ).map(item => item.record);
+    const firstVisibleTimestamp = records.length
+      ? finiteNumber(records[0].timestamp)
+      : null;
+    const safeDomainStart = firstVisibleTimestamp === null
+      ? domainStart
+      : Math.min(domainStart, firstVisibleTimestamp);
+    return {
+      records,
+      timeDomain: {minimum: safeDomainStart, maximum: domainEnd},
+      mode: warmingUp ? "warming-up" : "rolling"
+    };
   };
   const observedExtent = values => {
     const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
     if (!sorted.length) return null;
-    if (!state.ignoreOutliers) {
-      return {minimum: sorted[0], maximum: sorted[sorted.length - 1]};
-    }
-    return {
-      minimum: quantile(sorted, .04),
-      maximum: quantile(sorted, .96)
-    };
+    return {minimum: sorted[0], maximum: sorted[sorted.length - 1]};
   };
   const niceCeil = value => {
     if (!(value > 0)) return 0;
@@ -707,13 +745,15 @@
     if (!panel) return;
     const svg = panel.querySelector("svg");
     svg.replaceChildren();
-    const records = state.records;
+    const visibleWindow = visibleRecordWindow();
+    const records = visibleWindow.records;
     const selected = state.focus[group.id];
     const keys = selected === "all" ? group.keys : selected ? [selected] : [];
     const series = keys.map(fieldId => {
       const metric = registry.get(fieldId);
       const points = records.map((record, index) => ({
         index,
+        record,
         value: metricValue(record, fieldId)
       })).filter(point => point.value !== null);
       return {metric, points};
@@ -730,6 +770,9 @@
     if (!records.length || !series.length) {
       delete panel.dataset.yMin;
       delete panel.dataset.yMax;
+      delete panel.dataset.xMin;
+      delete panel.dataset.xMax;
+      delete panel.dataset.windowMode;
       appendText(svg, 340, 132, "等待指标", "middle", "empty-chart");
       return;
     }
@@ -749,9 +792,39 @@
     panel.dataset.yMin = String(minimum);
     panel.dataset.yMax = String(maximum);
     const yFor = value => top + (maximum - value) / (maximum - minimum) * chartHeight;
-    const xFor = index => records.length === 1
-      ? left + chartWidth / 2
-      : left + index / (records.length - 1) * chartWidth;
+    const observedTimeDomain = state.axis === "time" && !visibleWindow.timeDomain
+      ? observedExtent(records.map(record => finiteNumber(record.timestamp)))
+      : null;
+    const timeDomain = state.axis === "time"
+      ? visibleWindow.timeDomain || (observedTimeDomain && {
+          minimum: observedTimeDomain.minimum,
+          maximum: observedTimeDomain.maximum
+        })
+      : null;
+    if (timeDomain) {
+      panel.dataset.xMin = String(timeDomain.minimum);
+      panel.dataset.xMax = String(timeDomain.maximum);
+      panel.dataset.windowMode = visibleWindow.mode;
+    } else {
+      delete panel.dataset.xMin;
+      delete panel.dataset.xMax;
+      delete panel.dataset.windowMode;
+    }
+    const xFor = (record, index) => {
+      if (!timeDomain) {
+        return records.length === 1
+          ? left + chartWidth / 2
+          : left + index / (records.length - 1) * chartWidth;
+      }
+      const timestamp = finiteNumber(record.timestamp);
+      const span = timeDomain.maximum - timeDomain.minimum;
+      if (timestamp === null || !(span > 0)) return left;
+      const ratio = Math.max(
+        0,
+        Math.min(1, (timestamp - timeDomain.minimum) / span)
+      );
+      return left + ratio * chartWidth;
+    };
     const axisMetric = series[0].metric;
 
     for (let tick = 0; tick < 5; tick += 1) {
@@ -768,19 +841,34 @@
         "end"
       );
     }
-    const tickIndices = [...new Set([
-      0,
-      Math.round((records.length - 1) / 3),
-      Math.round(2 * (records.length - 1) / 3),
-      records.length - 1
-    ])];
-    tickIndices.forEach((index, tick) => appendText(
-      svg,
-      xFor(index),
-      height - 12,
-      axisLabel(records[index]),
-      tick === 0 ? "start" : tick === tickIndices.length - 1 ? "end" : "middle"
-    ));
+    if (timeDomain) {
+      for (let tick = 0; tick < 4; tick += 1) {
+        const ratio = tick / 3;
+        appendText(
+          svg,
+          left + ratio * chartWidth,
+          height - 12,
+          formatWallTime(
+            timeDomain.minimum + ratio * (timeDomain.maximum - timeDomain.minimum)
+          ),
+          tick === 0 ? "start" : tick === 3 ? "end" : "middle"
+        );
+      }
+    } else {
+      const tickIndices = [...new Set([
+        0,
+        Math.round((records.length - 1) / 3),
+        Math.round(2 * (records.length - 1) / 3),
+        records.length - 1
+      ])];
+      tickIndices.forEach((index, tick) => appendText(
+        svg,
+        xFor(records[index], index),
+        height - 12,
+        axisLabel(records[index]),
+        tick === 0 ? "start" : tick === tickIndices.length - 1 ? "end" : "middle"
+      ));
+    }
 
     const clipId = `plot-${group.id}`;
     const defs = svgElement("defs");
@@ -791,25 +879,17 @@
     defs.appendChild(clipPath);
     svg.appendChild(defs);
     series.forEach(item => {
-      const smoothed = ema(item.points.map(point => point.value));
       const rawPoints = item.points.map(point => ({
-        x: xFor(point.index), y: yFor(point.value)
-      }));
-      const smoothPoints = item.points.map((point, index) => ({
-        x: xFor(point.index), y: yFor(smoothed[index])
+        x: xFor(point.record, point.index), y: yFor(point.value)
       }));
       const color = `var(${item.metric.color})`;
       svg.appendChild(svgElement("path", {
         d: pathFor(rawPoints), class: "chart-raw", stroke: color,
         "clip-path": `url(#${clipId})`
       }));
-      svg.appendChild(svgElement("path", {
-        d: pathFor(smoothPoints), class: "chart-smooth", stroke: color,
-        "clip-path": `url(#${clipId})`
-      }));
-      const latest = smoothPoints[smoothPoints.length - 1];
+      const latest = rawPoints[rawPoints.length - 1];
       svg.appendChild(svgElement("circle", {
-        cx: latest.x, cy: latest.y, r: 3.4, class: "chart-point",
+        cx: latest.x, cy: latest.y, r: 4.5, class: "chart-point",
         stroke: color, "clip-path": `url(#${clipId})`
       }));
     });
@@ -961,35 +1041,36 @@
   };
   const ingest = records => {
     if (!Array.isArray(records) || !records.length) return;
-    records = records.filter(record =>
-      !record.metrics_source_id || record.metrics_source_id === state.sourceId
+    records = records.filter(
+      record => record.metrics_source_id === state.sourceId
     );
     if (!records.length) return;
     const bySequence = new Map(
       state.records.map(record => [
-        Number(record.sequence || record.train_step || 0),
+        Number(record.sequence),
         record
       ])
     );
     records.forEach(record => {
-      const sequence = Number(record.sequence || record.train_step || 0);
+      const sequence = Number(record.sequence);
       if (sequence > 0) bySequence.set(sequence, record);
     });
     state.records = [...bySequence.values()].sort(
       (left, right) =>
-        Number(left.sequence || left.train_step || 0) -
-        Number(right.sequence || right.train_step || 0)
+        Number(left.sequence) - Number(right.sequence)
     ).slice(-state.recordLimit);
     const latest = state.records[state.records.length - 1];
     state.cursor = latest
-      ? Number(latest.sequence || latest.train_step || 0)
+      ? Number(latest.sequence)
       : 0;
   };
   const renderStatus = (status, record) => {
     const actor = record?.actor || {};
-    const learnerConnected = status?.service === "learner-metrics";
-    const stale = status?.stale !== false;
-    const serverPresent = Boolean(actor.instance_id) && !stale;
+    const metricsAvailable = finiteNumber(status?.latest_sequence) !== null;
+    const learnerConnected = status?.service === "learner-metrics" && metricsAvailable;
+    const stale = status?.stale === true;
+    const freshnessUnavailable = status?.stale === null || status?.stale === undefined;
+    const serverPresent = Boolean(actor.instance_id);
     const clientConnected = actor.client_session_recent === true;
     const activeModelStep = finiteNumber(actor?.model_identity?.model_step);
     const stagedModelStep = finiteNumber(
@@ -1010,12 +1091,14 @@
       (projectedServerReady === undefined && lifecycleReady &&
         !actor.error && clientConnected && hasActiveModel)
     );
-    byId("learner-count").textContent = learnerConnected ? "1 / 1" : "0 / 1";
-    byId("server-count").textContent = serverPresent ? "1 / 1" : "0 / 1";
+    byId("learner-count").textContent = learnerConnected ? "1 / 1" : "— / 1";
+    byId("server-count").textContent = !metricsAvailable
+      ? "— / 1"
+      : serverPresent ? "1 / 1" : "0 / 1";
     setStatus(
       byId("learner-state"),
-      !learnerConnected ? "未连接" : stale ? "等待指标" : "运行中",
-      !learnerConnected ? "bad" : stale ? "wait" : "ok"
+      !learnerConnected ? "指标不可用" : freshnessUnavailable ? "时效未知" : stale ? "等待指标" : "运行中",
+      !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
     );
     setStatus(
       byId("server-state"),
@@ -1053,8 +1136,9 @@
     setStatus(
       byId("live-status"),
       !learnerConnected ? "连接失败" :
-        stale ? "指标已过期" : "实时 · 1 秒",
-      !learnerConnected ? "bad" : stale ? "wait" : "ok"
+        freshnessUnavailable ? "指标时效不可用" :
+        stale ? "指标已过期" : "实时",
+      !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
     );
     byId("run-context").textContent =
       `Learner / ${status?.metrics_source_id || "等待训练实例"}`;
@@ -1068,19 +1152,19 @@
       : eventViewStatus === "unavailable" ? " · 历史事件不可用" : "";
     byId("stream-status").textContent =
       `指标流：${status?.stream || "—"} · ` +
-      `stale=${String(status?.stale ?? true)} · ` +
-      `sequence ${formatInteger(status?.latest_sequence || 0)}` + eventNote;
+      `stale=${status?.stale_status || "unavailable"} · ` +
+      `sequence ${formatInteger(status?.latest_sequence)}` + eventNote;
   };
   const renderSummary = record => {
     const modelStep = metricValue(record, MODEL_STEP_ID);
     const trainUpdate = metricValue(record, TRAIN_UPDATE_ID);
     const trainedSamples = metricValue(record, TRAINED_SAMPLES_ID);
     const producedSamples = metricValue(record, PRODUCED_SAMPLES_ID);
-    byId("model-step").textContent = formatInteger(modelStep || 0);
-    byId("train-update").textContent = formatInteger(trainUpdate || 0);
-    byId("trained-samples").textContent = formatInteger(trainedSamples || 0);
+    byId("model-step").textContent = formatInteger(modelStep);
+    byId("train-update").textContent = formatInteger(trainUpdate);
+    byId("trained-samples").textContent = formatInteger(trainedSamples);
     byId("produced-samples").textContent =
-      formatInteger(producedSamples || 0);
+      formatInteger(producedSamples);
   };
 
   const poll = async () => {
@@ -1122,8 +1206,8 @@
       setStatus(byId("live-status"), "连接失败", "bad");
       setStatus(byId("learner-state"), "未连接", "bad");
       setStatus(byId("server-state"), "状态未知", "bad");
-      byId("learner-count").textContent = "0 / 1";
-      byId("server-count").textContent = "0 / 1";
+      byId("learner-count").textContent = "— / 1";
+      byId("server-count").textContent = "— / 1";
       byId("stream-status").textContent = `指标流：${String(error)}`;
       byId("last-refresh").textContent =
         `连接中断 ${new Date().toLocaleTimeString("zh-CN")}`;
@@ -1132,11 +1216,6 @@
     }
   };
 
-  byId("smoothing").addEventListener("input", event => {
-    state.smoothing = Number(event.target.value) / 100;
-    byId("smoothing-output").textContent = state.smoothing.toFixed(2);
-    renderAllPanels();
-  });
   byId("metric-window").addEventListener("change", event => {
     state.metricWindow = event.target.value;
     state.records = [];
@@ -1145,15 +1224,13 @@
     renderAllPanels();
     poll();
   });
-  byId("outliers").addEventListener("change", event => {
-    state.ignoreOutliers = event.target.checked;
-    renderAllPanels();
-  });
   byId("axis").addEventListener("change", event => {
     state.axis = event.target.value;
     renderAllPanels();
   });
 
+  state.metricWindow = byId("metric-window").value;
+  state.axis = byId("axis").value;
   buildPanels();
   poll();
   setInterval(poll, 1000);

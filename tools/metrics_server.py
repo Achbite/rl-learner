@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import signal
 import threading
 import time
 import uuid
@@ -124,7 +125,6 @@ _STATIC_METRIC_DEFINITIONS = (
         ("learner", "model_step"),
         ("metric_event_views", "train_updates", "latest", "values",
          "latest_model_step"), ("model", "latest_step"),
-        ("model_step",),
     ),
     _metric_definition(
         "learner.train_update.total.v1", "Train Update", "training_depth",
@@ -133,7 +133,6 @@ _STATIC_METRIC_DEFINITIONS = (
         ("metric_event_views", "train_updates", "latest", "values",
          "latest_train_update_sequence"),
         ("learner", "run_train_updates"),
-        ("train_step",),
     ),
     _metric_definition(
         "learner.trained_samples.total.v1", "Trained Samples",
@@ -143,7 +142,6 @@ _STATIC_METRIC_DEFINITIONS = (
         ("metric_event_views", "train_updates", "latest", "values",
          "latest_cumulative_trained_samples"),
         ("learner", "run_trained_samples"),
-        ("trained_samples",),
     ),
     _metric_definition(
         "server.episode.max_steps.current.v1", "Episode Max Steps",
@@ -156,21 +154,18 @@ _STATIC_METRIC_DEFINITIONS = (
         "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "policy_loss", "mean"), ("learner", "policy_loss"),
-        ("policy_loss",),
     ),
     _metric_definition(
         "learner.loss.value.v1", "Value Loss", "loss", "loss", "1",
         "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "value_loss", "mean"), ("learner", "value_loss"),
-        ("value_loss",),
     ),
     _metric_definition(
         "learner.loss.total.v1", "Total Loss", "loss", "loss", "1",
         "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "total_loss", "mean"), ("learner", "total_loss"),
-        ("total_loss",),
     ),
     _metric_definition(
         "server.episode.learning_return.mean.v1", "Mean Learning Return",
@@ -178,7 +173,6 @@ _STATIC_METRIC_DEFINITIONS = (
         "mean", "gauge",
         ("metric_event_views", "episodes", "windows", "100", "values",
          "mean_agent_return"), ("actor", "episodes", "mean_agent_return"),
-        ("mean_episode_reward",),
     ),
     _metric_definition(
         "server.training.episode.learning_return.mean.v1",
@@ -229,7 +223,7 @@ _STATIC_METRIC_DEFINITIONS = (
         "mean", "gauge",
         ("metric_event_views", "episodes", "windows", "100", "values",
          "agent_success_rate"), ("actor", "episodes", "agent_success_rate"),
-        ("pass_rate",), scale=100.0,
+        scale=100.0,
     ),
     _metric_definition(
         "server.training.episode.success.agent_rate.v1",
@@ -384,7 +378,7 @@ _STATIC_METRIC_DEFINITIONS = (
     _metric_definition(
         "sample.flow.trained.total.v1", "Trained Samples", "sample_flow",
         "sample_count", "samples", "sample_chain", "total", "counter",
-        ("sample_pool", "trained"), ("trained_samples",),
+        ("sample_pool", "trained"),
     ),
     _metric_definition(
         "sample.flow.invalid.total.v1", "Invalid Samples", "sample_flow",
@@ -392,29 +386,24 @@ _STATIC_METRIC_DEFINITIONS = (
         ("sample_pool", "invalid"),
     ),
     _metric_definition(
-        "sample.flow.stale.total.v1", "Stale Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "total", "counter",
-        ("sample_pool", "stale"),
-    ),
-    _metric_definition(
         "sample.flow.shutdown_untrained.total.v1", "Shutdown Untrained",
         "sample_flow", "sample_count", "samples", "sample_chain", "total",
         "counter", ("sample_pool", "shutdown_untrained"),
     ),
     _metric_definition(
-        "sample.flow.ready.total.v1", "Ready Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "latest", "gauge",
-        ("sample_pool", "ready_samples"),
+        "sample.flow.ready.total.v1", "Ready Transitions", "sample_flow",
+        "sample_count", "transitions", "sample_chain", "latest", "gauge",
+        ("sample_pool", "ready_transitions"),
     ),
     _metric_definition(
-        "sample.flow.leased.total.v1", "Leased Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "latest", "gauge",
-        ("sample_pool", "leased_samples"),
+        "sample.flow.leased.total.v1", "Leased Transitions", "sample_flow",
+        "sample_count", "transitions", "sample_chain", "latest", "gauge",
+        ("sample_pool", "leased_transitions"),
     ),
     _metric_definition(
         "sample.flow.outbound_pending.total.v1", "Outbound Pending",
         "sample_flow", "sample_count", "samples", "server", "latest",
-        "gauge", ("actor", "outbound_pending"),
+        "gauge", ("actor", "outbound_queue_transitions"),
     ),
     _metric_definition(
         "sample.flow.final_drop.total.v1", "Final Drop", "sample_flow",
@@ -451,41 +440,40 @@ _STATIC_METRIC_DEFINITIONS = (
         "entropy", "1", "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "entropy", "mean"),
-        ("learner", "entropy"), ("entropy",),
+        ("learner", "entropy"),
     ),
     _metric_definition(
         "learner.ppo.approx_kl.v1", "Approx. KL", "ppo_stability",
         "divergence", "1", "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "approx_kl", "mean"),
-        ("learner", "approx_kl"), ("approx_kl",),
+        ("learner", "approx_kl"),
     ),
     _metric_definition(
         "learner.ppo.clip_fraction.v1", "Clip Fraction", "ppo_stability",
         "percentage", "%", "train_update", "mean", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "clip_fraction", "mean"),
-        ("learner", "clip_fraction"), ("clip_fraction",), scale=100.0,
+        ("learner", "clip_fraction"), scale=100.0,
     ),
     _metric_definition(
         "learner.ppo.gradient_norm.v1", "Gradient Norm", "ppo_stability",
         "norm", "1", "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "gradient_norm", "mean"),
-        ("learner", "gradient_norm"), ("gradient_norm",),
+        ("learner", "gradient_norm"),
     ),
     _metric_definition(
         "learner.ppo.max_importance_ratio.v1", "Max Importance Ratio",
         "ppo_stability", "ratio", "1", "train_update", "max", "gauge",
         ("learner", "max_importance_ratio"),
-        ("max_importance_ratio",),
     ),
     _metric_definition(
         "learner.ppo.policy_lag.v1", "Policy Lag", "ppo_stability",
         "model_step", "step", "train_update", "latest", "gauge",
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "policy_lag", "mean"),
-        ("learner", "policy_lag"), ("policy_lag",),
+        ("learner", "policy_lag"),
     ),
     _metric_definition(
         "learner.value.prediction_mean.v1", "Value Prediction Mean",
@@ -494,7 +482,6 @@ _STATIC_METRIC_DEFINITIONS = (
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "value_prediction", "mean"),
         ("learner", "value_pred_mean"),
-        ("value_pred_mean",),
     ),
     _metric_definition(
         "learner.value.return_target_mean.v1", "Return Target Mean",
@@ -503,13 +490,11 @@ _STATIC_METRIC_DEFINITIONS = (
         ("metric_event_views", "train_updates", "latest", "values", "ppo",
          "return_target", "mean"),
         ("learner", "return_target_mean"),
-        ("return_target_mean",),
     ),
     _metric_definition(
         "learner.value.explained_variance.v1", "Explained Variance",
         "ppo_stability", "ratio", "1", "train_update", "latest",
         "gauge", ("learner", "explained_variance"),
-        ("explained_variance",),
     ),
 )
 
@@ -606,25 +591,16 @@ _EVENT_WINDOWS = {"25", "100", "5s", "1m", "1h", "24h", "all"}
 def _project_metric_value(record, definition, event_window="100"):
     if event_window not in _EVENT_WINDOWS:
         raise ValueError("unsupported metric event window")
-    event_views = record.get("metric_event_views")
-    event_views_authoritative = (
-        isinstance(event_views, dict)
-        and event_views.get("status") != "unavailable"
-    )
-    for path in definition["paths"]:
-        selected_path = path
-        if (
-            len(path) >= 5
-            and path[:3] == ("metric_event_views", "episodes", "windows")
-            and path[3] == "100"
-        ):
-            selected_path = (*path[:3], event_window, *path[4:])
-        value = _finite_number(_nested(record, selected_path))
-        if value is not None:
-            return value * definition["scale"]
-        if path and path[0] == "metric_event_views" and event_views_authoritative:
-            return None
-    return None
+    path = definition["paths"][0]
+    selected_path = path
+    if (
+        len(path) >= 5
+        and path[:3] == ("metric_event_views", "episodes", "windows")
+        and path[3] == "100"
+    ):
+        selected_path = (*path[:3], event_window, *path[4:])
+    value = _finite_number(_nested(record, selected_path))
+    return None if value is None else value * definition["scale"]
 
 
 def project_metric_values(record, definitions, event_window="100"):
@@ -658,11 +634,17 @@ class MetricsFileReader:
         max_records: int = 4096,
         read_chunk_bytes: int = 256 * 1024,
         max_pending_bytes: int = 1024 * 1024,
+        tail_interval_seconds: float = 0.05,
     ):
         if max_records <= 0:
             raise ValueError("max_records must be positive")
         if read_chunk_bytes <= 0 or max_pending_bytes <= 0:
             raise ValueError("metrics read bounds must be positive")
+        if (
+            not math.isfinite(tail_interval_seconds)
+            or tail_interval_seconds <= 0
+        ):
+            raise ValueError("metrics tail interval must be positive and finite")
         self._metrics_dir = os.path.abspath(metrics_dir)
         self._metrics_source_id = metrics_source_id or (
             f"local-training-{uuid.uuid4().hex}"
@@ -678,6 +660,13 @@ class MetricsFileReader:
         self._max_records = int(max_records)
         self._read_chunk_bytes = int(read_chunk_bytes)
         self._max_pending_bytes = int(max_pending_bytes)
+        self._tail_interval_seconds = float(tail_interval_seconds)
+        self._tail_stop = threading.Event()
+        self._tail_thread = None
+        self._tail_last_refresh_timestamp = None
+        self._tail_refresh_count = 0
+        self._tail_backlog_remaining = False
+        self._tail_error = None
         self._records = deque(maxlen=self._max_records)
         self._total_record_count = 0
         self._files = {}
@@ -686,7 +675,50 @@ class MetricsFileReader:
         os.makedirs(self._metrics_dir, exist_ok=True)
         print(f"[MetricsServer] 监控目录: {self._metrics_dir}")
 
+    def start(self):
+        if self._tail_thread is not None:
+            raise RuntimeError("metrics background tail is already started")
+        self._tail_stop.clear()
+        self._tail_thread = threading.Thread(
+            target=self._tail_loop,
+            name="learner-metrics-tail",
+            daemon=True,
+        )
+        self._tail_thread.start()
+        print(
+            "[MetricsServer] continuous background tail: "
+            f"interval={self._tail_interval_seconds * 1000.0:g}ms "
+            f"chunk={self._read_chunk_bytes} bytes"
+        )
+
+    def close(self):
+        thread = self._tail_thread
+        if thread is None:
+            return
+        self._tail_stop.set()
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            print("[MetricsServer] background tail did not stop within 2 seconds")
+        self._tail_thread = None
+
+    def _tail_loop(self):
+        while not self._tail_stop.is_set():
+            try:
+                backlog_remaining = self.refresh()
+            except Exception as exc:
+                with self._lock:
+                    self._tail_error = f"{type(exc).__name__}: {exc}"
+                print(f"[MetricsServer] background tail failed: {self._tail_error}")
+                return
+            with self._lock:
+                self._tail_last_refresh_timestamp = time.time()
+                self._tail_refresh_count += 1
+                self._tail_backlog_remaining = backlog_remaining
+            if not backlog_remaining:
+                self._tail_stop.wait(self._tail_interval_seconds)
+
     def refresh(self):
+        backlog_remaining = False
         with self._lock:
             now = time.monotonic()
             if now - self._last_scan_time >= 0.5:
@@ -694,12 +726,6 @@ class MetricsFileReader:
                 for path in glob.glob(
                     os.path.join(self._metrics_dir, "metrics_*.jsonl")
                 ):
-                    try:
-                        legacy_source_eligible = (
-                            os.path.getmtime(path) >= self._started_at - 5.0
-                        )
-                    except OSError:
-                        legacy_source_eligible = False
                     self._files.setdefault(
                         path,
                         {
@@ -707,11 +733,13 @@ class MetricsFileReader:
                             "pending": b"",
                             "discarding_oversize_line": False,
                             "corrupt": 0,
-                            "legacy_source_eligible": legacy_source_eligible,
                         },
                     )
             for path, state in list(self._files.items()):
-                self._read_file(path, state)
+                backlog_remaining = (
+                    self._read_file(path, state) or backlog_remaining
+                )
+        return backlog_remaining
 
     def _read_file(self, path: str, state: dict):
         try:
@@ -721,7 +749,7 @@ class MetricsFileReader:
                 state["pending"] = b""
                 state["discarding_oversize_line"] = False
             if file_size == state["offset"]:
-                return
+                return False
             with open(path, "rb") as stream:
                 stream.seek(state["offset"])
                 chunk = stream.read(self._read_chunk_bytes)
@@ -730,7 +758,7 @@ class MetricsFileReader:
             if state.get("discarding_oversize_line"):
                 newline = data.find(b"\n")
                 if newline < 0:
-                    return
+                    return state["offset"] < file_size
                 data = data[newline + 1 :]
                 state["discarding_oversize_line"] = False
             data = state["pending"] + data
@@ -747,39 +775,43 @@ class MetricsFileReader:
                 try:
                     record = json.loads(raw_line.decode("utf-8"))
                     record_source_id = record.get("metrics_source_id")
-                    if record_source_id is None:
-                        if not state.get("legacy_source_eligible", False):
-                            continue
-                    elif record_source_id != self._metrics_source_id:
+                    if record_source_id != self._metrics_source_id:
+                        continue
+                    sequence = record.get("sequence")
+                    if (
+                        isinstance(sequence, bool)
+                        or not isinstance(sequence, int)
+                        or sequence <= 0
+                    ):
+                        state["corrupt"] += 1
+                        self._corrupt_lines += 1
                         continue
                     self._records.append(record)
                     self._total_record_count += 1
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
                     state["corrupt"] += 1
                     self._corrupt_lines += 1
+            return state["offset"] < file_size
         except OSError as exc:
             state["error"] = str(exc)
+            return False
 
     def query(self, after_sequence: int = 0, limit: int = 0):
-        self.refresh()
         with self._lock:
             records = [
                 record
                 for record in self._records
-                if int(record.get("sequence", record.get("train_step", 0)))
-                > after_sequence
+                if int(record["sequence"]) > after_sequence
             ]
             if limit > 0:
                 records = records[:limit]
             return records
 
     def latest(self):
-        self.refresh()
         with self._lock:
             return self._records[-1] if self._records else {}
 
     def metric_definitions(self):
-        self.refresh()
         with self._lock:
             reward_names = set(_KNOWN_REWARD_COMPONENTS)
             for record in self._records:
@@ -832,13 +864,31 @@ class MetricsFileReader:
     def status(self):
         latest = self.latest()
         with self._lock:
-            timestamp = float(latest.get("timestamp", 0.0))
-            interval_seconds = max(
-                float(latest.get("interval_ms", 0.0)) / 1000.0, 0.0
+            timestamp = _finite_number(latest.get("timestamp"))
+            interval_ms = _finite_number(latest.get("interval_ms"))
+            configured_interval_ms = _finite_number(
+                latest.get("configured_poll_interval_ms")
             )
-            stale_after = max(5.0, 3.0 * interval_seconds)
+            interval_basis_ms = (
+                interval_ms
+                if interval_ms is not None and interval_ms > 0.0
+                else configured_interval_ms
+                if configured_interval_ms is not None
+                and configured_interval_ms > 0.0
+                else None
+            )
+            stale_after = (
+                None
+                if interval_basis_ms is None
+                else max(5.0, 3.0 * interval_basis_ms / 1000.0)
+            )
             age_seconds = (
-                max(0.0, time.time() - timestamp) if timestamp else None
+                None if timestamp is None else time.time() - timestamp
+            )
+            stale = (
+                None
+                if age_seconds is None or stale_after is None
+                else age_seconds > stale_after
             )
             return {
                 "schema_version": 1,
@@ -852,15 +902,30 @@ class MetricsFileReader:
                 "record_count": len(self._records),
                 "total_record_count": self._total_record_count,
                 "retained_record_limit": self._max_records,
-                "latest_sequence": latest.get(
-                    "sequence", latest.get("train_step", 0)
-                ),
+                "latest_sequence": latest.get("sequence"),
                 "latest_timestamp": timestamp,
+                "latest_interval_ms": interval_ms,
+                "configured_poll_interval_ms": configured_interval_ms,
                 "age_seconds": age_seconds,
                 "stale_after_seconds": stale_after,
-                "stale": age_seconds is None or age_seconds > stale_after,
+                "stale": stale,
+                "stale_status": (
+                    "unavailable" if stale is None else "stale" if stale else "fresh"
+                ),
                 "corrupt_line_count": self._corrupt_lines,
                 "file_count": len(self._files),
+                "tail_mode": "continuous_background",
+                "tail_running": (
+                    self._tail_thread is not None
+                    and self._tail_thread.is_alive()
+                ),
+                "tail_interval_ms": self._tail_interval_seconds * 1000.0,
+                "tail_last_refresh_timestamp": (
+                    self._tail_last_refresh_timestamp
+                ),
+                "tail_refresh_count": self._tail_refresh_count,
+                "tail_backlog_remaining": self._tail_backlog_remaining,
+                "tail_error": self._tail_error,
                 "file_errors": {
                     os.path.basename(path): state["error"]
                     for path, state in self._files.items()
@@ -874,12 +939,13 @@ class MetricsFileReader:
         rates = latest.get("rates", {})
         chain = latest.get("chain", {})
         return {
-            "mode": latest.get("mode", ""),
-            "sequence": latest.get("sequence", 0),
-            "consumed": sample_pool.get("acked", 0),
-            "consumer_sps": rates.get("trained_sps", 0.0),
-            "queue_size": sample_pool.get("ready_samples", 0),
-            "chain_ready": chain.get("ready", False),
+            "mode": latest.get("mode"),
+            "sequence": latest.get("sequence"),
+            "consumed": sample_pool.get("acked"),
+            "consumer_sps": rates.get("trained_sps"),
+            "consumer_rate_available": rates.get("available"),
+            "queue_size": sample_pool.get("ready_transitions"),
+            "chain_ready": chain.get("ready"),
         }
 
 
@@ -1052,23 +1118,29 @@ def main():
         metrics_source_id=args.source_id,
         runtime_mode=args.mode,
     )
-    metrics_reader.refresh()
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), MetricsHTTPHandler)
-    print(f"[MetricsServer] container listener: http://0.0.0.0:{args.port}")
-    public_url = os.environ.get("RL_METRICS_PUBLIC_URL", "").strip()
-    if public_url:
-        print(f"[MetricsServer] Learner Monitor: {public_url}")
+
+    def handle_stop_signal(_signal_number, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handle_stop_signal)
     try:
+        metrics_reader.start()
+        print(f"[MetricsServer] container listener: http://0.0.0.0:{args.port}")
+        public_url = os.environ.get("RL_METRICS_PUBLIC_URL", "").strip()
+        if public_url:
+            print(f"[MetricsServer] Learner Monitor: {public_url}")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        metrics_reader.close()
 
 
 if __name__ == "__main__":

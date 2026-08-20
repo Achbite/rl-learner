@@ -24,7 +24,7 @@ class MetricsBackend(abc.ABC):
 
     @abc.abstractmethod
     def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
-        """查询 train_step > since_step 的记录，limit=0 表示不限制"""
+        """查询 sequence > since_step 的记录，limit=0 表示不限制"""
         ...
 
     @abc.abstractmethod
@@ -94,8 +94,6 @@ class JsonlBackend(MetricsBackend):
         # 这里只保留常量空间的 latest 与摘要累加器。
         self._latest_record: Optional[dict] = None
         self._total_written = 0
-        self._best_pass_rate: Optional[float] = None
-        self._best_mean_reward: Optional[float] = None
 
         print(f"[MetricsBackend] 指标文件: {self._filepath}")
 
@@ -109,28 +107,21 @@ class JsonlBackend(MetricsBackend):
             self._file.flush()
 
             self._latest_record = json.loads(line)
-            pass_rate = float(record.get("pass_rate", 0.0))
-            mean_reward = float(record.get("mean_episode_reward", 0.0))
-            self._best_pass_rate = (
-                pass_rate
-                if self._best_pass_rate is None
-                else max(self._best_pass_rate, pass_rate)
-            )
-            self._best_mean_reward = (
-                mean_reward
-                if self._best_mean_reward is None
-                else max(self._best_mean_reward, mean_reward)
-            )
 
     def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
-        """查询 train_step > since_step 的记录"""
+        """查询 sequence > since_step 的记录"""
         with self._lock:
             self._file.flush()
             result = []
             with open(self._filepath, "r", encoding="utf-8") as source:
                 for raw_line in source:
                     record = json.loads(raw_line)
-                    if record.get("train_step", 0) <= since_step:
+                    sequence = record.get("sequence")
+                    if (
+                        isinstance(sequence, bool)
+                        or not isinstance(sequence, int)
+                        or sequence <= since_step
+                    ):
                         continue
                     result.append(record)
                     if limit > 0 and len(result) >= limit:
@@ -147,18 +138,16 @@ class JsonlBackend(MetricsBackend):
         with self._lock:
             if self._latest_record is None:
                 return {
-                    "total_steps": 0,
-                    "best_pass_rate": 0.0,
-                    "best_mean_reward": 0.0,
-                    "latest_loss": 0.0,
+                    "total_records": 0,
+                    "latest_sequence": None,
+                    "latest_timestamp": None,
                     "file": os.path.basename(self._filepath),
                 }
 
             return {
-                "total_steps": self._total_written,
-                "best_pass_rate": self._best_pass_rate,
-                "best_mean_reward": self._best_mean_reward,
-                "latest_loss": self._latest_record.get("total_loss", 0.0),
+                "total_records": self._total_written,
+                "latest_sequence": self._latest_record.get("sequence"),
+                "latest_timestamp": self._latest_record.get("timestamp"),
                 "file": os.path.basename(self._filepath),
             }
 

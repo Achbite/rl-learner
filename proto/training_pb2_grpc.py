@@ -221,78 +221,6 @@ class MetricEventService:
             _registered_method=True)
 
 
-class LearnerServiceStub:
-    """Missing associated documentation comment in .proto file."""
-
-    def __init__(self, channel):
-        """Constructor.
-
-        Args:
-            channel: A grpc.Channel.
-        """
-        self.SendSamples = channel.unary_unary(
-                '/rl.training.v1.LearnerService/SendSamples',
-                request_serializer=training__pb2.SampleBatch.SerializeToString,
-                response_deserializer=training__pb2.SampleResponse.FromString,
-                _registered_method=True)
-
-
-class LearnerServiceServicer:
-    """Missing associated documentation comment in .proto file."""
-
-    def SendSamples(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-
-def add_LearnerServiceServicer_to_server(servicer, server):
-    rpc_method_handlers = {
-            'SendSamples': grpc.unary_unary_rpc_method_handler(
-                    servicer.SendSamples,
-                    request_deserializer=training__pb2.SampleBatch.FromString,
-                    response_serializer=training__pb2.SampleResponse.SerializeToString,
-            ),
-    }
-    generic_handler = grpc.method_handlers_generic_handler(
-            'rl.training.v1.LearnerService', rpc_method_handlers)
-    server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('rl.training.v1.LearnerService', rpc_method_handlers)
-
-
- # This class is part of an EXPERIMENTAL API.
-class LearnerService:
-    """Missing associated documentation comment in .proto file."""
-
-    @staticmethod
-    def SendSamples(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.LearnerService/SendSamples',
-            training__pb2.SampleBatch.SerializeToString,
-            training__pb2.SampleResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-
 class SamplePoolIngressServiceStub:
     """Missing associated documentation comment in .proto file."""
 
@@ -437,6 +365,11 @@ class SamplePoolConsumerServiceStub:
                 request_serializer=training__pb2.RenewLeaseReq.SerializeToString,
                 response_deserializer=training__pb2.DeliveryRsp.FromString,
                 _registered_method=True)
+        self.FinalizeSamplePool = channel.unary_unary(
+                '/rl.training.v1.SamplePoolConsumerService/FinalizeSamplePool',
+                request_serializer=training__pb2.FinalizeSamplePoolReq.SerializeToString,
+                response_deserializer=training__pb2.FinalizeSamplePoolRsp.FromString,
+                _registered_method=True)
         self.GetStatus = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/GetStatus',
                 request_serializer=training__pb2.SamplePoolStatusReq.SerializeToString,
@@ -471,6 +404,12 @@ class SamplePoolConsumerServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def FinalizeSamplePool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -499,6 +438,11 @@ def add_SamplePoolConsumerServiceServicer_to_server(servicer, server):
                     servicer.RenewLease,
                     request_deserializer=training__pb2.RenewLeaseReq.FromString,
                     response_serializer=training__pb2.DeliveryRsp.SerializeToString,
+            ),
+            'FinalizeSamplePool': grpc.unary_unary_rpc_method_handler(
+                    servicer.FinalizeSamplePool,
+                    request_deserializer=training__pb2.FinalizeSamplePoolReq.FromString,
+                    response_serializer=training__pb2.FinalizeSamplePoolRsp.SerializeToString,
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
@@ -614,6 +558,33 @@ class SamplePoolConsumerService:
             '/rl.training.v1.SamplePoolConsumerService/RenewLease',
             training__pb2.RenewLeaseReq.SerializeToString,
             training__pb2.DeliveryRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FinalizeSamplePool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.SamplePoolConsumerService/FinalizeSamplePool',
+            training__pb2.FinalizeSamplePoolReq.SerializeToString,
+            training__pb2.FinalizeSamplePoolRsp.FromString,
             options,
             channel_credentials,
             insecure,

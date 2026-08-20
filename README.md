@@ -2,7 +2,8 @@
 
 简体中文 | [English](README.en.md)
 
-Learner 容器内运行 PPO、LocalSampleService、ModelDistributor 和可选监控。本地完整三端链路由开发者分别启动 Learner、AIServer 和 Client；Framework 只提供只读诊断，不参与运行编排。
+Learner 容器内运行 PPO、SamplePoolService、ModelDistributor 和可选监控。本地训练时先启动
+Learner，再启动 AIServer 和 Client。
 
 ## 1. 组件开发环境
 
@@ -13,11 +14,11 @@ make shell
 # 宿主机：复用同一开发镜像和依赖身份进行编译
 make build
 
-# 容器内：唯一测试入口（测试清单受 TCR 管理）
+# 容器内：统一测试入口
 bash ./test.sh
 ```
 
-开发入口不依赖旧 runtime image，也不要求正式 0.13 artifact 或 clean source。开发依赖只写入
+开发入口不依赖旧 runtime image，也不要求正式 0.14 artifact 或 clean source。开发依赖只写入
 `.workspace/dev-artifacts`，不得用于正式镜像。`make shell` 只能在宿主机执行。
 
 ## 2. 启动 Learner 侧服务
@@ -50,7 +51,15 @@ Sample Pool、Model Distributor 和监控存活；等待只会因 exact ACK、�
 或 config 中显式设置的正数 `aiserver_status.initial_model_ack_timeout_sec` 结束。Client 可以在
 AIServer ready 后再启动。
 
-launcher 会打印本次可用的监控 URL。`9005` 只属于可选观测，端口或监控失败不会终止 PPO。
+launcher 会打印本次可用的监控 URL。MetricsServer 使用独立后台线程持续 tail 当前 JSONL；存在
+积压时连续追赶，追平后再按固定间隔检查。HTTP 请求只读取内存 projection，不参与控制磁盘读取
+进度。`/api/status` 会报告 tail 运行、backlog 和错误事实。`9005` 只属于可选观测，端口或监控
+失败不会终止 PPO。
+
+Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 从 READY 集合随机无放回
+抽取 `training.train_batch_size` 条 processed transition，对整批 advantage 做一次归一化，再按
+`mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。一个 batch 可以包含多个 behavior model step；
+每条 transition 的 lineage/step/digest 仍作为真实 provenance 和 lag 指标保留。
 
 ## 3. 从已有模型开始全新训练
 
@@ -92,11 +101,18 @@ models/train/runtime/checkpoints/
 继承某个模型，必须先将 `SaveModel.onnx` 放到训练目录之外，再通过 config 或
 `--initial-model` 显式读取。后续训练不会自动恢复旧 Update。
 
-## 5. 正式制品与镜像
+## 5. 构建运行镜像
 
-只有 Level 1/2 通过、用户 Review 并形成 clean savepoint 后，才在宿主机依次构建正式
-Contracts/Pool/Distributor artifact、同步 runtime 依赖并运行 `bash build_image.sh`。正式脚本
-不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录。
+运行镜像只接受 clean source 和正式 Contracts、Sample Pool、Model Distributor 制品。在宿主机
+完成依赖同步后构建：
+
+```bash
+bash scripts/sync_runtime_artifacts.sh
+bash build_image.sh
+```
+
+脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录，并输出按当前 stack source
+identity 计算的镜像引用。
 
 ## 6. 端口
 

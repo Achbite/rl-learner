@@ -2,7 +2,9 @@
 
 [简体中文](README.md) | English
 
-The Learner container runs PPO, LocalSampleService, ModelDistributor, and the optional monitor. For the complete local three-component chain, start Learner, AIServer, and Client separately; Framework provides read-only diagnostics and does not orchestrate runtime processes.
+The Learner container runs PPO, SamplePoolService, ModelDistributor, and the
+optional monitor. For local training, start Learner first, followed by AIServer
+and Client.
 
 ## 1. Component development environment
 
@@ -13,11 +15,11 @@ make shell
 # Host: reuse the same development image and dependency identity for builds
 make build
 
-# Container: the only test entrypoint (the allowlist is governed by TCRs)
+# Container: unified test entrypoint
 bash ./test.sh
 ```
 
-The development path does not depend on an old runtime image, formal 0.13
+The development path does not depend on an old runtime image, formal 0.14
 artifacts, or clean source. Development dependencies remain under
 `.workspace/dev-artifacts` and cannot feed a formal image. Run `make shell` only
 on the host.
@@ -57,7 +59,19 @@ wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
 `aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
 diagnostic. Client can start after AIServer is ready.
 
-The launcher prints the monitor URL for that invocation. Port `9005` is optional observability; a monitor or port failure does not stop PPO.
+The launcher prints the monitor URL for that invocation. MetricsServer uses a
+dedicated background thread to tail the current JSONL continuously: it drains
+backlog without waiting and switches to periodic polling only after catching
+up. HTTP requests read the in-memory projection and do not control file-read
+progress. `/api/status` exposes the tail, backlog, and error facts. Port `9005`
+is optional observability; a monitor or port failure does not stop PPO.
+
+Learner does not consume raw trajectories or compute GAE. It
+asks SamplePool to draw `training.train_batch_size` READY processed transitions
+uniformly without replacement, normalizes advantages once over the full batch,
+then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
+batch may contain multiple behavior-model steps; each transition retains exact
+lineage, step, and digest provenance for lag observation.
 
 ## 3. Start fresh training from an existing model
 
@@ -103,12 +117,20 @@ and cannot start later training. To preserve or inherit a model, first place its
 config or with `--initial-model`. Later training never restores the previous
 update counter automatically.
 
-## 5. Formal artifacts and image
+## 5. Build the runtime image
 
-Only after Level 1/2 pass, user review, and clean savepoints may the host build
-formal Contracts/Pool/Distributor artifacts, synchronize runtime dependencies,
-and run `bash build_image.sh`. Formal scripts never consume
-`.workspace/dev-artifacts` or a mutable development-container build directory.
+The runtime image accepts only clean source and formal Contracts, Sample Pool,
+and Model Distributor artifacts. Synchronize the runtime dependencies and build
+from the host:
+
+```bash
+bash scripts/sync_runtime_artifacts.sh
+bash build_image.sh
+```
+
+The scripts never consume `.workspace/dev-artifacts` or a mutable development
+container build directory. The build prints the image reference derived from
+the current stack source identity.
 
 ## 6. Ports
 

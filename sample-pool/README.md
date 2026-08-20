@@ -1,6 +1,6 @@
-# LocalSampleService Runtime Artifact
+# SamplePoolService Runtime Artifact
 
-This directory stages the LocalSampleService artifact selected for the Learner
+This directory stages the SamplePoolService artifact selected for the Learner
 image. The artifact is copied here explicitly after `rl-sample-pool` publishes
 it to the workspace artifact store.
 

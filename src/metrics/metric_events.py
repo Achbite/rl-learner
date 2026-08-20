@@ -20,8 +20,8 @@ from proto import common_pb2, training_pb2, training_pb2_grpc
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-METRIC_SCHEMA_ID = "maze.metrics.v3"
-METRIC_SCHEMA_VERSION = 3
+METRIC_SCHEMA_ID = "maze.metrics.v4"
+METRIC_SCHEMA_VERSION = 4
 
 
 class MetricEventContractError(ValueError):
@@ -124,8 +124,8 @@ class MetricSchemaCatalog:
 
     @classmethod
     def load(cls, directory: Path) -> "MetricSchemaCatalog":
-        catalog_path = directory / "maze.metrics.v3.json"
-        digest_path = directory / "maze.metrics.v3.sha256"
+        catalog_path = directory / "maze.metrics.v4.json"
+        digest_path = directory / "maze.metrics.v4.sha256"
         catalog_bytes = catalog_path.read_bytes()
         actual_digest = hashlib.sha256(catalog_bytes).hexdigest()
         declared_digest = digest_path.read_text(encoding="utf-8").strip()
@@ -155,7 +155,7 @@ def default_metric_schema_directory() -> Path:
         return Path(configured).resolve()
     repository = Path(__file__).resolve().parents[2]
     local = repository / "schemas"
-    if (local / "maze.metrics.v3.json").is_file():
+    if (local / "maze.metrics.v4.json").is_file():
         return local
     sibling_contracts = repository.parent / "rl-contracts" / "schemas"
     return sibling_contracts
@@ -172,7 +172,7 @@ def _validate_sum_counts(
     for item in values:
         if item.field_id not in allowed_fields:
             raise MetricEventContractError(
-                f"{owner} field_id is outside maze.metrics.v3: {item.field_id}"
+                f"{owner} field_id is outside maze.metrics.v4: {item.field_id}"
             )
         if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
             raise MetricEventContractError(
@@ -191,7 +191,9 @@ def _validate_event(
         raise MetricEventContractError("metric event schema differs from batch")
     if not _same_message(event.source, batch.source):
         raise MetricEventContractError("metric event source differs from batch")
-    if int(event.event_sequence) <= 0 or int(event.committed_at_unix_ms) <= 0:
+    if int(event.event_sequence) <= 0 or not _has_field(
+        event, "observed_at_unix_ms"
+    ):
         raise MetricEventContractError("metric event identity is invalid")
     fact = event.WhichOneof("fact")
     if fact == "episode":
@@ -209,6 +211,15 @@ def _validate_event(
             if not agent.termination_reason:
                 raise MetricEventContractError(
                     "agent episode termination_reason is missing"
+                )
+            goal_reached = agent.termination_reason.endswith(
+                "GOAL_REACHED"
+            )
+            if bool(agent.success) != goal_reached or goal_reached != _has_field(
+                agent, "goal_rank_group"
+            ):
+                raise MetricEventContractError(
+                    "agent episode outcome and goal rank disagree"
                 )
             if not agent.behavior_model_lineage_id:
                 raise MetricEventContractError(
@@ -290,7 +301,6 @@ def validate_metric_batch(
     catalog: MetricSchemaCatalog,
     source: common_pb2.ServiceInstanceIdentity,
     previous_cursor: training_pb2.MetricBatchCursor,
-    previous_watermark_unix_ms: int = 0,
 ) -> None:
     schema = catalog.schema_identity()
     if not _same_message(batch.contract, contract):
@@ -314,10 +324,6 @@ def validate_metric_batch(
         raise MetricEventContractError("metric batch digest is invalid")
     if int(batch.created_at_unix_ms) <= 0:
         raise MetricEventContractError("metric batch created_at is invalid")
-    watermark = int(batch.event_time_watermark_unix_ms)
-    if watermark < int(previous_watermark_unix_ms):
-        raise MetricEventContractError("metric event-time watermark regressed")
-
     previous_event = int(previous_cursor.acknowledged_event_sequence)
     if batch.events:
         if batch.heartbeat or batch.HasField("gap"):
@@ -332,12 +338,6 @@ def validate_metric_batch(
             raise MetricEventContractError("metric event batch bounds are invalid")
         for event in batch.events:
             _validate_event(event, batch, catalog)
-        if watermark < max(
-            int(event.committed_at_unix_ms) for event in batch.events
-        ):
-            raise MetricEventContractError(
-                "metric watermark precedes a committed event"
-            )
         next_event = sequences[-1]
     elif batch.HasField("gap"):
         gap = batch.gap
@@ -428,7 +428,6 @@ class RawMetricBatchStore:
                     committed_batch_sequence TEXT NOT NULL DEFAULT '0',
                     committed_event_sequence TEXT NOT NULL DEFAULT '0',
                     committed_digest TEXT NOT NULL DEFAULT '',
-                    committed_watermark_unix_ms INTEGER NOT NULL DEFAULT 0,
                     pending_batch_sequence TEXT,
                     pending_event_sequence TEXT,
                     pending_digest TEXT,
@@ -444,7 +443,7 @@ class RawMetricBatchStore:
                     status TEXT NOT NULL CHECK(status IN ('pending', 'committed')),
                     payload BLOB NOT NULL,
                     persisted_at_unix_ms INTEGER NOT NULL,
-                    committed_at_unix_ms INTEGER,
+                    acknowledged_at_unix_ms INTEGER,
                     PRIMARY KEY(source_key, batch_sequence),
                     FOREIGN KEY(source_key) REFERENCES metric_sources(source_key)
                 );
@@ -560,14 +559,6 @@ class RawMetricBatchStore:
         with self._lock:
             return self._row_cursor(self._source_row(source), pending=False)
 
-    def committed_watermark_unix_ms(
-        self, source: common_pb2.ServiceInstanceIdentity
-    ) -> int:
-        with self._lock:
-            return int(
-                self._source_row(source)["committed_watermark_unix_ms"]
-            )
-
     def pending_cursor(
         self, source: common_pb2.ServiceInstanceIdentity
     ) -> training_pb2.MetricBatchCursor | None:
@@ -633,9 +624,6 @@ class RawMetricBatchStore:
                 catalog=self.catalog,
                 source=batch.source,
                 previous_cursor=committed,
-                previous_watermark_unix_ms=int(
-                    row["committed_watermark_unix_ms"]
-                ),
             )
             payload = batch.SerializeToString(deterministic=True)
             existing = self._connection.execute(
@@ -736,7 +724,7 @@ class RawMetricBatchStore:
             self._connection.execute(
                 """
                 UPDATE metric_batches
-                SET status = 'committed', committed_at_unix_ms = ?
+                SET status = 'committed', acknowledged_at_unix_ms = ?
                 WHERE source_key = ? AND batch_sequence = ?
                 """,
                 (now_ms, key, str(int(batch.batch_sequence))),
@@ -745,7 +733,7 @@ class RawMetricBatchStore:
                 """
                 UPDATE metric_sources
                 SET committed_batch_sequence = ?, committed_event_sequence = ?,
-                    committed_digest = ?, committed_watermark_unix_ms = ?,
+                    committed_digest = ?,
                     pending_batch_sequence = NULL,
                     pending_event_sequence = NULL, pending_digest = NULL,
                     final_acknowledged = ?, incomplete = ?,
@@ -756,7 +744,6 @@ class RawMetricBatchStore:
                     str(int(cursor.acknowledged_batch_sequence)),
                     str(int(cursor.acknowledged_event_sequence)),
                     cursor.acknowledged_batch_digest.hex,
-                    int(batch.event_time_watermark_unix_ms),
                     1 if batch.source_final else int(row["final_acknowledged"]),
                     incomplete,
                     incomplete_reason,
@@ -798,7 +785,6 @@ class RawMetricBatchStore:
                 """
                 SELECT role, component, instance_id, lifecycle_epoch,
                        committed_batch_sequence, committed_event_sequence,
-                       committed_watermark_unix_ms,
                        pending_batch_sequence, final_acknowledged,
                        incomplete, incomplete_reason
                 FROM metric_sources
@@ -831,9 +817,6 @@ class RawMetricBatchStore:
                     ),
                     "committed_event_sequence": int(
                         row["committed_event_sequence"]
-                    ),
-                    "committed_watermark_unix_ms": int(
-                        row["committed_watermark_unix_ms"]
                     ),
                     "pending_batch_sequence": (
                         None
@@ -1255,12 +1238,16 @@ class LocalMetricProjector:
         self._episode_buckets: dict[int, dict] = {}
         self._episode_all = _empty_episode_statistics()
         self._episode_latest: dict | None = None
-        self._episode_watermark = 0
+        self._episode_first_observed_at: int | None = None
+        self._episode_maximum_observed_at: int | None = None
+        self._episode_last_observed_at: int | None = None
         self._episode_source_keys: set[str] = set()
         self._train_buckets: dict[int, dict] = {}
         self._train_all = _empty_train_statistics()
         self._train_latest: dict | None = None
-        self._train_watermark = 0
+        self._train_first_observed_at: int | None = None
+        self._train_maximum_observed_at: int | None = None
+        self._train_last_observed_at: int | None = None
         self._train_source_keys: set[str] = set()
 
     @staticmethod
@@ -1277,8 +1264,20 @@ class LocalMetricProjector:
         self._episode_recent.append(statistics)
         self._episode_latest = statistics
         _merge_episode_statistics(self._episode_all, statistics)
+        observed_at = int(event.observed_at_unix_ms)
+        self._episode_first_observed_at = (
+            observed_at
+            if self._episode_first_observed_at is None
+            else min(self._episode_first_observed_at, observed_at)
+        )
+        self._episode_maximum_observed_at = (
+            observed_at
+            if self._episode_maximum_observed_at is None
+            else max(self._episode_maximum_observed_at, observed_at)
+        )
+        self._episode_last_observed_at = observed_at
         bucket = self._episode_buckets.setdefault(
-            self._bucket_start(event.committed_at_unix_ms),
+            self._bucket_start(observed_at),
             _empty_episode_statistics(),
         )
         _merge_episode_statistics(bucket, statistics)
@@ -1290,8 +1289,20 @@ class LocalMetricProjector:
         self._train_source_keys.add(source_key)
         self._train_latest = statistics
         _merge_train_statistics(self._train_all, statistics)
+        observed_at = int(event.observed_at_unix_ms)
+        self._train_first_observed_at = (
+            observed_at
+            if self._train_first_observed_at is None
+            else min(self._train_first_observed_at, observed_at)
+        )
+        self._train_maximum_observed_at = (
+            observed_at
+            if self._train_maximum_observed_at is None
+            else max(self._train_maximum_observed_at, observed_at)
+        )
+        self._train_last_observed_at = observed_at
         bucket = self._train_buckets.setdefault(
-            self._bucket_start(event.committed_at_unix_ms),
+            self._bucket_start(observed_at),
             _empty_train_statistics(),
         )
         _merge_train_statistics(bucket, statistics)
@@ -1299,15 +1310,14 @@ class LocalMetricProjector:
     @staticmethod
     def _window_statistics(
         buckets: dict[int, dict],
-        cut_unix_ms: int,
-        duration_ms: int,
+        start_unix_ms: int,
+        end_unix_ms: int,
         factory: Callable[[], dict],
         merge: Callable[[dict, dict], None],
     ) -> dict:
         result = factory()
-        start = cut_unix_ms - duration_ms
         for bucket_start, statistics in buckets.items():
-            if start <= bucket_start < cut_unix_ms:
+            if start_unix_ms <= bucket_start <= end_unix_ms:
                 merge(result, statistics)
         return result
 
@@ -1324,40 +1334,25 @@ class LocalMetricProjector:
                     raise MetricEventContractError(
                         "metric fact owner differs from durable source role"
                     )
-            if role == "aiserver":
-                self._episode_watermark = max(
-                    self._episode_watermark,
-                    int(batch.event_time_watermark_unix_ms),
-                )
-            elif role == "learner":
-                self._train_watermark = max(
-                    self._train_watermark,
-                    int(batch.event_time_watermark_unix_ms),
-                )
             self._last_row_id = row_id
             self._view_revision += 1
-        episode_retention_start = (
-            self._episode_watermark
-            - max(self.TIME_WINDOWS_MS.values())
-            - self.BUCKET_MS
+
+    def _observed_window_bounds(
+        self,
+        first_observed_at: int | None,
+        maximum_observed_at: int | None,
+        duration_ms: int,
+    ) -> tuple[int, int]:
+        if first_observed_at is None or maximum_observed_at is None:
+            return (0, 0)
+        first_bucket = self._bucket_start(first_observed_at)
+        nominal_start_bucket = self._bucket_start(
+            maximum_observed_at - duration_ms
         )
-        if episode_retention_start > 0:
-            self._episode_buckets = {
-                key: value
-                for key, value in self._episode_buckets.items()
-                if key >= episode_retention_start
-            }
-        train_retention_start = (
-            self._train_watermark
-            - max(self.TIME_WINDOWS_MS.values())
-            - self.BUCKET_MS
+        return (
+            max(first_bucket, nominal_start_bucket),
+            self._bucket_start(maximum_observed_at),
         )
-        if train_retention_start > 0:
-            self._train_buckets = {
-                key: value
-                for key, value in self._train_buckets.items()
-                if key >= train_retention_start
-            }
 
     @staticmethod
     def _projection_status(store_snapshot: dict) -> str:
@@ -1373,9 +1368,6 @@ class LocalMetricProjector:
             self._advance()
             store_snapshot = self.store.snapshot()
             status = self._projection_status(store_snapshot)
-            episode_cut = self._bucket_start(self._episode_watermark)
-            train_cut = self._bucket_start(self._train_watermark)
-
             episode_windows = {}
             recent = list(self._episode_recent)
             for size in self.EPISODE_WINDOWS:
@@ -1389,19 +1381,26 @@ class LocalMetricProjector:
                     requested_size=size,
                 )
             for label, duration in self.TIME_WINDOWS_MS.items():
+                start_unix_ms, end_bucket_unix_ms = self._observed_window_bounds(
+                    self._episode_first_observed_at,
+                    self._episode_maximum_observed_at,
+                    duration,
+                )
                 raw = self._window_statistics(
                     self._episode_buckets,
-                    episode_cut,
-                    duration,
+                    start_unix_ms,
+                    end_bucket_unix_ms,
                     _empty_episode_statistics,
                     _merge_episode_statistics,
                 )
                 episode_windows[label] = _render_episode_statistics(
                     raw,
                     status=status,
-                    window_kind="event_time",
-                    start_unix_ms=episode_cut - duration,
-                    end_unix_ms=episode_cut,
+                    window_kind="observed_time",
+                    start_unix_ms=start_unix_ms,
+                    end_unix_ms=(
+                        self._episode_maximum_observed_at or 0
+                    ),
                 )
             episode_windows["all"] = _render_episode_statistics(
                 self._episode_all,
@@ -1411,19 +1410,24 @@ class LocalMetricProjector:
 
             train_windows = {}
             for label, duration in self.TIME_WINDOWS_MS.items():
+                start_unix_ms, end_bucket_unix_ms = self._observed_window_bounds(
+                    self._train_first_observed_at,
+                    self._train_maximum_observed_at,
+                    duration,
+                )
                 raw = self._window_statistics(
                     self._train_buckets,
-                    train_cut,
-                    duration,
+                    start_unix_ms,
+                    end_bucket_unix_ms,
                     _empty_train_statistics,
                     _merge_train_statistics,
                 )
                 train_windows[label] = _render_train_statistics(
                     raw,
                     status=status,
-                    window_kind="event_time",
-                    start_unix_ms=train_cut - duration,
-                    end_unix_ms=train_cut,
+                    window_kind="observed_time",
+                    start_unix_ms=start_unix_ms,
+                    end_unix_ms=(self._train_maximum_observed_at or 0),
                 )
             train_windows["all"] = _render_train_statistics(
                 self._train_all,
@@ -1453,12 +1457,20 @@ class LocalMetricProjector:
                 "server_source_count": len(self._episode_source_keys),
                 "learner_source_count": len(self._train_source_keys),
                 "episodes": {
-                    "event_time_watermark_unix_ms": self._episode_watermark,
+                    "first_observed_at_unix_ms": self._episode_first_observed_at,
+                    "maximum_observed_at_unix_ms": (
+                        self._episode_maximum_observed_at
+                    ),
+                    "last_observed_at_unix_ms": self._episode_last_observed_at,
                     "latest": latest_episode,
                     "windows": episode_windows,
                 },
                 "train_updates": {
-                    "event_time_watermark_unix_ms": self._train_watermark,
+                    "first_observed_at_unix_ms": self._train_first_observed_at,
+                    "maximum_observed_at_unix_ms": (
+                        self._train_maximum_observed_at
+                    ),
+                    "last_observed_at_unix_ms": self._train_last_observed_at,
                     "latest": latest_train,
                     "windows": train_windows,
                 },
@@ -1498,19 +1510,23 @@ class LocalTrainUpdateMetricWriter:
         *,
         first_event_sequence: int,
         last_event_sequence: int,
-        watermark_unix_ms: int,
     ) -> None:
         if not 0 < first_event_sequence <= last_event_sequence:
             raise MetricEventContractError(
                 "learner metric sequence gap bounds are invalid"
             )
         committed = self.store.committed_cursor(self.source)
+        created_at_unix_ms = int(time.time() * 1000)
+        if created_at_unix_ms <= 0:
+            raise MetricEventContractError(
+                "learner metric gap created_at must be positive"
+            )
         batch = training_pb2.MetricBatch(
             contract=self.store.contract,
             schema_identity=self.store.catalog.schema_identity(),
             source=self.source,
             batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
-            created_at_unix_ms=max(1, int(time.time() * 1000)),
+            created_at_unix_ms=created_at_unix_ms,
             first_event_sequence=first_event_sequence,
             last_event_sequence=last_event_sequence,
             gap=training_pb2.MetricSequenceGap(
@@ -1519,7 +1535,6 @@ class LocalTrainUpdateMetricWriter:
                 oldest_available_event_sequence=last_event_sequence + 1,
                 reason="learner_train_update_fact_unavailable",
             ),
-            event_time_watermark_unix_ms=watermark_unix_ms,
         )
         batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
         cursor = self.store.persist_batch("learner", batch)
@@ -1528,7 +1543,7 @@ class LocalTrainUpdateMetricWriter:
     def append(
         self,
         fact: training_pb2.TrainUpdateMetricFact,
-        committed_at_unix_ms: int,
+        observed_at_unix_ms: int,
     ) -> None:
         with self._lock:
             if self._finalized:
@@ -1545,9 +1560,6 @@ class LocalTrainUpdateMetricWriter:
                 raise MetricEventContractError(
                     "train update sequence is behind learner event sequence"
                 )
-            previous_watermark = self.store.committed_watermark_unix_ms(
-                self.source
-            )
             if actual_update_sequence > expected_update_sequence:
                 first_missing_event = (
                     int(committed.acknowledged_event_sequence) + 1
@@ -1560,19 +1572,10 @@ class LocalTrainUpdateMetricWriter:
                 self._append_gap(
                     first_event_sequence=first_missing_event,
                     last_event_sequence=last_missing_event,
-                    watermark_unix_ms=previous_watermark,
                 )
                 committed = self.store.committed_cursor(self.source)
 
-            committed_at = int(committed_at_unix_ms)
-            if committed_at <= 0:
-                raise MetricEventContractError(
-                    "learner metric committed_at must be positive"
-                )
-            previous_watermark = self.store.committed_watermark_unix_ms(
-                self.source
-            )
-            committed_at = max(committed_at, previous_watermark)
+            observed_at = int(observed_at_unix_ms)
             event_sequence = int(committed.acknowledged_event_sequence) + 1
             batch_sequence = int(committed.acknowledged_batch_sequence) + 1
             event = training_pb2.MetricEvent(
@@ -1580,7 +1583,7 @@ class LocalTrainUpdateMetricWriter:
                 schema_identity=self.store.catalog.schema_identity(),
                 source=self.source,
                 event_sequence=event_sequence,
-                committed_at_unix_ms=committed_at,
+                observed_at_unix_ms=observed_at,
                 train_update=fact,
             )
             batch = training_pb2.MetricBatch(
@@ -1592,7 +1595,6 @@ class LocalTrainUpdateMetricWriter:
                 first_event_sequence=event_sequence,
                 last_event_sequence=event_sequence,
                 events=[event],
-                event_time_watermark_unix_ms=committed_at,
             )
             batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
@@ -1604,22 +1606,18 @@ class LocalTrainUpdateMetricWriter:
                 return
             self._settle_pending()
             committed = self.store.committed_cursor(self.source)
-            watermark = max(
-                int(time.time() * 1000),
-                self.store.committed_watermark_unix_ms(self.source),
-            )
+            finalized_at_unix_ms = int(time.time() * 1000)
             batch = training_pb2.MetricBatch(
                 contract=self.store.contract,
                 schema_identity=self.store.catalog.schema_identity(),
                 source=self.source,
                 batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
-                created_at_unix_ms=max(1, int(time.time() * 1000)),
+                created_at_unix_ms=finalized_at_unix_ms,
                 heartbeat=True,
                 source_final=True,
                 final_event_sequence=int(
                     committed.acknowledged_event_sequence
                 ),
-                event_time_watermark_unix_ms=watermark,
             )
             batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
@@ -1717,9 +1715,9 @@ class AIServerMetricRelay:
             failure_count = self._transport_failure_count
             unavailable_since = self._transport_unavailable_since
             elapsed = (
-                max(0.0, now - unavailable_since)
+                now - unavailable_since
                 if unavailable_since > 0.0
-                else 0.0
+                else None
             )
             if prior_state == "unavailable":
                 self.logger.info(
