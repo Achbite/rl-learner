@@ -6,7 +6,9 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
 source "${repo_dir}/artifact_versions.env"
 
-platform="${RL_RUNTIME_ARTIFACT_PLATFORM}"
+# 与 build_image.sh 保持一致：按当前 Docker 服务端平台定位上游产物目录，
+# 使同一套同步脚本可在 mac 与 WSL / Linux 开发环境直接复用。
+platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
 platform_dir="${platform//\//-}"
 contract_dir="${workspace_root}/.workspace/artifacts/rl-contracts/${RL_CONTRACTS_VERSION}/${platform_dir}"
 sample_pool_source="${workspace_root}/.workspace/artifacts/rl-sample-pool/${RL_SAMPLE_POOL_VERSION}/${platform_dir}"
