@@ -70,6 +70,10 @@ _Override = tuple[tuple[str, ...], Callable[[str, str], object]]
 
 
 ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
+    "RL_LEARNER_LOCAL_MONITOR_ENABLED": (
+        ("dashboard", "enabled"),
+        _boolean,
+    ),
     "RL_TRAINING_DEVICE": (("training", "device"), _device),
     "RL_TRAINING_SEED": (("training", "seed"), _integer),
     "RL_PPO_LEARNING_RATE": (("training", "learning_rate"), _floating),
@@ -112,8 +116,11 @@ _INTERNAL_ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
 }
 
 _ALLOWED_NONCONFIG_ENVIRONMENT = {
+    "RL_DEVELOPMENT_MONITOR_CONTAINER_PORT",
+    "RL_DEVELOPMENT_MONITOR_URL",
     "RL_TRAINING_WORKSPACE",
     "RL_MODEL_LINEAGE_ID",
+    "RL_METRICS_PUBLIC_URL",
     "RL_METRICS_SOURCE_ID",
     "RL_LEARNER_INSTANCE",
 }
@@ -131,6 +138,7 @@ CLI_OVERRIDE_FIELDS = {
     ("model_distributor", "port"),
     ("aiserver_status", "host"),
     ("aiserver_status", "port"),
+    ("dashboard", "enabled"),
     ("dashboard", "server_port"),
 }
 
@@ -178,6 +186,10 @@ def _normalize_cli_override(path: tuple[str, ...], value: object) -> object:
     field = ".".join(path)
     if path not in CLI_OVERRIDE_FIELDS:
         raise ValueError(f"unsupported Learner CLI override: {field}")
+    if path == ("dashboard", "enabled"):
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} CLI value must be a boolean")
+        return value
     if path in {
         ("model_distributor", "port"),
         ("aiserver_status", "port"),
@@ -382,5 +394,6 @@ def effective_config_log(config: dict) -> dict:
         },
         "model_distributor": copy.deepcopy(config["model_distributor"]),
         "aiserver_status": copy.deepcopy(config["aiserver_status"]),
+        "metric_events": copy.deepcopy(config["metric_events"]),
         "dashboard": copy.deepcopy(config["dashboard"]),
     }

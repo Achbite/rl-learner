@@ -31,7 +31,9 @@ only the training workload and accepts no positional workload:
 
 ```bash
 ./run.sh --help
-./run.sh --config configs/learner_config.yaml
+./run.sh --monitor --config configs/learner_config.yaml
+# Disable only the local three-container preview, not raw metrics or training
+./run.sh --no-monitor --config configs/learner_config.yaml
 ```
 
 `--help` prints the supported overrides and their config fields without
@@ -39,8 +41,9 @@ starting Sample Pool, Model Distributor, PPO, or the monitor.
 
 `configs/learner_config.yaml` is the complete default source. Startup applies
 allowlisted PPO/training environment overrides and then CLI overrides before
-validation. `--initial-model`, `--model-distributor`, `--aiserver`, and
-`--metrics-port` only override existing config fields. The supervisor and PPO
+validation. `--initial-model`, `--model-distributor`, `--aiserver`,
+`--metrics-port`, `--monitor`, and `--no-monitor` only override existing config
+fields. The supervisor and PPO
 runtime share the same parser/loader, and relative paths are resolved against
 the selected config file.
 
@@ -59,7 +62,18 @@ wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
 `aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
 diagnostic. Client can start after AIServer is ready.
 
-The launcher prints the monitor URL for that invocation. MetricsServer uses a
+`dashboard.enabled: true` is the local default. Infra can inject the strict
+boolean environment variable `RL_LEARNER_LOCAL_MONITOR_ENABLED=false`; CLI
+`--monitor/--no-monitor` takes precedence. Disabling the preview skips only the
+HTTP/HTML MetricsServer and does not disable JSONL, MetricEvent, SQLite,
+AIServer relay, the projector, or training.
+
+`run.sh` prints a browser URL only when the development launcher supplied one
+for the effective container port; otherwise it reports a container-only URL or
+that the host URL is unavailable. Linux/WSL direct mode uses the actual host
+port returned by `docker port`, for example
+`http://127.0.0.1:32793/monitor`; macOS/Colima keeps
+`http://127.0.0.1:9005/monitor` through an SSH tunnel. MetricsServer uses a
 dedicated background thread to tail the current JSONL continuously: it drains
 backlog without waiting and switches to periodic polling only after catching
 up. HTTP requests read the in-memory projection and do not control file-read

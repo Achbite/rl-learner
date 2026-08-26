@@ -3,13 +3,15 @@
 set -euo pipefail
 
 requested_image_tag="${RL_LEARNER_IMAGE_TAG:-}"
+development_worktree="${RL_P1A_DEVELOPMENT_BUILD:-0}"
 
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
 contract_root="${workspace_root}/.workspace/artifacts/rl-contracts"
 context_dir="${workspace_root}/.workspace/build-contexts/rl-learner-$$"
 source "${repo_dir}/artifact_versions.env"
-if test -n "$(git -C "${repo_dir}" status --porcelain --untracked-files=all)"; then
+if test -n "$(git -C "${repo_dir}" status --porcelain --untracked-files=all)" &&
+   [ "${development_worktree}" != "1" ]; then
     echo "refusing to build a Learner runtime image from a dirty worktree" >&2
     exit 1
 fi
@@ -51,8 +53,12 @@ if [ ! -f "${stack_identity_tool}" ]; then
     echo "stack source identity tool is missing: ${stack_identity_tool}" >&2
     exit 1
 fi
+stack_identity_arguments=(--workspace-root "${workspace_root}")
+if [ "${development_worktree}" = "1" ]; then
+    stack_identity_arguments+=(--development-worktree)
+fi
 stack_identity_json="$(
-    python3 "${stack_identity_tool}" --workspace-root "${workspace_root}"
+    python3 "${stack_identity_tool}" "${stack_identity_arguments[@]}"
 )"
 identity_fields="$(
     python3 -c '
@@ -76,7 +82,26 @@ IFS=$'\t' read -r \
     contracts_manifest_digest sample_pool_manifest_digest \
     model_distributor_manifest_digest component_config_digest \
     <<< "${identity_fields}"
-canonical_image_tag="a3-${RL_CONTRACTS_VERSION}-${stack_source_id:0:12}"
+component_contract_tool="${workspace_root}/rl-framework/tools/generate_component_contract.py"
+if [ ! -f "${component_contract_tool}" ]; then
+    echo "component contract generator is missing: ${component_contract_tool}" >&2
+    exit 1
+fi
+contract_temp_dir="$(mktemp -d)"
+trap 'rm -rf "${context_dir}" "${contract_temp_dir}"' EXIT
+contract_manifest_digest="$(
+    python3 "${component_contract_tool}" \
+        --component learner \
+        --output "${contract_temp_dir}/manifest.json" \
+        --schema-source "${repo_dir}/component-contract/config.schema.json" \
+        --schema-image-path /opt/rl/component-contract/config.schema.json \
+        --config-file "main=/opt/rl/learner/configs/learner_config.yaml=learner.yaml=${repo_dir}/configs/learner_config.yaml" \
+        --config-file "sample_pool=/opt/rl/learner/sample-pool/config/pool_config.yaml=sample-pool.yaml=${sample_pool_dir}/config/pool_config.yaml" \
+        --config-file "model_distributor=/opt/rl/learner/model-distributor/config/model_distributor_config.yaml=model-distributor.yaml=${model_distributor_dir}/config/model_distributor_config.yaml" \
+        --contracts-version "${RL_CONTRACTS_VERSION}" \
+        --contracts-artifact-digest "${contracts_artifact_digest}"
+)"
+canonical_image_tag="p1a-${RL_CONTRACTS_VERSION}-${stack_source_id:0:12}"
 if [ -n "${requested_image_tag}" ] &&
    [ "${requested_image_tag}" != "${canonical_image_tag}" ]; then
     echo "Learner image tag must match the canonical stack identity:" >&2
@@ -89,16 +114,18 @@ image_ref="rl-training/learner:${canonical_image_tag}"
 if docker image inspect "${image_ref}" >/dev/null 2>&1; then
     existing_identity="$(
         docker image inspect --format \
-            '{{index .Config.Labels "org.rl-training.stack-source-id"}}|{{index .Config.Labels "org.rl-training.component"}}|{{index .Config.Labels "org.rl-training.component-commit"}}|{{index .Config.Labels "org.rl-training.contracts-version"}}|{{index .Config.Labels "org.rl-training.contracts-artifact-digest"}}|{{index .Config.Labels "org.rl-training.contracts-manifest-digest"}}|{{index .Config.Labels "org.rl-training.component-config-digest"}}|{{index .Config.Labels "org.rl-training.sample-pool-manifest-digest"}}|{{index .Config.Labels "org.rl-training.model-distributor-manifest-digest"}}' \
+            '{{index .Config.Labels "org.rl-training.stack-source-id"}}|{{index .Config.Labels "org.rl-training.component"}}|{{index .Config.Labels "org.rl-training.component-commit"}}|{{index .Config.Labels "org.rl-training.contracts-version"}}|{{index .Config.Labels "org.rl-training.contracts-artifact-digest"}}|{{index .Config.Labels "org.rl-training.contracts-manifest-digest"}}|{{index .Config.Labels "org.rl-training.component-config-digest"}}|{{index .Config.Labels "org.rl-training.sample-pool-manifest-digest"}}|{{index .Config.Labels "org.rl-training.model-distributor-manifest-digest"}}|{{index .Config.Labels "org.rl-training.component-contract.sha256"}}' \
             "${image_ref}"
     )"
-    expected_identity="${stack_source_id}|learner|${component_commit}|${RL_CONTRACTS_VERSION}|${contracts_artifact_digest}|${contracts_manifest_digest}|${component_config_digest}|${sample_pool_manifest_digest}|${model_distributor_manifest_digest}"
+    expected_identity="${stack_source_id}|learner|${component_commit}|${RL_CONTRACTS_VERSION}|${contracts_artifact_digest}|${contracts_manifest_digest}|${component_config_digest}|${sample_pool_manifest_digest}|${model_distributor_manifest_digest}|${contract_manifest_digest}"
     if [ "${existing_identity}" != "${expected_identity}" ]; then
         echo "refusing to overwrite an existing Learner tag with another identity: ${image_ref}" >&2
         exit 1
     fi
-    RL_LEARNER_IMAGE_REF="${image_ref}" \
-        bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
+    if [ "${development_worktree}" != "1" ]; then
+        RL_LEARNER_IMAGE_REF="${image_ref}" \
+            bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
+    fi
     printf '%s\n' "${image_ref}"
     exit 0
 fi
@@ -109,7 +136,6 @@ mkdir -p "${context_dir}/_deps/contracts" \
     "${context_dir}/_deps/model-distributor/bin" \
     "${context_dir}/_deps/model-distributor/config" \
     "${context_dir}/_deps/identity"
-trap 'rm -rf "${context_dir}"' EXIT
 rsync -a \
     --exclude='.git/' \
     --exclude='build/' \
@@ -141,6 +167,8 @@ cp "${model_distributor_dir}/manifest.json" \
     "${context_dir}/_deps/identity/model-distributor.json"
 printf '%s\n' "${stack_identity_json}" \
     > "${context_dir}/_deps/identity/stack-source.json"
+cp "${contract_temp_dir}/manifest.json" \
+    "${context_dir}/component-contract/manifest.json"
 
 docker build \
     --label "org.opencontainers.image.revision=${component_commit}" \
@@ -153,8 +181,12 @@ docker build \
     --label "org.rl-training.component-config-digest=${component_config_digest}" \
     --label "org.rl-training.sample-pool-manifest-digest=${sample_pool_manifest_digest}" \
     --label "org.rl-training.model-distributor-manifest-digest=${model_distributor_manifest_digest}" \
+    --label "org.rl-training.component-contract.path=/opt/rl/component-contract/manifest.json" \
+    --label "org.rl-training.component-contract.sha256=${contract_manifest_digest}" \
     --tag "${image_ref}" \
     "${context_dir}"
-RL_LEARNER_IMAGE_REF="${image_ref}" \
-    bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
+if [ "${development_worktree}" != "1" ]; then
+    RL_LEARNER_IMAGE_REF="${image_ref}" \
+        bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
+fi
 printf '%s\n' "${image_ref}"

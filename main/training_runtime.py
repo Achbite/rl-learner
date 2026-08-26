@@ -49,6 +49,7 @@ from src.metrics.metric_events import (
     MetricEventContractError,
     MetricSchemaCatalog,
     RawMetricBatchStore,
+    create_learner_metric_event_server,
     default_metric_schema_directory,
 )
 from src.metrics.metrics_backend import DisabledMetricsBackend, create_backend
@@ -1158,6 +1159,10 @@ class TrainingRuntime:
     GET_BATCH_RECONCILE_STABLE_WINDOW_SEC = 0.5
     GET_BATCH_RECONCILE_CONFIRMATIONS = 2
     SHUTDOWN_RECONCILE_MARGIN_SEC = 5.0
+    MANAGED_METRIC_READY_PATH = Path(
+        "/run/rl/learner-metric-ready.json"
+    )
+    METRIC_FINAL_ACK_TIMEOUT_SEC = 10.0
 
     def __init__(self, config: dict):
         validate_config(config)
@@ -1297,6 +1302,17 @@ class TrainingRuntime:
         self.metric_event_writer: LocalTrainUpdateMetricWriter | None = None
         self.metric_event_relay: AIServerMetricRelay | None = None
         self.metric_event_projector: LocalMetricProjector | None = None
+        self.metric_event_server = None
+        self.metric_event_server_started = False
+        self.metric_event_server_port = int(
+            config["metric_events"]["server_port"]
+        )
+        self.metric_event_server_enabled = bool(
+            config["metric_events"]["server_enabled"]
+        )
+        self.metric_event_relay_enabled = bool(
+            config["metric_events"]["aiserver_relay_enabled"]
+        )
         self._metric_event_disabled_reason = ""
         self._metric_event_write_failure_count = 0
         self._metric_event_write_failure_started_at = 0.0
@@ -1329,14 +1345,24 @@ class TrainingRuntime:
                 self.learner_service,
                 initial_train_update_sequence=self.train_updates,
             )
-            relay = AIServerMetricRelay(
-                store=store,
-                contract=self.contract,
-                consumer=self.learner_service,
-                status_stub=self.actor_stub,
-                event_stub=self.metric_event_stub,
-                logger=self.logger,
-            )
+            relay = None
+            if self.metric_event_relay_enabled:
+                relay = AIServerMetricRelay(
+                    store=store,
+                    contract=self.contract,
+                    consumer=self.learner_service,
+                    status_stub=self.actor_stub,
+                    event_stub=self.metric_event_stub,
+                    logger=self.logger,
+                )
+            event_server = None
+            if self.metric_event_server_enabled:
+                event_server = create_learner_metric_event_server(
+                    store=store,
+                    contract=self.contract,
+                    source=self.learner_service,
+                    port=self.metric_event_server_port,
+                )
             projector = LocalMetricProjector(store)
         except (OSError, MetricEventContractError, RuntimeError) as error:
             if store is not None:
@@ -1355,8 +1381,49 @@ class TrainingRuntime:
         self.metric_event_writer = writer
         self.metric_event_relay = relay
         self.metric_event_projector = projector
+        self.metric_event_server = event_server
+
+    def _publish_metric_ready(self) -> None:
+        if os.environ.get("RL_CONFIG_PATH") is None:
+            return
+        store = self.metric_event_store
+        if store is None:
+            raise RuntimeError("Learner metric store is unavailable")
+        schema = store.catalog.schema_identity()
+        document = {
+            "component": self.learner_service.component,
+            "instance_id": self.learner_service.instance_id,
+            "lifecycle_epoch": int(
+                self.learner_service.lifecycle_epoch
+            ),
+            "container_port": self.metric_event_server_port,
+            "schema_id": schema.schema_id,
+            "schema_version": int(schema.schema_version),
+            "schema_digest": schema.canonical_digest.hex,
+        }
+        destination = self.MANAGED_METRIC_READY_PATH
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(
+            f".{destination.name}.tmp.{os.getpid()}"
+        )
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(document, output, sort_keys=True, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
 
     def _start_metric_events(self) -> None:
+        server = getattr(self, "metric_event_server", None)
+        if self.metric_event_server_enabled:
+            if server is None:
+                raise RuntimeError(
+                    "Learner raw MetricEvent service is required but unavailable: "
+                    + self._metric_event_disabled_reason
+                )
+            server.start()
+            self.metric_event_server_started = True
+            self._publish_metric_ready()
         relay = getattr(self, "metric_event_relay", None)
         if relay is None:
             return
@@ -1370,6 +1437,7 @@ class TrainingRuntime:
         writer = getattr(self, "metric_event_writer", None)
         store = getattr(self, "metric_event_store", None)
         relay = getattr(self, "metric_event_relay", None)
+        server = getattr(self, "metric_event_server", None)
         if writer is not None:
             try:
                 writer.finalize()
@@ -1385,8 +1453,40 @@ class TrainingRuntime:
                         )
                     except Exception:
                         pass
+        if (
+            store is not None
+            and server is not None
+            and self.metric_event_server_started
+        ):
+            try:
+                final_acknowledged = store.wait_for_final_export_ack(
+                    self.learner_service,
+                    self.METRIC_FINAL_ACK_TIMEOUT_SEC,
+                )
+                if not final_acknowledged:
+                    store.mark_incomplete(
+                        self.learner_service,
+                        "infra_final_ack_timeout",
+                    )
+                    self.logger.error(
+                        "Learner raw metric final batch was not acknowledged "
+                        "before %.1fs shutdown deadline",
+                        self.METRIC_FINAL_ACK_TIMEOUT_SEC,
+                    )
+            except Exception as error:
+                self.logger.error(
+                    "Learner metric final ACK wait failed: %s", error
+                )
         if relay is not None:
             relay.close()
+        if server is not None:
+            try:
+                server.stop(2.0).wait(timeout=3.0)
+            except Exception as error:
+                self.logger.error(
+                    "Learner raw metric server stop failed: %s", error
+                )
+        self.MANAGED_METRIC_READY_PATH.unlink(missing_ok=True)
         if store is not None:
             try:
                 store.close()
@@ -1408,6 +1508,11 @@ class TrainingRuntime:
             relay = getattr(self, "metric_event_relay", None)
             if relay is not None:
                 snapshot["aiserver_relay"] = relay.snapshot()
+            snapshot["raw_service"] = {
+                "enabled": self.metric_event_server_enabled,
+                "started": self.metric_event_server_started,
+                "container_port": self.metric_event_server_port,
+            }
             return snapshot
         except Exception as error:
             return {

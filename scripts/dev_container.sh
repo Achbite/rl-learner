@@ -12,7 +12,6 @@ container_name="learner-dev"
 network_name="rl-training-dev"
 monitor_host_port=9005
 monitor_tunnel_socket="${TMPDIR:-/tmp}/rl-training-learner-dev-9005.sock"
-monitor_tunnel_marker="${TMPDIR:-/tmp}/rl-training-learner-dev-9005.json"
 colima_ssh_config="${RL_COLIMA_SSH_CONFIG:-${HOME}/.colima/_lima/colima/ssh.config}"
 tag="${LEARNER_DEV_IMAGE_TAG:-test-001}"
 dev_image="rl-training/learner-dev:${tag}"
@@ -69,29 +68,8 @@ colima_ssh_target() {
     awk '$1 == "Host" { print $2; exit }' "${colima_ssh_config}"
 }
 
-monitor_marker_owned() {
-    [ -f "${monitor_tunnel_marker}" ] || return 1
-    python3 - "${monitor_tunnel_marker}" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as stream:
-        marker = json.load(stream)
-except (OSError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(
-    0
-    if marker.get("owner") == "learner-dev"
-    and marker.get("port") == 9005
-    else 1
-)
-PY
-}
-
 monitor_tunnel_running() {
     local target
-    monitor_marker_owned || return 1
     [ -S "${monitor_tunnel_socket}" ] || return 1
     [ -f "${colima_ssh_config}" ] || return 1
     target="$(colima_ssh_target)"
@@ -103,67 +81,21 @@ monitor_tunnel_running() {
         "${target}" >/dev/null 2>&1
 }
 
-write_monitor_marker() {
-    local target="$1"
-    python3 - \
-        "${monitor_tunnel_marker}" \
-        "${monitor_tunnel_socket}" \
-        "${colima_ssh_config}" \
-        "${target}" <<'PY'
-import json
+remove_monitor_socket() {
+    python3 - "${monitor_tunnel_socket}" <<'PY'
 import os
 import sys
-import tempfile
-import time
 
-marker_path, socket_path, config_path, target = sys.argv[1:]
-document = {
-    "schema_version": 1,
-    "owner": "learner-dev",
-    "port": 9005,
-    "socket_path": socket_path,
-    "config_path": config_path,
-    "target": target,
-    "created_at": time.time(),
-}
-directory = os.path.dirname(marker_path) or "."
-descriptor, temporary = tempfile.mkstemp(
-    prefix=".learner-monitor-", suffix=".json", dir=directory
-)
 try:
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(document, stream, ensure_ascii=False, sort_keys=True)
-        stream.write("\n")
-    os.replace(temporary, marker_path)
-except BaseException:
-    try:
-        os.unlink(temporary)
-    except OSError:
-        pass
-    raise
-PY
-}
-
-remove_owned_monitor_files() {
-    monitor_marker_owned || return 0
-    python3 - "${monitor_tunnel_marker}" "${monitor_tunnel_socket}" <<'PY'
-import os
-import sys
-
-for value in sys.argv[1:]:
-    try:
-        os.unlink(value)
-    except FileNotFoundError:
-        pass
+    os.unlink(sys.argv[1])
+except FileNotFoundError:
+    pass
 PY
 }
 
 stop_monitor_transport() {
     local target
     if [ "$(monitor_transport_mode)" = "direct" ]; then
-        return
-    fi
-    if ! monitor_marker_owned; then
         return
     fi
     if monitor_tunnel_running; then
@@ -174,7 +106,7 @@ stop_monitor_transport() {
             -O exit \
             "${target}" >/dev/null 2>&1 || true
     fi
-    remove_owned_monitor_files
+    remove_monitor_socket
 }
 
 published_monitor_port() {
@@ -209,15 +141,9 @@ prepare_monitor_transport() {
         return 1
     fi
     if monitor_tunnel_running; then
-        return
-    fi
-    if [ -e "${monitor_tunnel_marker}" ] && ! monitor_marker_owned; then
-        echo "PORT_IDENTITY_CONFLICT: unowned monitor marker ${monitor_tunnel_marker}" >&2
-        return 1
-    fi
-    if [ -e "${monitor_tunnel_socket}" ] && ! monitor_marker_owned; then
-        echo "PORT_IDENTITY_CONFLICT: unowned monitor socket ${monitor_tunnel_socket}" >&2
-        return 1
+        stop_monitor_transport
+    elif [ -e "${monitor_tunnel_socket}" ]; then
+        remove_monitor_socket
     fi
     if tcp_ready; then
         if python3 - 2>/dev/null <<'PY'
@@ -234,9 +160,6 @@ PY
             echo "MONITOR_TARGET_UNAVAILABLE: host port 9005 accepts TCP but not the metrics API" >&2
         fi
         return 1
-    fi
-    if monitor_marker_owned; then
-        remove_owned_monitor_files
     fi
     target="$(colima_ssh_target)"
     if [ -z "${target}" ]; then
@@ -260,7 +183,6 @@ PY
         -N \
         -f \
         "${target}"
-    write_monitor_marker "${target}"
 }
 
 fetch_host_monitor_status() {

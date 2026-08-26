@@ -1131,10 +1131,10 @@ def main():
     signal.signal(signal.SIGTERM, handle_stop_signal)
     try:
         metrics_reader.start()
-        print(f"[MetricsServer] container listener: http://0.0.0.0:{args.port}")
+        print(f"[MetricsServer] container listener: 0.0.0.0:{args.port}")
         public_url = os.environ.get("RL_METRICS_PUBLIC_URL", "").strip()
         if public_url:
-            print(f"[MetricsServer] Learner Monitor: {public_url}")
+            print(f"[MetricsServer] host browser: {public_url}")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
