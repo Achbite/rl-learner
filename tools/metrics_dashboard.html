@@ -163,6 +163,21 @@
       border: 1px solid var(--separator-strong);
       border-radius: 8px;
     }
+    .refresh-button {
+      min-height: 31px;
+      padding: 4px 12px;
+      color: var(--label);
+      background: var(--surface);
+      border: 1px solid var(--separator-strong);
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .refresh-button:hover { border-color: var(--blue); }
+    .toolbar-note {
+      color: var(--secondary);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
     .panel-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -311,27 +326,16 @@
 
   <section class="toolbar" aria-label="曲线控制">
     <div class="toolbar-group">
-      <label class="toggle">指标窗口
-        <select id="metric-window" class="select" aria-label="指标显示与聚合窗口">
-          <option value="25">最近 25 局</option>
-          <option value="100" selected>最近 100 局</option>
-          <option value="5s">5 秒</option>
-          <option value="1m">1 分钟</option>
-          <option value="1h">1 小时</option>
-          <option value="24h">24 小时</option>
-          <option value="all">本次训练全部</option>
-        </select>
+      <label class="toggle">时间范围
+        <select id="time-range" class="select" aria-label="时间范围"></select>
+      </label>
+      <label class="toggle">自动刷新
+        <select id="refresh-interval" class="select" aria-label="自动刷新间隔"></select>
       </label>
     </div>
     <div class="toolbar-group">
-      <label class="toggle">横轴
-        <select id="axis" class="select">
-          <option value="model">Model Step</option>
-          <option value="update">Train Update</option>
-          <option value="episode">Training Episode</option>
-          <option value="time">Wall Time</option>
-        </select>
-      </label>
+      <button id="refresh-now" type="button" class="refresh-button">立即刷新</button>
+      <span id="history-status" class="toolbar-note" role="status"></span>
     </div>
   </section>
 
@@ -353,12 +357,29 @@
   const TRAINED_SAMPLES_ID = "learner.trained_samples.total.v1";
   const TRAINING_EPISODE_ID = "server.training.episode.completed.total.v1";
   const PRODUCED_SAMPLES_ID = "sample.flow.produced.total.v1";
-  const TIME_WINDOW_SECONDS = new Map([
-    ["5s", 5],
-    ["1m", 60],
-    ["1h", 60 * 60],
-    ["24h", 24 * 60 * 60]
-  ]);
+  // 时间范围与自动刷新档位（Grafana 同款快速档），EVENT_WINDOW 固定为
+  // 服务端 episode 聚合窗口，避免时间档被误当作事件窗口下发。
+  const TIME_RANGES = [
+    {key: "1m", label: "最近 1 分钟", seconds: 60},
+    {key: "30m", label: "最近 30 分钟", seconds: 30 * 60},
+    {key: "1h", label: "最近 1 小时", seconds: 60 * 60},
+    {key: "6h", label: "最近 6 小时", seconds: 6 * 60 * 60},
+    {key: "24h", label: "最近 24 小时", seconds: 24 * 60 * 60},
+    {key: "all", label: "全部", seconds: null}
+  ];
+  const REFRESH_INTERVALS = [
+    {key: "5s", label: "每 5 秒", ms: 5000},
+    {key: "30s", label: "每 30 秒", ms: 30000},
+    {key: "1m", label: "每 1 分钟", ms: 60000},
+    {key: "5m", label: "每 5 分钟", ms: 300000},
+    {key: "off", label: "关闭", ms: 0}
+  ];
+  const EVENT_WINDOW = "100";
+  const HISTORY_RANGES = new Set(["6h", "24h", "all"]);
+  const TICK_STEPS_SECONDS = [
+    1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+    3600, 7200, 21600, 43200, 86400
+  ];
   const REWARD_COMPONENT_IDS = [
     "server.training.reward.component.goal_reward.episode_mean.v1",
     "server.training.reward.component.timeout_penalty.episode_mean.v1",
@@ -383,15 +404,10 @@
       initial: REWARD_COMPONENT_IDS
     },
     {
-      id: "episode-success", title: "Episode Success", catalogGroup: "episode_success",
+      id: "episode-success", title: "Agent Success Rate", catalogGroup: "episode_success",
       initial: [
-        "server.training.episode.success.agent_rate.v1",
         "server.training.episode.success.any_rate.v1",
-        "server.training.episode.success.all_rate.v1",
-        "server.training.episode.path_ratio.mean.v1",
-        "server.training.episode.step.mean.v1",
-        "server.training.episode.unique_cells.mean.v1",
-        "server.training.episode.blocked_move_rate.v1"
+        "server.training.episode.success.all_rate.v1"
       ]
     },
     {
@@ -438,13 +454,18 @@
     recordLimit: 4096,
     cursor: 0,
     sourceId: "",
-    metricWindow: "100",
-    axis: "model",
+    timeRange: "30m",
+    refreshMs: 5000,
+    historyRecords: [],
+    historyRange: "",
+    historyFetchedAt: 0,
+    historyAvailable: true,
     focus: {},
     domains: new Map(),
     catalogFetchedAt: 0,
     polling: false,
-    status: null
+    status: null,
+    timer: null
   };
 
   const byId = id => document.getElementById(id);
@@ -568,66 +589,80 @@
     element.textContent = text;
     svg.appendChild(element);
   };
-  const axisValue = record => {
-    if (state.axis === "time") return finiteNumber(record.timestamp);
-    if (state.axis === "update") return metricValue(record, TRAIN_UPDATE_ID);
-    if (state.axis === "episode") return metricValue(record, TRAINING_EPISODE_ID);
-    return metricValue(record, MODEL_STEP_ID);
-  };
-  const axisLabel = record => {
-    const value = axisValue(record);
-    if (value === null) return "—";
-    return state.axis === "time"
-      ? formatWallTime(value)
-      : formatInteger(value);
-  };
-  const formatWallTime = timestamp => new Date(timestamp * 1000).toLocaleTimeString(
-    "zh-CN",
-    {hour: "2-digit", minute: "2-digit", second: "2-digit"}
-  );
-  const visibleRecordWindow = () => {
-    const duration = TIME_WINDOW_SECONDS.get(state.metricWindow);
-    if (!duration) {
-      return {records: state.records, timeDomain: null, mode: "unbounded"};
+  const formatTickTime = (timestamp, spanSeconds) => {
+    const date = new Date(timestamp * 1000);
+    if (spanSeconds > 86400) {
+      return date.toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
     }
-    const timestamped = state.records.map(record => ({
-      record,
-      timestamp: finiteNumber(record.timestamp)
-    })).filter(item => item.timestamp !== null);
-    if (!timestamped.length) {
-      return {records: [], timeDomain: null, mode: "unavailable"};
+    return date.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: spanSeconds <= 600 ? "2-digit" : undefined
+    });
+  };
+  // 历史层与实时层按 sequence 去重合并，实时层优先（精度更高）。
+  const combinedRecords = () => {
+    if (!state.historyRecords.length) return state.records;
+    const firstLiveSequence = state.records.length
+      ? Number(state.records[0].sequence)
+      : Infinity;
+    const older = state.historyRecords.filter(
+      record => Number(record.sequence) < firstLiveSequence
+    );
+    return older.concat(state.records);
+  };
+  // 统一时间域：所有面板共享同一时间范围与刻度，逐像素对齐。
+  const currentDomain = records => {
+    const range = TIME_RANGES.find(item => item.key === state.timeRange);
+    const timestamps = records
+      .map(record => finiteNumber(record.timestamp))
+      .filter(timestamp => timestamp !== null);
+    if (!range || !timestamps.length) return null;
+    if (range.seconds === null) {
+      const first = Math.min(...timestamps);
+      const last = Math.max(...timestamps);
+      return {minimum: first, maximum: Math.max(last, first + 60)};
     }
-    const firstMetricTimestamp = Math.min(
-      ...timestamped.map(item => item.timestamp)
-    );
-    const latestMetricTimestamp = Math.max(
-      ...timestamped.map(item => item.timestamp)
-    );
-    const reportedStart = finiteNumber(state.status?.started_at);
-    const streamStart = reportedStart === null
-      ? firstMetricTimestamp
-      : Math.min(reportedStart, firstMetricTimestamp);
-    const warmingUp = latestMetricTimestamp - streamStart < duration;
-    const domainStart = warmingUp
-      ? streamStart
-      : latestMetricTimestamp - duration;
-    const domainEnd = domainStart + duration;
-    const epsilon = 1e-9;
-    const records = timestamped.filter(item =>
-      item.timestamp >= domainStart - epsilon &&
-      item.timestamp <= domainEnd + epsilon
-    ).map(item => item.record);
-    const firstVisibleTimestamp = records.length
-      ? finiteNumber(records[0].timestamp)
-      : null;
-    const safeDomainStart = firstVisibleTimestamp === null
-      ? domainStart
-      : Math.min(domainStart, firstVisibleTimestamp);
-    return {
-      records,
-      timeDomain: {minimum: safeDomainStart, maximum: domainEnd},
-      mode: warmingUp ? "warming-up" : "rolling"
-    };
+    const now = Date.now() / 1000;
+    return {minimum: now - range.seconds, maximum: now};
+  };
+  const tickStepFor = spanSeconds => {
+    const target = spanSeconds / 6;
+    const step = TICK_STEPS_SECONDS.find(candidate => candidate >= target);
+    return step === undefined ? Math.ceil(target / 86400) * 86400 : step;
+  };
+  // 像素级降采样：单序列顶点超过绘图宽度两倍时按像素桶取 min/max 包络，
+  // 保住尖峰的同时把 path 顶点数限制在屏幕可分辨范围内。
+  const decimatePoints = (points, plotLeft, plotWidth) => {
+    const bucketCount = Math.max(1, Math.floor(plotWidth));
+    if (points.length <= bucketCount * 2) return points;
+    const buckets = new Array(bucketCount);
+    points.forEach(point => {
+      let index = Math.floor((point.x - plotLeft) / plotWidth * bucketCount);
+      index = Math.max(0, Math.min(bucketCount - 1, index));
+      (buckets[index] || (buckets[index] = [])).push(point);
+    });
+    const reduced = [];
+    buckets.forEach(bucket => {
+      if (!bucket) return;
+      if (bucket.length <= 2) {
+        reduced.push(...bucket);
+        return;
+      }
+      let low = bucket[0];
+      let high = bucket[0];
+      bucket.forEach(point => {
+        if (point.y < low.y) low = point;
+        if (point.y > high.y) high = point;
+      });
+      reduced.push(...[low, high].sort((left, right) => left.x - right.x));
+    });
+    return reduced;
   };
   const observedExtent = values => {
     const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
@@ -740,42 +775,16 @@
     (point, index) => `${index ? "L" : "M"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`
   ).join(" ");
 
-  const renderPanel = group => {
+  const renderPanel = (group, context) => {
     const panel = document.querySelector(`[data-group="${group.id}"]`);
     if (!panel) return;
     const svg = panel.querySelector("svg");
     svg.replaceChildren();
-    const visibleWindow = visibleRecordWindow();
-    const records = visibleWindow.records;
+    const domain = context.domain;
     const selected = state.focus[group.id];
     const keys = selected === "all" ? group.keys : selected ? [selected] : [];
-    const series = keys.map(fieldId => {
-      const metric = registry.get(fieldId);
-      const points = records.map((record, index) => ({
-        index,
-        record,
-        value: metricValue(record, fieldId)
-      })).filter(point => point.value !== null);
-      return {metric, points};
-    }).filter(item => item.metric && item.points.length);
     panel.dataset.focus = selected || "";
-    svg.setAttribute(
-      "aria-label",
-      `${group.title} 曲线，横轴 ${
-        state.axis === "time" ? "Wall Time" :
-        state.axis === "update" ? "Train Update" :
-        state.axis === "episode" ? "Training Episode" : "Model Step"
-      }`
-    );
-    if (!records.length || !series.length) {
-      delete panel.dataset.yMin;
-      delete panel.dataset.yMax;
-      delete panel.dataset.xMin;
-      delete panel.dataset.xMax;
-      delete panel.dataset.windowMode;
-      appendText(svg, 340, 132, "等待指标", "middle", "empty-chart");
-      return;
-    }
+    svg.setAttribute("aria-label", `${group.title} 曲线，横轴 Wall Time`);
 
     const width = 680;
     const height = 260;
@@ -785,6 +794,34 @@
     const bottom = 39;
     const chartWidth = width - left - right;
     const chartHeight = height - top - bottom;
+
+    if (!domain || !keys.length) {
+      delete panel.dataset.yMin;
+      delete panel.dataset.yMax;
+      appendText(svg, 340, 132, "等待指标", "middle", "empty-chart");
+      return;
+    }
+    const span = domain.maximum - domain.minimum;
+    const visibleRecords = context.records.filter(record => {
+      const timestamp = finiteNumber(record.timestamp);
+      return timestamp !== null &&
+        timestamp >= domain.minimum && timestamp <= domain.maximum;
+    });
+    const series = keys.map(fieldId => {
+      const metric = registry.get(fieldId);
+      const points = visibleRecords.map(record => ({
+        timestamp: finiteNumber(record.timestamp),
+        value: metricValue(record, fieldId)
+      })).filter(point => point.timestamp !== null && point.value !== null);
+      return {metric, points};
+    }).filter(item => item.metric && item.points.length);
+    if (!series.length || !(span > 0)) {
+      delete panel.dataset.yMin;
+      delete panel.dataset.yMax;
+      appendText(svg, 340, 132, "所选范围暂无数据", "middle", "empty-chart");
+      return;
+    }
+
     const rawValues = series.flatMap(item => item.points.map(point => point.value));
     const [minimum, maximum] = stableDomain(
       group, keys, series[0].metric, rawValues
@@ -792,36 +829,10 @@
     panel.dataset.yMin = String(minimum);
     panel.dataset.yMax = String(maximum);
     const yFor = value => top + (maximum - value) / (maximum - minimum) * chartHeight;
-    const observedTimeDomain = state.axis === "time" && !visibleWindow.timeDomain
-      ? observedExtent(records.map(record => finiteNumber(record.timestamp)))
-      : null;
-    const timeDomain = state.axis === "time"
-      ? visibleWindow.timeDomain || (observedTimeDomain && {
-          minimum: observedTimeDomain.minimum,
-          maximum: observedTimeDomain.maximum
-        })
-      : null;
-    if (timeDomain) {
-      panel.dataset.xMin = String(timeDomain.minimum);
-      panel.dataset.xMax = String(timeDomain.maximum);
-      panel.dataset.windowMode = visibleWindow.mode;
-    } else {
-      delete panel.dataset.xMin;
-      delete panel.dataset.xMax;
-      delete panel.dataset.windowMode;
-    }
-    const xFor = (record, index) => {
-      if (!timeDomain) {
-        return records.length === 1
-          ? left + chartWidth / 2
-          : left + index / (records.length - 1) * chartWidth;
-      }
-      const timestamp = finiteNumber(record.timestamp);
-      const span = timeDomain.maximum - timeDomain.minimum;
-      if (timestamp === null || !(span > 0)) return left;
+    const xFor = timestamp => {
       const ratio = Math.max(
         0,
-        Math.min(1, (timestamp - timeDomain.minimum) / span)
+        Math.min(1, (timestamp - domain.minimum) / span)
       );
       return left + ratio * chartWidth;
     };
@@ -841,33 +852,20 @@
         "end"
       );
     }
-    if (timeDomain) {
-      for (let tick = 0; tick < 4; tick += 1) {
-        const ratio = tick / 3;
-        appendText(
-          svg,
-          left + ratio * chartWidth,
-          height - 12,
-          formatWallTime(
-            timeDomain.minimum + ratio * (timeDomain.maximum - timeDomain.minimum)
-          ),
-          tick === 0 ? "start" : tick === 3 ? "end" : "middle"
-        );
-      }
-    } else {
-      const tickIndices = [...new Set([
-        0,
-        Math.round((records.length - 1) / 3),
-        Math.round(2 * (records.length - 1) / 3),
-        records.length - 1
-      ])];
-      tickIndices.forEach((index, tick) => appendText(
+    const tickStep = tickStepFor(span);
+    const firstTick = Math.ceil(domain.minimum / tickStep) * tickStep;
+    for (let tickTime = firstTick; tickTime <= domain.maximum; tickTime += tickStep) {
+      const x = xFor(tickTime);
+      svg.appendChild(svgElement("line", {
+        x1: x, y1: top, x2: x, y2: top + chartHeight, class: "chart-grid"
+      }));
+      appendText(
         svg,
-        xFor(records[index], index),
+        x,
         height - 12,
-        axisLabel(records[index]),
-        tick === 0 ? "start" : tick === tickIndices.length - 1 ? "end" : "middle"
-      ));
+        formatTickTime(tickTime, span),
+        x < left + 26 ? "start" : x > width - right - 26 ? "end" : "middle"
+      );
     }
 
     const clipId = `plot-${group.id}`;
@@ -879,15 +877,17 @@
     defs.appendChild(clipPath);
     svg.appendChild(defs);
     series.forEach(item => {
-      const rawPoints = item.points.map(point => ({
-        x: xFor(point.record, point.index), y: yFor(point.value)
+      const pixelPoints = item.points.map(point => ({
+        x: xFor(point.timestamp),
+        y: yFor(point.value)
       }));
       const color = `var(${item.metric.color})`;
       svg.appendChild(svgElement("path", {
-        d: pathFor(rawPoints), class: "chart-raw", stroke: color,
+        d: pathFor(decimatePoints(pixelPoints, left, chartWidth)),
+        class: "chart-raw", stroke: color,
         "clip-path": `url(#${clipId})`
       }));
-      const latest = rawPoints[rawPoints.length - 1];
+      const latest = pixelPoints[pixelPoints.length - 1];
       svg.appendChild(svgElement("circle", {
         cx: latest.x, cy: latest.y, r: 4.5, class: "chart-point",
         stroke: color, "clip-path": `url(#${clipId})`
@@ -895,7 +895,15 @@
     });
   };
 
-  const renderAllPanels = () => groups.forEach(renderPanel);
+  const buildRenderContext = () => {
+    const records = combinedRecords();
+    return {records, domain: currentDomain(records)};
+  };
+  const renderAllPanels = () => {
+    const context = buildRenderContext();
+    groups.forEach(group => renderPanel(group, context));
+  };
+  const renderGroup = group => renderPanel(group, buildRenderContext());
   const closeAllPickers = () => {
     document.querySelectorAll(".registry-picker").forEach(element => {
       element.hidden = true;
@@ -937,7 +945,7 @@
       button.addEventListener("click", () => {
         state.focus[group.id] = fieldId;
         refreshPanelControls(group);
-        renderPanel(group);
+        renderGroup(group);
       });
       tags.appendChild(button);
     };
@@ -993,7 +1001,7 @@
         state.focus[group.id] = fieldId;
         closeAllPickers();
         refreshPanelControls(group);
-        renderPanel(group);
+        renderGroup(group);
       });
       picker.appendChild(option);
     });
@@ -1027,7 +1035,7 @@
       panel.append(head, tags, picker, wrap);
       grid.appendChild(panel);
       refreshPanelControls(group);
-      renderPanel(group);
+      renderGroup(group);
     });
   };
 
@@ -1037,7 +1045,42 @@
     state.sourceId = sourceId || "";
     state.domains.clear();
     state.catalogFetchedAt = 0;
+    state.historyRecords = [];
+    state.historyRange = "";
+    state.historyFetchedAt = 0;
     renderAllPanels();
+  };
+  // 6h/24h/all 大范围切换到服务端粗粒度历史层；服务端无该端点时降级为仅保留段。
+  const loadHistory = async force => {
+    if (!HISTORY_RANGES.has(state.timeRange)) {
+      state.historyRecords = [];
+      state.historyRange = "";
+      byId("history-status").textContent = "";
+      return;
+    }
+    if (!force && state.historyRange === state.timeRange) return;
+    try {
+      const response = await fetch(
+        `/api/metrics/history?range=${encodeURIComponent(state.timeRange)}`,
+        {cache: "no-store"}
+      );
+      if (!response.ok) throw new Error(`history HTTP ${response.status}`);
+      const document = await response.json();
+      state.historyRecords = (document.records || []).filter(
+        record => record.metrics_source_id === state.sourceId
+      );
+      state.historyRange = state.timeRange;
+      state.historyFetchedAt = Date.now();
+      state.historyAvailable = true;
+      byId("history-status").textContent = state.historyRecords.length
+        ? `历史点 ${formatInteger(state.historyRecords.length)}`
+        : "暂无历史数据";
+    } catch (error) {
+      state.historyAvailable = false;
+      state.historyRecords = [];
+      state.historyRange = "";
+      byId("history-status").textContent = "历史层不可用，仅显示保留段";
+    }
   };
   const ingest = records => {
     if (!Array.isArray(records) || !records.length) return;
@@ -1186,7 +1229,7 @@
       await refreshCatalog(sourceChanged || registry.size === 0);
       const metricsResponse = await fetch(
         `/api/metrics?after_sequence=${encodeURIComponent(state.cursor)}` +
-        `&window=${encodeURIComponent(state.metricWindow)}`,
+        `&window=${EVENT_WINDOW}`,
         {cache: "no-store"}
       );
       if (!metricsResponse.ok) {
@@ -1194,6 +1237,12 @@
       }
       const document = await metricsResponse.json();
       ingest(document.records || []);
+      if (HISTORY_RANGES.has(state.timeRange)) {
+        const historyStale = Date.now() - state.historyFetchedAt > 60000;
+        if (state.historyRange !== state.timeRange || historyStale) {
+          await loadHistory(true);
+        }
+      }
       state.status = status;
       const latest = state.records[state.records.length - 1] || {};
       renderStatus(status, latest);
@@ -1216,24 +1265,40 @@
     }
   };
 
-  byId("metric-window").addEventListener("change", event => {
-    state.metricWindow = event.target.value;
-    state.records = [];
-    state.cursor = 0;
+  const populateSelect = (id, options, current) => {
+    const select = byId(id);
+    options.forEach(option => {
+      const element = document.createElement("option");
+      element.value = option.key;
+      element.textContent = option.label;
+      select.appendChild(element);
+    });
+    select.value = current;
+  };
+  const applyRefreshInterval = () => {
+    if (state.timer !== null) clearInterval(state.timer);
+    state.timer = state.refreshMs > 0
+      ? setInterval(() => poll(), state.refreshMs)
+      : null;
+  };
+  byId("time-range").addEventListener("change", event => {
+    state.timeRange = event.target.value;
     state.domains.clear();
-    renderAllPanels();
-    poll();
-  });
-  byId("axis").addEventListener("change", event => {
-    state.axis = event.target.value;
+    loadHistory(true).then(renderAllPanels);
     renderAllPanels();
   });
+  byId("refresh-interval").addEventListener("change", event => {
+    const option = REFRESH_INTERVALS.find(item => item.key === event.target.value);
+    state.refreshMs = option ? option.ms : 5000;
+    applyRefreshInterval();
+  });
+  byId("refresh-now").addEventListener("click", () => poll());
 
-  state.metricWindow = byId("metric-window").value;
-  state.axis = byId("axis").value;
+  populateSelect("time-range", TIME_RANGES, state.timeRange);
+  populateSelect("refresh-interval", REFRESH_INTERVALS, "5s");
   buildPanels();
   poll();
-  setInterval(poll, 1000);
+  applyRefreshInterval();
 </script>
 </body>
 </html>

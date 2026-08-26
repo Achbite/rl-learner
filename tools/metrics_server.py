@@ -587,6 +587,14 @@ def _finite_number(value):
 
 _EVENT_WINDOWS = {"25", "100", "5s", "1m", "1h", "24h", "all"}
 
+# 粗粒度历史层支持的时间范围；秒级实时层仅保留 max_records 条，
+# 超出该窗口的 6h/24h/all 视图由按桶降采样的历史层提供。
+_HISTORY_RANGE_SECONDS = {
+    "6h": 6.0 * 3600.0,
+    "24h": 24.0 * 3600.0,
+    "all": None,
+}
+
 
 def _project_metric_value(record, definition, event_window="100"):
     if event_window not in _EVENT_WINDOWS:
@@ -635,6 +643,8 @@ class MetricsFileReader:
         read_chunk_bytes: int = 256 * 1024,
         max_pending_bytes: int = 1024 * 1024,
         tail_interval_seconds: float = 0.05,
+        history_bucket_seconds: float = 15.0,
+        history_max_records: int = 6000,
     ):
         if max_records <= 0:
             raise ValueError("max_records must be positive")
@@ -645,6 +655,13 @@ class MetricsFileReader:
             or tail_interval_seconds <= 0
         ):
             raise ValueError("metrics tail interval must be positive and finite")
+        if history_max_records <= 0:
+            raise ValueError("history_max_records must be positive")
+        if (
+            not math.isfinite(history_bucket_seconds)
+            or history_bucket_seconds <= 0
+        ):
+            raise ValueError("history bucket seconds must be positive and finite")
         self._metrics_dir = os.path.abspath(metrics_dir)
         self._metrics_source_id = metrics_source_id or (
             f"local-training-{uuid.uuid4().hex}"
@@ -656,7 +673,9 @@ class MetricsFileReader:
         self._started_at = (
             time.time() if started_at is None else float(started_at)
         )
-        self._lock = threading.Lock()
+        # 历史层摄入在 refresh() 持锁路径内会间接调用 metric_definitions()，
+        # 需要可重入锁避免同线程二次获取造成死锁。
+        self._lock = threading.RLock()
         self._max_records = int(max_records)
         self._read_chunk_bytes = int(read_chunk_bytes)
         self._max_pending_bytes = int(max_pending_bytes)
@@ -668,6 +687,13 @@ class MetricsFileReader:
         self._tail_backlog_remaining = False
         self._tail_error = None
         self._records = deque(maxlen=self._max_records)
+        self._history_bucket_seconds = float(history_bucket_seconds)
+        # 粗粒度历史层：桶内末值瘦身记录，重启后随磁盘回读自动重建。
+        self._history = deque(maxlen=int(history_max_records))
+        self._history_pending_bucket = None
+        self._history_pending_record = None
+        self._history_definitions = None
+        self._history_definitions_at = 0.0
         self._total_record_count = 0
         self._files = {}
         self._corrupt_lines = 0
@@ -788,6 +814,7 @@ class MetricsFileReader:
                         continue
                     self._records.append(record)
                     self._total_record_count += 1
+                    self._ingest_history(record)
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
                     state["corrupt"] += 1
                     self._corrupt_lines += 1
@@ -805,6 +832,78 @@ class MetricsFileReader:
             ]
             if limit > 0:
                 records = records[:limit]
+            return records
+
+    def _ingest_history(self, record):
+        # 按固定秒桶归并，桶内只保留末值原始记录；跨桶时再投影落盘，
+        # 避免每条秒级记录都触发一次全量字段投影。
+        timestamp = _finite_number(record.get("timestamp"))
+        if timestamp is None:
+            return
+        bucket = int(timestamp // self._history_bucket_seconds)
+        if self._history_pending_bucket is None:
+            self._history_pending_bucket = bucket
+            self._history_pending_record = record
+            return
+        if bucket == self._history_pending_bucket:
+            self._history_pending_record = record
+            return
+        if bucket < self._history_pending_bucket:
+            # 多文件回读可能出现轻微乱序，丢弃过期桶保持历史层时间单调。
+            return
+        self._flush_history()
+        self._history_pending_bucket = bucket
+        self._history_pending_record = record
+
+    def _definitions_for_history(self):
+        now = time.monotonic()
+        if (
+            self._history_definitions is None
+            or now - self._history_definitions_at >= 60.0
+        ):
+            self._history_definitions = self.metric_definitions()
+            self._history_definitions_at = now
+        return self._history_definitions
+
+    def _project_history_record(self, record):
+        # 历史层固定以 100 局事件窗口投影，与实时层默认视图保持一致；
+        # 瘦身记录仅保留绘图所需字段，控制常驻内存。
+        return {
+            "sequence": record.get("sequence"),
+            "timestamp": record.get("timestamp"),
+            "metrics_source_id": record.get("metrics_source_id"),
+            "metric_values": {
+                definition["descriptor"]["field_id"]: _project_metric_value(
+                    record, definition, "100"
+                )
+                for definition in self._definitions_for_history()
+            },
+        }
+
+    def _flush_history(self):
+        if self._history_pending_record is None:
+            return
+        self._history.append(
+            self._project_history_record(self._history_pending_record)
+        )
+
+    def history(self, range_key: str = "6h"):
+        if range_key not in _HISTORY_RANGE_SECONDS:
+            raise ValueError("unsupported history range")
+        seconds = _HISTORY_RANGE_SECONDS[range_key]
+        with self._lock:
+            records = list(self._history)
+            if self._history_pending_record is not None:
+                records.append(
+                    self._project_history_record(self._history_pending_record)
+                )
+            if seconds is not None:
+                cutoff = time.time() - seconds
+                records = [
+                    record
+                    for record in records
+                    if (_finite_number(record.get("timestamp")) or 0.0) >= cutoff
+                ]
             return records
 
     def latest(self):
@@ -902,6 +1001,11 @@ class MetricsFileReader:
                 "record_count": len(self._records),
                 "total_record_count": self._total_record_count,
                 "retained_record_limit": self._max_records,
+                "history_record_count": len(self._history),
+                "history_oldest_timestamp": (
+                    self._history[0].get("timestamp") if self._history else None
+                ),
+                "history_bucket_seconds": self._history_bucket_seconds,
                 "latest_sequence": latest.get("sequence"),
                 "latest_timestamp": timestamp,
                 "latest_interval_ms": interval_ms,
@@ -970,6 +1074,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                         "/api",
                         "/api/metrics",
                         "/api/metrics/catalog",
+                        "/api/metrics/history",
                         "/api/metrics/latest",
                         "/api/metrics/summary",
                         "/api/status",
@@ -1018,6 +1123,24 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                         )
                         for record in records
                     ],
+                    "total": len(records),
+                }
+            )
+        elif path == "/api/metrics/history":
+            range_key = params.get("range", ["6h"])[0]
+            if range_key not in _HISTORY_RANGE_SECONDS:
+                self._json_response(
+                    {"schema_version": 1, "error": "invalid history range"},
+                    status=400,
+                )
+                return
+            records = metrics_reader.history(range_key)
+            self._json_response(
+                {
+                    "schema_version": 1,
+                    "stream": "current",
+                    "range": range_key,
+                    "records": records,
                     "total": len(records),
                 }
             )
