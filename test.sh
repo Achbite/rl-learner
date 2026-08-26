@@ -15,5 +15,7 @@ trap 'rm -rf "${test_runtime_dir}"' EXIT
 cd "${test_runtime_dir}"
 
 python3 -m unittest -v \
+    tests.test_monitor_startup.LocalMonitorStartupTest.test_run_flags_override_the_local_monitor \
+    tests.test_monitor_startup.LocalMonitorStartupTest.test_infra_environment_disables_only_the_local_monitor \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_fixed_processed_transitions_enter_training_batch \
     tests.test_ppo_contract.LearnerDevelopmentTest.test_fixed_processed_transitions_match_ppo_loss

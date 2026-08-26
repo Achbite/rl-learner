@@ -88,6 +88,20 @@ def parser() -> argparse.ArgumentParser:
         metavar="PORT",
         help="override dashboard.server_port",
     )
+    monitor = result.add_mutually_exclusive_group()
+    monitor.add_argument(
+        "--monitor",
+        dest="monitor_enabled",
+        action="store_true",
+        default=None,
+        help="enable the local three-container training preview",
+    )
+    monitor.add_argument(
+        "--no-monitor",
+        dest="monitor_enabled",
+        action="store_false",
+        help="disable only the local HTTP/HTML training preview",
+    )
     return result
 
 
@@ -108,6 +122,8 @@ def parse_startup_arguments(
         overrides[("aiserver_status", "port")] = port
     if parsed.metrics_port is not None:
         overrides[("dashboard", "server_port")] = parsed.metrics_port
+    if parsed.monitor_enabled is not None:
+        overrides[("dashboard", "enabled")] = parsed.monitor_enabled
     return LearnerStartupArguments(
         config_path=str(parsed.config),
         cli_overrides=overrides,

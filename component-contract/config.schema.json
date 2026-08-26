@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rl-training.local/schemas/learner-config-p1a.json",
+  "type": "object",
+  "required": [
+    "contract",
+    "training_semantics",
+    "identity",
+    "training",
+    "model",
+    "sample_pool",
+    "model_distributor",
+    "aiserver_status",
+    "metric_events",
+    "dashboard",
+    "log"
+  ],
+  "additionalProperties": true
+}

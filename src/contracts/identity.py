@@ -435,6 +435,7 @@ def validate_config(config: dict) -> None:
         "sample_pool",
         "model_distributor",
         "aiserver_status",
+        "metric_events",
         "dashboard",
         "log",
     }
@@ -597,6 +598,18 @@ def validate_config(config: dict) -> None:
             "aiserver_status.initial_model_ack_timeout_sec must be null or "
             "a positive finite number"
         )
+    metric_events = config["metric_events"]
+    metric_server_port = metric_events.get("server_port")
+    if (
+        not isinstance(metric_events.get("server_enabled"), bool)
+        or not isinstance(
+            metric_events.get("aiserver_relay_enabled"), bool
+        )
+        or isinstance(metric_server_port, bool)
+        or not isinstance(metric_server_port, int)
+        or not 1 <= metric_server_port <= 65535
+    ):
+        raise ValueError("metric_events configuration is invalid")
     dashboard = config["dashboard"]
     dashboard_port = dashboard.get("server_port")
     if (

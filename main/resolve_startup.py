@@ -27,6 +27,8 @@ def resolve(arguments: Sequence[str]) -> dict:
         "aiserver_host": config["aiserver_status"]["host"],
         "aiserver_port": int(config["aiserver_status"]["port"]),
         "metrics_port": int(config["dashboard"]["server_port"]),
+        "metrics_enabled": 1 if config["dashboard"]["enabled"] else 0,
+        "metric_event_port": int(config["metric_events"]["server_port"]),
     }
 
 
@@ -53,6 +55,8 @@ def main() -> int:
             "aiserver_host",
             "aiserver_port",
             "metrics_port",
+            "metrics_enabled",
+            "metric_event_port",
         ):
             value = str(document[field])
             if "\n" in value or "\r" in value:

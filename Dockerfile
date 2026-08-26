@@ -35,6 +35,10 @@ RUN cp -a _deps/contracts/python/. proto/ && \
         /opt/rl/identity/model-distributor.json && \
     cp _deps/identity/stack-source.json \
         /opt/rl/identity/stack-source.json && \
+    mkdir -p /opt/rl/component-contract && \
+    cp component-contract/manifest.json \
+        component-contract/config.schema.json \
+        /opt/rl/component-contract/ && \
     rm -rf _deps && \
     chmod +x run.sh scripts/entrypoint.sh && \
     chmod +x /opt/rl/learner/sample-pool/bin/maze_sample_pool && \

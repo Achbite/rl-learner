@@ -27,7 +27,9 @@ bash ./test.sh
 
 ```bash
 ./run.sh --help
-./run.sh --config configs/learner_config.yaml
+./run.sh --monitor --config configs/learner_config.yaml
+# 只关闭本地三容器预览，不关闭原始指标或训练
+./run.sh --no-monitor --config configs/learner_config.yaml
 ```
 
 `--help` 只打印实际支持的覆盖项及对应 config 字段，不启动 Sample Pool、Model Distributor、
@@ -35,8 +37,9 @@ PPO 或监控进程。
 
 `configs/learner_config.yaml` 是完整默认事实源；启动时只执行一次
 `config -> RL_PPO_*/RL_TRAINING_* 白名单环境覆盖 -> CLI 覆盖 -> 校验`。支持的业务 CLI
-只有 `--initial-model`、`--model-distributor`、`--aiserver` 和 `--metrics-port`，分别覆盖
-config 中已经存在的 warm-start、Distributor、AIServer 和 Dashboard 字段。`run.sh` 与 PPO
+只有 `--initial-model`、`--model-distributor`、`--aiserver`、`--metrics-port`、`--monitor` 和
+`--no-monitor`，分别覆盖 config 中已经存在的 warm-start、Distributor、AIServer 和 Dashboard
+字段。`run.sh` 与 PPO
 Runtime 复用同一解析器，shell 不保存第二套训练目录、端点或端口默认值。相对路径统一相对
 所选 config 文件所在目录解析。
 
@@ -51,7 +54,13 @@ Sample Pool、Model Distributor 和监控存活；等待只会因 exact ACK、�
 或 config 中显式设置的正数 `aiserver_status.initial_model_ack_timeout_sec` 结束。Client 可以在
 AIServer ready 后再启动。
 
-launcher 会打印本次可用的监控 URL。MetricsServer 使用独立后台线程持续 tail 当前 JSONL；存在
+`dashboard.enabled: true` 是本地默认值。Infra 可注入严格布尔环境变量
+`RL_LEARNER_LOCAL_MONITOR_ENABLED=false` 关闭预览，CLI `--monitor/--no-monitor` 优先于环境变量。
+关闭预览只跳过 HTTP/HTML MetricsServer，不关闭 JSONL、MetricEvent、SQLite、AIServer relay、
+projector 或训练线程。
+
+`run.sh` 只在开发 launcher 已提供与当前容器端口一致的 host URL 时打印可由浏览器访问的地址；
+否则明确报告仅容器内可用或 host URL unavailable。MetricsServer 使用独立后台线程持续 tail 当前 JSONL；存在
 积压时连续追赶，追平后再按固定间隔检查。HTTP 请求只读取内存 projection，不参与控制磁盘读取
 进度。`/api/status` 会报告 tail 运行、backlog 和错误事实。`9005` 只属于可选观测，端口或监控
 失败不会终止 PPO。

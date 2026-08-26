@@ -4,6 +4,10 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 config="${repo_dir}/configs/learner_config.yaml"
+managed=0
+if [ -n "${RL_CONFIG_PATH:-}" ]; then
+    managed=1
+fi
 repository_sample_pool_dir="${repo_dir}/sample-pool"
 runtime_sample_pool_dir="/opt/rl/learner/sample-pool"
 repository_distributor_dir="${repo_dir}/model-distributor"
@@ -30,6 +34,18 @@ sample_pool_bin="${SAMPLE_POOL_BIN:-${default_sample_pool_dir}/bin/maze_sample_p
 sample_pool_config="${SAMPLE_POOL_CONFIG:-${default_sample_pool_dir}/config/pool_config.yaml}"
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
 model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
+if [ "${managed}" -eq 1 ]; then
+    if [[ "${RL_CONFIG_PATH}" != /* ]]; then
+        echo "RL_CONFIG_PATH must be absolute" >&2
+        exit 2
+    fi
+    managed_config_dir="$(dirname "${RL_CONFIG_PATH}")"
+    sample_pool_bin="${default_sample_pool_dir}/bin/maze_sample_pool"
+    sample_pool_config="${managed_config_dir}/sample-pool.yaml"
+    model_distributor_bin="${default_distributor_dir}/bin/maze_model_distributor"
+    model_distributor_config="${managed_config_dir}/model-distributor.yaml"
+    rm -f /run/rl/readiness.json /run/rl/learner-metric-ready.json
+fi
 
 for argument in "$@"; do
     if [ "${argument}" = "--help" ] || [ "${argument}" = "-h" ]; then
@@ -39,9 +55,15 @@ for argument in "$@"; do
 done
 
 execution_token="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-export RL_MODEL_LINEAGE_ID="maze-model-${execution_token}"
-export RL_TRAINING_FINALIZE_REQUEST_PATH="/tmp/rl-training-${execution_token}-finalize"
-export RL_TRAINING_FINALIZE_COMPLETE_PATH="/tmp/rl-training-${execution_token}-finalized"
+if [ "${managed}" -eq 0 ]; then
+    export RL_MODEL_LINEAGE_ID="maze-model-${execution_token}"
+    export RL_TRAINING_FINALIZE_REQUEST_PATH="/tmp/rl-training-${execution_token}-finalize"
+    export RL_TRAINING_FINALIZE_COMPLETE_PATH="/tmp/rl-training-${execution_token}-finalized"
+else
+    unset RL_MODEL_LINEAGE_ID
+    unset RL_TRAINING_FINALIZE_REQUEST_PATH
+    unset RL_TRAINING_FINALIZE_COMPLETE_PATH
+fi
 metrics_source_id="${RL_METRICS_SOURCE_ID:-}"
 if [ -z "${metrics_source_id}" ]; then
     metrics_source_id="$(python3 -c 'import uuid; print("local-training-" + uuid.uuid4().hex)')"
@@ -53,7 +75,7 @@ startup_output="$(
     python3 -m main.resolve_startup --format lines -- "$@"
 )"
 mapfile -t startup_values <<< "${startup_output}"
-if [ "${#startup_values[@]}" -ne 10 ]; then
+if [ "${#startup_values[@]}" -ne 12 ]; then
     echo "Learner effective startup handoff is invalid" >&2
     exit 1
 fi
@@ -67,15 +89,22 @@ model_distributor_port="${startup_values[6]}"
 aiserver_host="${startup_values[7]}"
 aiserver_port="${startup_values[8]}"
 metrics_port="${startup_values[9]}"
+metrics_enabled="${startup_values[10]}"
+metric_event_port="${startup_values[11]}"
+if [ "${metrics_enabled}" = "1" ]; then
+    local_monitor_state="enabled"
+else
+    local_monitor_state="disabled"
+fi
 printf '%s\n' \
-    "Learner effective startup: config=${config} train=${local_train_root} initial_model=${initial_model:-<fresh>} sample=${sample_pool_host}:${sample_pool_port} model=${model_distributor_host}:${model_distributor_port} aiserver=${aiserver_host}:${aiserver_port} metrics_port=${metrics_port}"
+    "Learner effective startup: config=${config} train=${local_train_root} initial_model=${initial_model:-<fresh>} sample=${sample_pool_host}:${sample_pool_port} model=${model_distributor_host}:${model_distributor_port} aiserver=${aiserver_host}:${aiserver_port} local_monitor=${local_monitor_state} metrics_port=${metrics_port} metric_event_port=${metric_event_port}"
 
 # Host port ownership belongs to the development launcher. Only advertise its
 # URL when it explicitly identifies the container port mapped by that URL.
 unset RL_METRICS_PUBLIC_URL
 development_monitor_url="${RL_DEVELOPMENT_MONITOR_URL:-}"
 development_monitor_container_port="${RL_DEVELOPMENT_MONITOR_CONTAINER_PORT:-}"
-if [ -n "${development_monitor_url}" ]; then
+if [ "${metrics_enabled}" = "1" ] && [ -n "${development_monitor_url}" ]; then
     if [ "${development_monitor_container_port}" = "${metrics_port}" ]; then
         export RL_METRICS_PUBLIC_URL="${development_monitor_url}"
     else
@@ -211,6 +240,9 @@ shutdown() {
     model_distributor_pid=""
     terminate_process "${sample_pool_pid}" 10 || true
     sample_pool_pid=""
+    if [ "${managed}" -eq 1 ]; then
+        rm -f /run/rl/readiness.json /run/rl/learner-metric-ready.json
+    fi
     cleanup_training_lock
 }
 
@@ -250,8 +282,12 @@ trap shutdown EXIT
 trap on_signal TERM INT
 
 cd "${repo_dir}"
-RL_SAMPLE_POOL_PORT="${sample_pool_port}" \
+if [ "${managed}" -eq 1 ]; then
     "${sample_pool_bin}" "${sample_pool_config}" &
+else
+    RL_SAMPLE_POOL_PORT="${sample_pool_port}" \
+        "${sample_pool_bin}" "${sample_pool_config}" &
+fi
 sample_pool_pid=$!
 
 ready=0
@@ -274,9 +310,13 @@ if [ "${ready}" -ne 1 ]; then
     exit 1
 fi
 
-RL_MODEL_DISTRIBUTOR_PORT="${model_distributor_port}" \
-RL_MODEL_ARTIFACT_ROOT="${local_train_root}" \
+if [ "${managed}" -eq 1 ]; then
     "${model_distributor_bin}" "${model_distributor_config}" &
+else
+    RL_MODEL_DISTRIBUTOR_PORT="${model_distributor_port}" \
+    RL_MODEL_ARTIFACT_ROOT="${local_train_root}" \
+        "${model_distributor_bin}" "${model_distributor_config}" &
+fi
 model_distributor_pid=$!
 
 ready=0
@@ -299,15 +339,82 @@ if [ "${ready}" -ne 1 ]; then
     exit 1
 fi
 
-python3 tools/metrics_server.py \
-    --dir "${local_train_root}/metrics" \
-    --port "${metrics_port}" \
-    --source-id "${metrics_source_id}" \
-    --mode training &
-metrics_pid=$!
+if [ "${metrics_enabled}" = "1" ]; then
+    python3 tools/metrics_server.py \
+        --dir "${local_train_root}/metrics" \
+        --port "${metrics_port}" \
+        --source-id "${metrics_source_id}" \
+        --mode training &
+    metrics_pid=$!
+    monitor_ready=0
+    for _ in $(seq 1 30); do
+        if ! kill -0 "${metrics_pid}" 2>/dev/null; then
+            break
+        fi
+        if python3 -c 'import sys, urllib.request; response = urllib.request.urlopen("http://127.0.0.1:" + sys.argv[1] + "/api/status", timeout=1); response.read(1); response.close()' "${metrics_port}" >/dev/null 2>&1; then
+            monitor_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${monitor_ready}" -eq 1 ]; then
+        if [ -n "${RL_METRICS_PUBLIC_URL:-}" ]; then
+            printf 'Learner local monitor: %s\n' "${RL_METRICS_PUBLIC_URL}"
+        else
+            printf 'Learner local monitor: container-only http://127.0.0.1:%s/monitor (host URL unavailable)\n' "${metrics_port}"
+        fi
+    else
+        echo "Learner local monitor did not become reachable on container port ${metrics_port}; training continues" >&2
+    fi
+else
+    echo "Learner local monitor: disabled"
+fi
 
 python3 -m main.training_runtime "$@" &
 training_pid=$!
+
+if [ "${managed}" -eq 1 ]; then
+    metric_ready_path="/run/rl/learner-metric-ready.json"
+    metric_ready=0
+    for _ in $(seq 1 300); do
+        if ! kill -0 "${training_pid}" 2>/dev/null ||
+           ! kill -0 "${sample_pool_pid}" 2>/dev/null ||
+           ! kill -0 "${model_distributor_pid}" 2>/dev/null; then
+            break
+        fi
+        if [ -s "${metric_ready_path}" ]; then
+            metric_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${metric_ready}" -ne 1 ]; then
+        echo "Learner managed readiness timeout before raw MetricEvent service publication" >&2
+        exit 1
+    fi
+    metric_output="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); keys=("component","instance_id","lifecycle_epoch","container_port","schema_id","schema_version","schema_digest"); print("\n".join(str(d[k]) for k in keys))' "${metric_ready_path}")"
+    mapfile -t metric_values <<< "${metric_output}"
+    if [ "${#metric_values[@]}" -ne 7 ] ||
+	   [ "${metric_values[0]}" != "learner" ] ||
+       [ "${metric_values[3]}" != "${metric_event_port}" ]; then
+        echo "Learner managed metric source identity is invalid" >&2
+        exit 1
+    fi
+    python3 scripts/publish_readiness.py \
+        --component learner \
+        --config "${config}" \
+        --fact process=running \
+        --fact sample_pool=serving \
+        --fact model_distributor=serving \
+        --fact metric_service=serving \
+        --fact metric_component="${metric_values[0]}" \
+        --fact metric_instance_id="${metric_values[1]}" \
+        --fact metric_lifecycle_epoch="${metric_values[2]}" \
+        --fact metric_container_port="${metric_values[3]}" \
+        --fact metric_schema_id="${metric_values[4]}" \
+        --fact metric_schema_version="${metric_values[5]}" \
+        --fact metric_schema_digest="${metric_values[6]}"
+fi
 
 while [ "${stopping}" -eq 0 ]; do
     for process in \

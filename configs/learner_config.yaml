@@ -86,7 +86,17 @@ aiserver_status:
   # A positive value enables an explicit bounded diagnostic timeout.
   initial_model_ack_timeout_sec: null
 
+# The raw MetricEvent service is independently owned by the Learner. Local A3
+# keeps the historical single-AIServer relay; Infra managed config disables
+# that relay because Infra is the sole durable consumer for every source.
+metric_events:
+  server_enabled: false
+  server_port: 9006
+  aiserver_relay_enabled: true
+
 dashboard:
+  # Local three-container preview. Infra sets
+  # RL_LEARNER_LOCAL_MONITOR_ENABLED=false without disabling raw metrics.
   enabled: true
   server_port: 9005
   backend: jsonl

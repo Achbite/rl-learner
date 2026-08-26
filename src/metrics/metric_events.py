@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from concurrent import futures
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -402,6 +403,7 @@ class RawMetricBatchStore:
         self.contract = _copy_message(contract)
         self.catalog = catalog
         self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
         self._connection = sqlite3.connect(
             str(path), timeout=5.0, check_same_thread=False
         )
@@ -450,6 +452,18 @@ class RawMetricBatchStore:
                 CREATE TABLE IF NOT EXISTS metric_store_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS metric_export_consumers (
+                    source_key TEXT PRIMARY KEY,
+                    consumer_key TEXT NOT NULL,
+                    consumer_component TEXT NOT NULL,
+                    consumer_instance_id TEXT NOT NULL,
+                    consumer_lifecycle_epoch TEXT NOT NULL,
+                    committed_batch_sequence TEXT NOT NULL DEFAULT '0',
+                    committed_event_sequence TEXT NOT NULL DEFAULT '0',
+                    committed_digest TEXT NOT NULL DEFAULT '',
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    FOREIGN KEY(source_key) REFERENCES metric_sources(source_key)
                 );
                 """
             )
@@ -676,6 +690,7 @@ class RawMetricBatchStore:
                     key,
                 ),
             )
+            self._changed.notify_all()
             return candidate_cursor
 
     def mark_acknowledged(
@@ -751,6 +766,7 @@ class RawMetricBatchStore:
                     key,
                 ),
             )
+            self._changed.notify_all()
 
     def mark_incomplete(
         self,
@@ -869,9 +885,378 @@ class RawMetricBatchStore:
             )
         return result
 
+    @staticmethod
+    def _consumer_key(
+        consumer: common_pb2.ServiceInstanceIdentity,
+    ) -> str:
+        return _source_key(consumer)
+
+    def bind_export_consumer(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+        consumer: common_pb2.ServiceInstanceIdentity,
+    ) -> bool:
+        source_key = _source_key(source)
+        consumer_key = self._consumer_key(consumer)
+        now_ms = int(time.time() * 1000)
+        with self._changed, self._connection:
+            self._source_row(source)
+            row = self._connection.execute(
+                """
+                SELECT consumer_key FROM metric_export_consumers
+                WHERE source_key = ?
+                """,
+                (source_key,),
+            ).fetchone()
+            if row is not None:
+                return str(row["consumer_key"]) == consumer_key
+            self._connection.execute(
+                """
+                INSERT INTO metric_export_consumers(
+                    source_key, consumer_key, consumer_component,
+                    consumer_instance_id, consumer_lifecycle_epoch,
+                    updated_at_unix_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_key,
+                    consumer_key,
+                    consumer.component,
+                    consumer.instance_id,
+                    str(int(consumer.lifecycle_epoch)),
+                    now_ms,
+                ),
+            )
+            self._changed.notify_all()
+            return True
+
+    def export_cursor(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+    ) -> training_pb2.MetricBatchCursor:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT committed_batch_sequence, committed_event_sequence,
+                       committed_digest
+                FROM metric_export_consumers WHERE source_key = ?
+                """,
+                (_source_key(source),),
+            ).fetchone()
+            if row is None:
+                return training_pb2.MetricBatchCursor(source=source)
+            cursor = training_pb2.MetricBatchCursor(
+                source=source,
+                acknowledged_batch_sequence=int(
+                    row["committed_batch_sequence"]
+                ),
+                acknowledged_event_sequence=int(
+                    row["committed_event_sequence"]
+                ),
+            )
+            if row["committed_digest"]:
+                cursor.acknowledged_batch_digest.CopyFrom(
+                    _content_digest(str(row["committed_digest"]))
+                )
+            return cursor
+
+    def next_export_batch(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+        cursor: training_pb2.MetricBatchCursor,
+    ) -> training_pb2.MetricBatch | None:
+        if not _same_message(cursor.source, source):
+            raise MetricEventContractError(
+                "metric export cursor source identity mismatch"
+            )
+        next_sequence = int(cursor.acknowledged_batch_sequence) + 1
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT payload, batch_digest FROM metric_batches
+                WHERE source_key = ? AND batch_sequence = ?
+                  AND status = 'committed'
+                """,
+                (_source_key(source), str(next_sequence)),
+            ).fetchone()
+        if row is None:
+            return None
+        batch = training_pb2.MetricBatch.FromString(row["payload"])
+        if (
+            int(batch.batch_sequence) != next_sequence
+            or batch.batch_digest.hex != row["batch_digest"]
+            or _digest_message(batch) != row["batch_digest"]
+        ):
+            raise MetricEventContractError(
+                "stored learner metric export batch is corrupted"
+            )
+        return batch
+
+    def export_availability(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+    ) -> tuple[int, int, bool]:
+        with self._lock:
+            row = self._source_row(source)
+            latest = int(row["committed_event_sequence"])
+            return (1 if latest > 0 else 0, latest, bool(row["final_acknowledged"]))
+
+    def acknowledge_export(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+        cursor: training_pb2.MetricBatchCursor,
+    ) -> None:
+        source_key = _source_key(source)
+        with self._changed, self._connection:
+            current = self.export_cursor(source)
+            if _same_message(current, cursor):
+                return
+            batch = self.next_export_batch(source, current)
+            if batch is None:
+                raise MetricEventContractError(
+                    "metric export ACK has no matching durable batch"
+                )
+            expected = cursor_for_batch(batch, current)
+            if not _same_message(expected, cursor):
+                raise MetricEventContractError(
+                    "metric export ACK does not identify the next durable batch"
+                )
+            self._connection.execute(
+                """
+                UPDATE metric_export_consumers
+                SET committed_batch_sequence = ?,
+                    committed_event_sequence = ?, committed_digest = ?,
+                    updated_at_unix_ms = ?
+                WHERE source_key = ?
+                """,
+                (
+                    str(int(cursor.acknowledged_batch_sequence)),
+                    str(int(cursor.acknowledged_event_sequence)),
+                    cursor.acknowledged_batch_digest.hex,
+                    int(time.time() * 1000),
+                    source_key,
+                ),
+            )
+            self._changed.notify_all()
+
+    def wait_for_export_change(self, timeout: float) -> None:
+        with self._changed:
+            self._changed.wait(timeout=max(0.0, timeout))
+
+    def wait_for_final_export_ack(
+        self,
+        source: common_pb2.ServiceInstanceIdentity,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._changed:
+            while True:
+                consumer = self._connection.execute(
+                    """
+                    SELECT committed_batch_sequence
+                    FROM metric_export_consumers WHERE source_key = ?
+                    """,
+                    (_source_key(source),),
+                ).fetchone()
+                source_row = self._source_row(source)
+                if consumer is None:
+                    return False
+                if bool(source_row["final_acknowledged"]) and int(
+                    consumer["committed_batch_sequence"]
+                ) == int(source_row["committed_batch_sequence"]):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._changed.wait(timeout=remaining)
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+
+class LearnerMetricEventService(
+    training_pb2_grpc.MetricEventServiceServicer
+):
+    """Expose the Learner-owned raw journal to one exact Infra consumer."""
+
+    def __init__(
+        self,
+        *,
+        store: RawMetricBatchStore,
+        contract: common_pb2.ContractIdentity,
+        source: common_pb2.ServiceInstanceIdentity,
+    ):
+        self.store = store
+        self.contract = _copy_message(contract)
+        self.source = _copy_message(source)
+
+    @staticmethod
+    def _valid_consumer(
+        consumer: common_pb2.ServiceInstanceIdentity,
+    ) -> bool:
+        try:
+            _source_key(consumer)
+            return True
+        except MetricEventContractError:
+            return False
+
+    def _fill_availability(self, response) -> None:
+        response.producer.CopyFrom(self.source)
+        oldest, latest, _ = self.store.export_availability(self.source)
+        response.oldest_available_event_sequence = oldest
+        response.latest_available_event_sequence = latest
+
+    def GetMetricBatch(self, request, context):
+        response = training_pb2.GetMetricBatchRsp()
+        self._fill_availability(response)
+        if (
+            not _same_message(request.contract, self.contract)
+            or not self._valid_consumer(request.consumer)
+        ):
+            response.ret_code = -1
+            response.result = (
+                training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
+            )
+            response.message = "metric consumer contract or identity is invalid"
+            return response
+        if not self.store.bind_export_consumer(
+            self.source, request.consumer
+        ):
+            response.ret_code = -1
+            response.result = (
+                training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
+            )
+            response.message = "learner metric journal is pinned to another consumer"
+            return response
+        committed = self.store.export_cursor(self.source)
+        if not _same_message(request.cursor, committed):
+            response.ret_code = -1
+            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
+            response.message = "metric cursor does not match committed cursor"
+            return response
+        if (
+            int(request.max_events) <= 0
+            or int(request.max_events) > 1024
+            or int(request.max_bytes) <= 0
+            or int(request.max_bytes) > 16 * 1024 * 1024
+            or int(request.wait_timeout_ms) < 0
+            or int(request.wait_timeout_ms) > 5000
+        ):
+            response.ret_code = -1
+            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+            response.message = "metric batch limits are invalid"
+            return response
+
+        deadline = time.monotonic() + int(request.wait_timeout_ms) / 1000.0
+        while True:
+            batch = self.store.next_export_batch(self.source, committed)
+            if batch is not None:
+                if (
+                    len(batch.events) > int(request.max_events)
+                    or batch.ByteSize() > int(request.max_bytes)
+                ):
+                    response.ret_code = -1
+                    response.result = (
+                        training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+                    )
+                    response.message = "requested limits are smaller than the next durable batch"
+                    return response
+                response.ret_code = 0
+                response.result = training_pb2.METRIC_BATCH_RESULT_DELIVERED
+                response.message = "durable learner metric batch delivered"
+                response.batch.CopyFrom(batch)
+                self._fill_availability(response)
+                return response
+            _, _, source_final = self.store.export_availability(self.source)
+            if source_final:
+                response.ret_code = 0
+                response.result = training_pb2.METRIC_BATCH_RESULT_FINAL
+                response.message = "learner metric source final batch is acknowledged"
+                return response
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0 or not context.is_active():
+                response.ret_code = 0
+                response.result = training_pb2.METRIC_BATCH_RESULT_WAIT
+                response.message = "no learner metric batch is currently available"
+                return response
+            self.store.wait_for_export_change(min(remaining, 0.25))
+
+    def AckMetricBatch(self, request, context):
+        del context
+        response = training_pb2.AckMetricBatchRsp()
+        self._fill_availability(response)
+        if (
+            not _same_message(request.contract, self.contract)
+            or not self._valid_consumer(request.consumer)
+            or not self.store.bind_export_consumer(
+                self.source, request.consumer
+            )
+        ):
+            response.ret_code = -1
+            response.result = (
+                training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_IDENTITY
+            )
+            response.message = "metric ACK contract or consumer is invalid"
+            response.committed_cursor.CopyFrom(
+                self.store.export_cursor(self.source)
+            )
+            return response
+        committed = self.store.export_cursor(self.source)
+        response.committed_cursor.CopyFrom(committed)
+        if _same_message(request.cursor, committed):
+            response.ret_code = 0
+            response.result = (
+                training_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED
+            )
+            response.message = "learner metric batch was already acknowledged"
+            return response
+        try:
+            self.store.acknowledge_export(self.source, request.cursor)
+        except MetricEventContractError as error:
+            response.ret_code = -1
+            response.result = (
+                training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
+            )
+            response.message = str(error)
+            return response
+        response.ret_code = 0
+        response.result = training_pb2.METRIC_BATCH_ACK_RESULT_APPLIED
+        response.message = "learner metric batch acknowledged"
+        response.committed_cursor.CopyFrom(
+            self.store.export_cursor(self.source)
+        )
+        self._fill_availability(response)
+        return response
+
+
+def create_learner_metric_event_server(
+    *,
+    store: RawMetricBatchStore,
+    contract: common_pb2.ContractIdentity,
+    source: common_pb2.ServiceInstanceIdentity,
+    port: int,
+):
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise MetricEventContractError(
+            "learner metric event server port must be in [1, 65535]"
+        )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    training_pb2_grpc.add_MetricEventServiceServicer_to_server(
+        LearnerMetricEventService(
+            store=store,
+            contract=contract,
+            source=source,
+        ),
+        server,
+    )
+    bound = server.add_insecure_port(f"0.0.0.0:{port}")
+    if bound != port:
+        server.stop(0)
+        raise MetricEventContractError(
+            f"learner metric event server could not bind port {port}"
+        )
+    return server
 
 
 def _empty_episode_statistics() -> dict:
