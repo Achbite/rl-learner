@@ -15,14 +15,12 @@ if test -n "$(git -C "${repo_dir}" status --porcelain --untracked-files=all)" &&
     echo "refusing to build a Learner runtime image from a dirty worktree" >&2
     exit 1
 fi
+# 运行产物由各上游仓库的 build_artifact.sh 按当前 Docker 服务端平台生成，
+# 因此镜像构建同样以实时平台定位产物目录；artifact_versions.env 中的
+# RL_RUNTIME_ARTIFACT_PLATFORM 仅作为主力环境的参考默认值，不参与硬校验，
+# 否则跨平台开发环境无法复用同一套构建脚本。
 platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
-if test "${platform}" != "${RL_RUNTIME_ARTIFACT_PLATFORM}"; then
-    echo "Docker platform does not match the selected runtime artifact platform:" >&2
-    echo "  docker=${platform}" >&2
-    echo "  selected=${RL_RUNTIME_ARTIFACT_PLATFORM}" >&2
-    exit 1
-fi
-platform_dir="${RL_RUNTIME_ARTIFACT_PLATFORM//\//-}"
+platform_dir="${platform//\//-}"
 contract_dir="${contract_root}/${RL_CONTRACTS_VERSION}/${platform_dir}"
 sample_pool_dir="${repo_dir}/sample-pool"
 model_distributor_dir="${repo_dir}/model-distributor"
@@ -48,7 +46,7 @@ python3 "${repo_dir}/scripts/verify_runtime_artifacts.py" \
     --contract-version "${RL_CONTRACTS_VERSION}" \
     --sample-pool-version "${RL_SAMPLE_POOL_VERSION}" \
     --model-distributor-version "${RL_MODEL_DISTRIBUTOR_VERSION}" \
-    --platform "${RL_RUNTIME_ARTIFACT_PLATFORM}"
+    --platform "${platform}"
 
 stack_identity_tool="${workspace_root}/rl-framework/tools/compute_stack_source_id.py"
 if [ ! -f "${stack_identity_tool}" ]; then

@@ -60,7 +60,9 @@ AIServer ready 后再启动。
 projector 或训练线程。
 
 `run.sh` 只在开发 launcher 已提供与当前容器端口一致的 host URL 时打印可由浏览器访问的地址；
-否则明确报告仅容器内可用或 host URL unavailable。MetricsServer 使用独立后台线程持续 tail 当前 JSONL；存在
+否则明确报告仅容器内可用或 host URL unavailable。Linux/WSL direct 模式使用 `docker port`
+返回的真实宿主发布端口，例如 `http://127.0.0.1:32793/monitor`；macOS/Colima 模式通过
+SSH tunnel 保持 `http://127.0.0.1:9005/monitor`。MetricsServer 使用独立后台线程持续 tail 当前 JSONL；存在
 积压时连续追赶，追平后再按固定间隔检查。HTTP 请求只读取内存 projection，不参与控制磁盘读取
 进度。`/api/status` 会报告 tail 运行、backlog 和错误事实。`9005` 只属于可选观测，端口或监控
 失败不会终止 PPO。

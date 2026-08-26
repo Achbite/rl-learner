@@ -70,7 +70,10 @@ AIServer relay, the projector, or training.
 
 `run.sh` prints a browser URL only when the development launcher supplied one
 for the effective container port; otherwise it reports a container-only URL or
-that the host URL is unavailable. MetricsServer uses a
+that the host URL is unavailable. Linux/WSL direct mode uses the actual host
+port returned by `docker port`, for example
+`http://127.0.0.1:32793/monitor`; macOS/Colima keeps
+`http://127.0.0.1:9005/monitor` through an SSH tunnel. MetricsServer uses a
 dedicated background thread to tail the current JSONL continuously: it drains
 backlog without waiting and switches to periodic polling only after catching
 up. HTTP requests read the in-memory projection and do not control file-read

@@ -95,6 +95,9 @@ PY
 
 stop_monitor_transport() {
     local target
+    if [ "$(monitor_transport_mode)" = "direct" ]; then
+        return
+    fi
     if monitor_tunnel_running; then
         target="$(colima_ssh_target)"
         ssh \
@@ -106,9 +109,34 @@ stop_monitor_transport() {
     remove_monitor_socket
 }
 
+published_monitor_port() {
+    docker port "${container_name}" 9005/tcp 2>/dev/null |
+        awk -F: 'NR == 1 {print $NF}'
+}
+
+# Colima 在 macOS 上把 Docker 运行在 Lima 虚拟机内，宿主无法直达容器发布端口，
+# 因此需要 SSH 隧道把固定端口转发进去。Linux 与 WSL 的 Docker 直接运行在宿主
+# 内核上，--publish 的映射端口即可访问，无需隧道。
+monitor_transport_mode() {
+    if [ -f "${colima_ssh_config}" ] && command -v ssh >/dev/null 2>&1; then
+        echo "tunnel"
+    else
+        echo "direct"
+    fi
+}
+
 prepare_monitor_transport() {
     local target
     local upstream_port
+    if [ "$(monitor_transport_mode)" = "direct" ]; then
+        upstream_port="$(published_monitor_port)"
+        if ! [[ "${upstream_port}" =~ ^[0-9]+$ ]]; then
+            echo "MONITOR_TARGET_UNAVAILABLE: learner-dev has no metrics port mapping" >&2
+            return 1
+        fi
+        monitor_host_port="${upstream_port}"
+        return 0
+    fi
     if [ ! -f "${colima_ssh_config}" ] || ! command -v ssh >/dev/null 2>&1; then
         return 1
     fi
@@ -138,10 +166,7 @@ PY
         echo "Colima SSH config has no Host entry: ${colima_ssh_config}" >&2
         return 1
     fi
-    upstream_port="$(
-        docker port "${container_name}" 9005/tcp 2>/dev/null |
-            awk -F: 'NR == 1 {print $NF}'
-    )"
+    upstream_port="$(published_monitor_port)"
     if ! [[ "${upstream_port}" =~ ^[0-9]+$ ]]; then
         echo "MONITOR_TARGET_UNAVAILABLE: learner-dev has no metrics port mapping" >&2
         return 1
@@ -161,12 +186,12 @@ PY
 }
 
 fetch_host_monitor_status() {
-    python3 - <<'PY'
+    python3 - "${monitor_host_port}" <<'PY'
 import sys
 import urllib.request
 
 with urllib.request.urlopen(
-    "http://127.0.0.1:9005/api/status", timeout=1
+    f"http://127.0.0.1:{sys.argv[1]}/api/status", timeout=1
 ) as response:
     sys.stdout.write(response.read().decode("utf-8"))
 PY
