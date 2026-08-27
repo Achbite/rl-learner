@@ -1113,6 +1113,7 @@ class LearnerMetricEventService(
         if (
             not _same_message(request.contract, self.contract)
             or not self._valid_consumer(request.consumer)
+            or not _same_message(request.cursor.source, self.source)
         ):
             response.ret_code = -1
             response.result = (
@@ -1189,6 +1190,7 @@ class LearnerMetricEventService(
         if (
             not _same_message(request.contract, self.contract)
             or not self._valid_consumer(request.consumer)
+            or not _same_message(request.cursor.source, self.source)
             or not self.store.bind_export_consumer(
                 self.source, request.consumer
             )
