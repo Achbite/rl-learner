@@ -594,6 +594,10 @@ _HISTORY_RANGE_SECONDS = {
     "24h": 24.0 * 3600.0,
     "all": None,
 }
+# 历史响应的目标点数上限：超过该点数时按均匀步长做二级抽取，
+# 使响应体与前端解析开销不随保留时长线性膨胀。
+_HISTORY_DEFAULT_MAX_POINTS = 1500
+_HISTORY_MAX_POINTS_LIMIT = 6000
 
 
 def _project_metric_value(record, definition, event_window="100"):
@@ -887,9 +891,49 @@ class MetricsFileReader:
             self._project_history_record(self._history_pending_record)
         )
 
-    def history(self, range_key: str = "6h"):
+    @staticmethod
+    def _select_history_fields(record, fields):
+        # 按调用方声明的字段白名单裁剪响应；面板通常只消费全部字段的少数几个，
+        # 裁剪后响应体与解析开销显著下降。
+        if fields is None:
+            return record
+        values = record.get("metric_values") or {}
+        return {
+            "sequence": record.get("sequence"),
+            "timestamp": record.get("timestamp"),
+            "metrics_source_id": record.get("metrics_source_id"),
+            "metric_values": {
+                field_id: values[field_id]
+                for field_id in fields
+                if field_id in values
+            },
+        }
+
+    @staticmethod
+    def _thin_history(records, max_points):
+        # 均匀步长抽取并强制保留末点，避免大范围响应点数随保留时长线性膨胀。
+        if max_points <= 0 or len(records) <= max_points:
+            return records
+        stride = -(-len(records) // max_points)
+        thinned = records[::stride]
+        if thinned[-1] is not records[-1]:
+            thinned.append(records[-1])
+        return thinned
+
+    def history(
+        self,
+        range_key: str = "6h",
+        *,
+        fields=None,
+        after_sequence: int = 0,
+        max_points: int = _HISTORY_DEFAULT_MAX_POINTS,
+    ):
         if range_key not in _HISTORY_RANGE_SECONDS:
             raise ValueError("unsupported history range")
+        if after_sequence < 0:
+            raise ValueError("history cursor must not be negative")
+        if max_points < 0 or max_points > _HISTORY_MAX_POINTS_LIMIT:
+            raise ValueError("history max_points is out of range")
         seconds = _HISTORY_RANGE_SECONDS[range_key]
         with self._lock:
             records = list(self._history)
@@ -897,14 +941,24 @@ class MetricsFileReader:
                 records.append(
                     self._project_history_record(self._history_pending_record)
                 )
-            if seconds is not None:
-                cutoff = time.time() - seconds
-                records = [
-                    record
-                    for record in records
-                    if (_finite_number(record.get("timestamp")) or 0.0) >= cutoff
-                ]
-            return records
+        if seconds is not None:
+            cutoff = time.time() - seconds
+            records = [
+                record
+                for record in records
+                if (_finite_number(record.get("timestamp")) or 0.0) >= cutoff
+            ]
+        if after_sequence > 0:
+            records = [
+                record
+                for record in records
+                if _finite_number(record.get("sequence")) is not None
+                and int(record["sequence"]) > after_sequence
+            ]
+        records = self._thin_history(records, max_points)
+        return [
+            self._select_history_fields(record, fields) for record in records
+        ]
 
     def latest(self):
         with self._lock:
@@ -1128,18 +1182,44 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
             )
         elif path == "/api/metrics/history":
             range_key = params.get("range", ["6h"])[0]
-            if range_key not in _HISTORY_RANGE_SECONDS:
+            try:
+                after_sequence = int(params.get("after_sequence", ["0"])[0])
+                max_points = int(
+                    params.get(
+                        "max_points", [str(_HISTORY_DEFAULT_MAX_POINTS)]
+                    )[0]
+                )
+                raw_fields = params.get("fields", [""])[0].strip()
+                fields = (
+                    tuple(
+                        field_id
+                        for field_id in raw_fields.split(",")
+                        if field_id
+                    )
+                    if raw_fields
+                    else None
+                )
+                records = metrics_reader.history(
+                    range_key,
+                    fields=fields,
+                    after_sequence=after_sequence,
+                    max_points=max_points,
+                )
+            except ValueError:
                 self._json_response(
-                    {"schema_version": 1, "error": "invalid history range"},
+                    {
+                        "schema_version": 1,
+                        "error": "invalid history query",
+                    },
                     status=400,
                 )
                 return
-            records = metrics_reader.history(range_key)
             self._json_response(
                 {
                     "schema_version": 1,
                     "stream": "current",
                     "range": range_key,
+                    "after_sequence": after_sequence,
                     "records": records,
                     "total": len(records),
                 }

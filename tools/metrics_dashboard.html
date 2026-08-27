@@ -246,20 +246,50 @@
       white-space: nowrap;
     }
     .registry-empty { padding: 5px 7px; color: var(--secondary); }
-    .chart-wrap { padding: 0 8px 7px; }
-    .chart { display: block; width: 100%; min-height: 220px; overflow: hidden; }
+    .chart-wrap { position: relative; padding: 0 8px 7px; }
+    .chart { display: block; width: 100%; overflow: hidden; touch-action: none; }
     .chart-grid { stroke: var(--grid); stroke-width: 1; }
+    /* 轴文字随 viewBox 动态计算，字号在各面板宽度下保持一致 */
     .chart-axis { fill: var(--secondary); font-size: 12px; }
     .chart-raw {
       fill: none;
-      stroke-width: 2.25;
+      stroke-width: 1.75;
       stroke-linecap: round;
       stroke-linejoin: round;
-      opacity: .78;
       vector-effect: non-scaling-stroke;
     }
     .chart-point { fill: var(--surface); stroke-width: 2.75; vector-effect: non-scaling-stroke; }
+    .chart-cursor { stroke: var(--separator-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+    .chart-hit { fill: var(--surface); stroke-width: 2; vector-effect: non-scaling-stroke; }
     .empty-chart { fill: var(--secondary); font-size: 14px; }
+    .tooltip {
+      position: absolute;
+      z-index: 2;
+      display: grid;
+      gap: 3px;
+      min-width: 132px;
+      max-width: 260px;
+      padding: 7px 9px;
+      background: var(--surface);
+      border: 1px solid var(--separator-strong);
+      border-radius: 9px;
+      box-shadow: 0 4px 14px light-dark(rgba(0, 0, 0, .12), rgba(0, 0, 0, .44));
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+    }
+    .tooltip[hidden] { display: none; }
+    .tooltip-time { color: var(--secondary); }
+    .tooltip-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .tooltip-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .tooltip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tooltip-value { font-weight: 600; white-space: nowrap; }
+    .tag-value { color: var(--label); font-variant-numeric: tabular-nums; font-weight: 600; }
+    .swatch[data-dash="true"] {
+      background: repeating-linear-gradient(
+        90deg, currentColor 0 4px, transparent 4px 7px
+      );
+    }
     .footer {
       justify-content: space-between;
       flex-wrap: wrap;
@@ -451,7 +481,7 @@
         "learner.value.explained_variance.v1"
       ]
     }
-  ].map(group => ({...group, keys: [], initialized: false}));
+  ].map(group => ({...group, keys: [], initialized: false, styles: new Map()}));
   const groupById = new Map(groups.map(group => [group.id, group]));
   const registry = new Map();
   const state = {
@@ -464,12 +494,16 @@
     historyRecords: [],
     historyRange: "",
     historyFetchedAt: 0,
+    historyCursor: 0,
+    historyFields: "",
     historyAvailable: true,
     focus: {},
+    anchor: {},
     domains: new Map(),
     catalogFetchedAt: 0,
     polling: false,
     status: null,
+    lastRefreshText: "",
     timer: null
   };
 
@@ -491,6 +525,19 @@
     }
     return COLORS[Math.abs(hash) % COLORS.length];
   };
+  // 同一面板内按顺序分配颜色，并在颜色用尽后叠加虚线线型；
+  // 全局 hash 取色会让同面板曲线撞色（例如 accepted 与 trained 同色）而无法区分。
+  const assignGroupStyles = group => {
+    group.styles = new Map(group.keys.map((fieldId, index) => [fieldId, {
+      color: COLORS[index % COLORS.length],
+      dash: index >= COLORS.length
+    }]));
+  };
+  const styleFor = (group, fieldId) => group.styles?.get(fieldId) || {
+    color: colorFor(fieldId),
+    dash: false
+  };
+  const dashArrayFor = style => style.dash ? "6 4" : null;
   const setStatus = (element, text, value) => {
     element.textContent = text;
     element.dataset.state = value;
@@ -526,12 +573,41 @@
   const fieldIdsForGroup = group => [...registry.values()]
     .filter(metric => metric.group === group.catalogGroup)
     .map(metric => metric.field_id);
-  const groupSupportsAll = group => {
-    if (group.keys.length < 2) return false;
-    const dimensions = new Set(
-      group.keys.map(fieldId => registry.get(fieldId)?.dimension).filter(Boolean)
-    );
-    return dimensions.size === 1;
+  // 按量纲分桶：共享 Y 轴要求同量纲，因此多线对比只在同一量纲内成立。
+  const dimensionBuckets = group => {
+    const buckets = new Map();
+    group.keys.forEach(fieldId => {
+      const dimension = registry.get(fieldId)?.dimension;
+      if (!dimension) return;
+      if (!buckets.has(dimension)) buckets.set(dimension, []);
+      buckets.get(dimension).push(fieldId);
+    });
+    return buckets;
+  };
+  const largestBucket = buckets => {
+    let best = [];
+    buckets.forEach(fieldIds => {
+      if (fieldIds.length > best.length) best = fieldIds;
+    });
+    return best;
+  };
+  // 只要任一量纲下有两条以上曲线即可做同类对比；量纲混杂的面板
+  // 此前只能逐条单看，信息可达性过低。
+  const groupSupportsAll = group =>
+    largestBucket(dimensionBuckets(group)).length >= 2;
+  const isUniformGroup = group => dimensionBuckets(group).size <= 1;
+  // 聚合视图实际绘制的曲线：以锚定指标所属量纲为准，
+  // 锚定量纲不足两条时退回最大的量纲桶。
+  const resolvedKeys = group => {
+    const selected = state.focus[group.id];
+    if (selected !== "all") return selected ? [selected] : [];
+    const buckets = dimensionBuckets(group);
+    const anchor = state.anchor[group.id];
+    const anchorDimension = registry.get(anchor)?.dimension;
+    const anchored = anchorDimension ? buckets.get(anchorDimension) : null;
+    if (anchored && anchored.length >= 2) return anchored;
+    const fallback = largestBucket(buckets);
+    return fallback.length ? fallback : group.keys.slice(0, 1);
   };
   const normalizeFocus = group => {
     const current = state.focus[group.id];
@@ -552,7 +628,7 @@
         "scope", "statistic", "value_kind"
       ];
       if (!required.every(key => typeof field[key] === "string" && field[key])) return;
-      nextRegistry.set(field.field_id, {...field, color: colorFor(field.field_id)});
+      nextRegistry.set(field.field_id, {...field});
     });
     registry.clear();
     nextRegistry.forEach((value, key) => registry.set(key, value));
@@ -571,6 +647,7 @@
         }
       }
       normalizeFocus(group);
+      assignGroupStyles(group);
       refreshPanelControls(group);
     });
   };
@@ -624,17 +701,26 @@
   // 统一时间域：所有面板共享同一时间范围与刻度，逐像素对齐。
   const currentDomain = records => {
     const range = TIME_RANGES.find(item => item.key === state.timeRange);
-    const timestamps = records
-      .map(record => finiteNumber(record.timestamp))
-      .filter(timestamp => timestamp !== null);
-    if (!range || !timestamps.length) return null;
-    if (range.seconds === null) {
-      const first = Math.min(...timestamps);
-      const last = Math.max(...timestamps);
-      return {minimum: first, maximum: Math.max(last, first + 60)};
+    if (!range) return null;
+    // 线性扫描取时间极值；24h 档记录可达上万条，
+    // Math.min(...array) 形式的展开既有栈溢出风险也更慢。
+    let earliest = Infinity;
+    let latest = -Infinity;
+    for (let index = 0; index < records.length; index += 1) {
+      const timestamp = finiteNumber(records[index].timestamp);
+      if (timestamp === null) continue;
+      if (timestamp < earliest) earliest = timestamp;
+      if (timestamp > latest) latest = timestamp;
     }
-    const now = Date.now() / 1000;
-    return {minimum: now - range.seconds, maximum: now};
+    if (earliest === Infinity) return null;
+    // 记录时间戳来自容器时钟，窗口右端只用浏览器 now 会在容器时钟偏快时
+    // 把最新数据裁掉；取两者较大值兼顾滚动窗口与时钟偏差。
+    const maximum = Math.max(Date.now() / 1000, latest);
+    // 各档右端语义一致地表示"现在"：滚动档按范围回溯，全部档从数据起点展开。
+    if (range.seconds === null) {
+      return {minimum: earliest, maximum: Math.max(maximum, earliest + 60)};
+    }
+    return {minimum: maximum - range.seconds, maximum};
   };
   const tickStepFor = spanSeconds => {
     const target = spanSeconds / 6;
@@ -665,14 +751,27 @@
         if (point.y < low.y) low = point;
         if (point.y > high.y) high = point;
       });
+      // 桶内平坦时 min 与 max 为同一点，只输出一次避免重复顶点。
+      if (low === high) {
+        reduced.push(low);
+        return;
+      }
       reduced.push(...[low, high].sort((left, right) => left.x - right.x));
     });
     return reduced;
   };
+  // 单次线性扫描求极值；此前的 sort() 在 24h 档会对数万元素排序，
+  // 每个刷新周期为每个面板重复一次，足以阻塞主线程。
   const observedExtent = values => {
-    const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
-    if (!sorted.length) return null;
-    return {minimum: sorted[0], maximum: sorted[sorted.length - 1]};
+    let minimum = Infinity;
+    let maximum = -Infinity;
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index];
+      if (!Number.isFinite(value)) continue;
+      if (value < minimum) minimum = value;
+      if (value > maximum) maximum = value;
+    }
+    return minimum === Infinity ? null : {minimum, maximum};
   };
   const niceCeil = value => {
     if (!(value > 0)) return 0;
@@ -780,6 +879,140 @@
     (point, index) => `${index ? "L" : "M"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`
   ).join(" ");
 
+  const CHART_HEIGHT = 260;
+  const CHART_MARGIN = {left: 72, right: 18, top: 15, bottom: 39};
+  // 每个面板的最近一次渲染几何与序列，供 crosshair 命中查询复用。
+  const hoverState = new Map();
+
+  // 图例直接显示各曲线当前值，多线面板无需悬停即可读数。
+  const applyLegendValues = (group, series) => {
+    const panel = document.querySelector(`[data-group="${group.id}"]`);
+    if (!panel) return;
+    const latest = new Map(series.map(item => [
+      item.metric.field_id,
+      item.points[item.points.length - 1]?.value ?? null
+    ]));
+    panel.querySelectorAll(".tag[data-metric]").forEach(tag => {
+      const slot = tag.querySelector(".tag-value");
+      if (!slot) return;
+      const fieldId = tag.dataset.metric;
+      const metric = registry.get(fieldId);
+      slot.textContent = latest.has(fieldId)
+        ? formatMetric(metric, latest.get(fieldId))
+        : "";
+    });
+  };
+
+  const hideTooltip = panel => {
+    const tooltip = panel.querySelector(".tooltip");
+    if (tooltip) tooltip.hidden = true;
+    panel.querySelectorAll(".chart-cursor, .chart-hit").forEach(
+      element => element.remove()
+    );
+  };
+  // 就近命中：按指针 x 反解时间，再在各序列内二分查找最接近的样本点。
+  const nearestPoint = (points, timestamp) => {
+    let low = 0;
+    let high = points.length - 1;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (points[middle].timestamp < timestamp) low = middle + 1;
+      else high = middle;
+    }
+    const candidate = points[low];
+    const previous = points[low - 1];
+    if (!previous) return candidate;
+    return Math.abs(previous.timestamp - timestamp) <=
+      Math.abs(candidate.timestamp - timestamp) ? previous : candidate;
+  };
+  const showTooltip = (group, event) => {
+    const panel = document.querySelector(`[data-group="${group.id}"]`);
+    const cached = hoverState.get(group.id);
+    if (!panel || !cached) return;
+    const svg = panel.querySelector("svg");
+    const tooltip = panel.querySelector(".tooltip");
+    const {geometry, domain, span} = cached;
+    const bounds = svg.getBoundingClientRect();
+    if (!bounds.width) return;
+    const scale = geometry.width / bounds.width;
+    const x = (event.clientX - bounds.left) * scale;
+    if (x < geometry.left || x > geometry.width - geometry.right) {
+      hideTooltip(panel);
+      return;
+    }
+    const timestamp = domain.minimum +
+      (x - geometry.left) / geometry.chartWidth * span;
+    panel.querySelectorAll(".chart-cursor, .chart-hit").forEach(
+      element => element.remove()
+    );
+    const rows = [];
+    cached.series.forEach(item => {
+      const point = nearestPoint(item.points, timestamp);
+      if (!point) return;
+      rows.push({metric: item.metric, style: item.style, point});
+      svg.appendChild(svgElement("circle", {
+        cx: cached.xFor(point.timestamp),
+        cy: cached.yFor(point.value),
+        r: 3.5, class: "chart-hit", stroke: `var(${item.style.color})`
+      }));
+    });
+    if (!rows.length) {
+      hideTooltip(panel);
+      return;
+    }
+    const cursorX = cached.xFor(rows[0].point.timestamp);
+    svg.insertBefore(svgElement("line", {
+      x1: cursorX, y1: geometry.top, x2: cursorX,
+      y2: geometry.top + geometry.chartHeight, class: "chart-cursor"
+    }), svg.firstChild);
+    tooltip.replaceChildren();
+    const time = document.createElement("div");
+    time.className = "tooltip-time";
+    time.textContent = new Date(rows[0].point.timestamp * 1000)
+      .toLocaleTimeString("zh-CN");
+    tooltip.appendChild(time);
+    rows.forEach(row => {
+      const line = document.createElement("div");
+      line.className = "tooltip-row";
+      const name = document.createElement("span");
+      name.className = "tooltip-name";
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.color = `var(${row.style.color})`;
+      if (row.style.dash) swatch.dataset.dash = "true";
+      const label = document.createElement("span");
+      label.className = "tooltip-label";
+      label.textContent = row.metric.label;
+      name.append(swatch, label);
+      const value = document.createElement("span");
+      value.className = "tooltip-value";
+      value.textContent = formatMetric(row.metric, row.point.value);
+      line.append(name, value);
+      tooltip.appendChild(line);
+    });
+    tooltip.hidden = false;
+    const wrap = panel.querySelector(".chart-wrap");
+    const localX = cursorX / scale + 14;
+    const maximumX = wrap.clientWidth - tooltip.offsetWidth - 8;
+    tooltip.style.left = `${Math.max(8, Math.min(localX, maximumX))}px`;
+    tooltip.style.top = "12px";
+  };
+
+  // viewBox 宽度跟随容器实际像素宽度，使 1 用户单位等于 1 CSS 像素，
+  // 轴文字字号在单列与双列布局下保持一致，不再随面板宽度缩放。
+  const chartGeometry = panel => {
+    const wrap = panel.querySelector(".chart-wrap");
+    const measured = Math.round(wrap?.clientWidth || 0) - 16;
+    const width = Math.max(320, measured > 0 ? measured : 664);
+    return {
+      width,
+      height: CHART_HEIGHT,
+      ...CHART_MARGIN,
+      chartWidth: width - CHART_MARGIN.left - CHART_MARGIN.right,
+      chartHeight: CHART_HEIGHT - CHART_MARGIN.top - CHART_MARGIN.bottom
+    };
+  };
+
   const renderPanel = (group, context) => {
     const panel = document.querySelector(`[data-group="${group.id}"]`);
     if (!panel) return;
@@ -787,23 +1020,20 @@
     svg.replaceChildren();
     const domain = context.domain;
     const selected = state.focus[group.id];
-    const keys = selected === "all" ? group.keys : selected ? [selected] : [];
+    const keys = resolvedKeys(group);
     panel.dataset.focus = selected || "";
     svg.setAttribute("aria-label", `${group.title} 曲线，横轴 Wall Time`);
 
-    const width = 680;
-    const height = 260;
-    const left = 72;
-    const right = 18;
-    const top = 15;
-    const bottom = 39;
-    const chartWidth = width - left - right;
-    const chartHeight = height - top - bottom;
+    const geometry = chartGeometry(panel);
+    const {width, height, left, right, top, chartWidth, chartHeight} = geometry;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("height", String(height));
+    hoverState.delete(group.id);
 
     if (!domain || !keys.length) {
       delete panel.dataset.yMin;
       delete panel.dataset.yMax;
-      appendText(svg, 340, 132, "等待指标", "middle", "empty-chart");
+      appendText(svg, width / 2, height / 2, "等待指标", "middle", "empty-chart");
       return;
     }
     const span = domain.maximum - domain.minimum;
@@ -818,12 +1048,14 @@
         timestamp: finiteNumber(record.timestamp),
         value: metricValue(record, fieldId)
       })).filter(point => point.timestamp !== null && point.value !== null);
-      return {metric, points};
+      return {metric, style: styleFor(group, fieldId), points};
     }).filter(item => item.metric && item.points.length);
     if (!series.length || !(span > 0)) {
       delete panel.dataset.yMin;
       delete panel.dataset.yMax;
-      appendText(svg, 340, 132, "所选范围暂无数据", "middle", "empty-chart");
+      appendText(
+        svg, width / 2, height / 2, "所选范围暂无数据", "middle", "empty-chart"
+      );
       return;
     }
 
@@ -886,18 +1118,24 @@
         x: xFor(point.timestamp),
         y: yFor(point.value)
       }));
-      const color = `var(${item.metric.color})`;
-      svg.appendChild(svgElement("path", {
+      const color = `var(${item.style.color})`;
+      const dashArray = dashArrayFor(item.style);
+      const attributes = {
         d: pathFor(decimatePoints(pixelPoints, left, chartWidth)),
         class: "chart-raw", stroke: color,
         "clip-path": `url(#${clipId})`
-      }));
+      };
+      if (dashArray) attributes["stroke-dasharray"] = dashArray;
+      svg.appendChild(svgElement("path", attributes));
       const latest = pixelPoints[pixelPoints.length - 1];
       svg.appendChild(svgElement("circle", {
         cx: latest.x, cy: latest.y, r: 4.5, class: "chart-point",
         stroke: color, "clip-path": `url(#${clipId})`
       }));
     });
+    // 缓存几何与序列供 crosshair 命中查询，避免每次指针移动重算数据。
+    hoverState.set(group.id, {geometry, domain, span, series, xFor, yFor});
+    applyLegendValues(group, series);
   };
 
   const buildRenderContext = () => {
@@ -928,52 +1166,81 @@
     normalizeFocus(group);
     const tags = panel.querySelector(".tags");
     const picker = panel.querySelector(".registry-picker");
-    tags.replaceChildren();
-    const addTag = (fieldId, label, color) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "tag";
-      button.dataset.metric = fieldId;
-      button.setAttribute("aria-pressed", String(state.focus[group.id] === fieldId));
-      button.setAttribute(
-        "aria-label",
-        fieldId === "all"
-          ? `显示 ${group.title} 全部曲线`
-          : `在 ${group.title} 聚焦 ${label}`
-      );
-      const swatch = document.createElement("span");
-      swatch.className = "swatch";
-      swatch.style.color = color;
-      const text = document.createElement("span");
-      text.textContent = label;
-      button.append(swatch, text);
-      button.addEventListener("click", () => {
-        state.focus[group.id] = fieldId;
-        refreshPanelControls(group);
-        renderGroup(group);
+    // 仅在标签集合发生结构变化时重建 DOM；每轮轮询无条件重建会丢失键盘焦点、
+    // 重置候选列表的展开状态，并让图例数值闪烁。
+    const signature = `${
+      groupSupportsAll(group) ? (isUniformGroup(group) ? "all|" : "same|") : ""
+    }${group.keys.join(",")}`;
+    if (tags.dataset.signature !== signature) {
+      tags.replaceChildren();
+      const addTag = (fieldId, label, style) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "tag";
+        button.dataset.metric = fieldId;
+        button.setAttribute(
+          "aria-label",
+          fieldId === "all"
+            ? `显示 ${group.title} 同量纲全部曲线`
+            : `在 ${group.title} 聚焦 ${label}`
+        );
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.color = style.color;
+        if (style.dash) swatch.dataset.dash = "true";
+        const text = document.createElement("span");
+        text.textContent = label;
+        const value = document.createElement("span");
+        value.className = "tag-value";
+        button.append(swatch, text, value);
+        button.addEventListener("click", () => {
+          state.focus[group.id] = fieldId;
+          // 记录锚点量纲，使聚合视图显示与该指标同量纲的曲线。
+          if (fieldId !== "all") state.anchor[group.id] = fieldId;
+          refreshPanelControls(group);
+          renderGroup(group);
+        });
+        tags.appendChild(button);
+      };
+      if (groupSupportsAll(group)) {
+        addTag(
+          "all",
+          isUniformGroup(group) ? "全部" : "同类",
+          {color: "var(--secondary)", dash: false}
+        );
+      }
+      group.keys.forEach(fieldId => {
+        const metric = registry.get(fieldId);
+        if (!metric) return;
+        const style = styleFor(group, fieldId);
+        addTag(fieldId, metric.label, {
+          color: `var(${style.color})`,
+          dash: style.dash
+        });
       });
-      tags.appendChild(button);
-    };
-    if (groupSupportsAll(group)) addTag("all", "全部", "var(--secondary)");
-    group.keys.forEach(fieldId => {
-      const metric = registry.get(fieldId);
-      if (metric) addTag(fieldId, metric.label, `var(${metric.color})`);
-    });
 
-    const add = document.createElement("button");
-    add.type = "button";
-    add.className = "add-metric";
-    add.textContent = "＋";
-    add.setAttribute("aria-label", `向 ${group.title} 添加追踪变量`);
-    add.setAttribute("aria-expanded", "false");
-    add.addEventListener("click", () => {
-      const open = picker.hidden;
-      closeAllPickers();
-      picker.hidden = !open;
-      add.setAttribute("aria-expanded", String(open));
-      if (open) refreshPicker(group, picker);
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "add-metric";
+      add.textContent = "＋";
+      add.setAttribute("aria-label", `向 ${group.title} 添加追踪变量`);
+      add.setAttribute("aria-expanded", String(!picker.hidden));
+      add.addEventListener("click", () => {
+        const open = picker.hidden;
+        closeAllPickers();
+        picker.hidden = !open;
+        add.setAttribute("aria-expanded", String(open));
+        if (open) refreshPicker(group, picker);
+      });
+      tags.appendChild(add);
+      tags.dataset.signature = signature;
+    }
+    tags.querySelectorAll(".tag[data-metric]").forEach(tag => {
+      tag.setAttribute(
+        "aria-pressed",
+        String(state.focus[group.id] === tag.dataset.metric)
+      );
     });
-    tags.appendChild(add);
   }
 
   const refreshPicker = (group, picker) => {
@@ -1004,7 +1271,9 @@
       option.addEventListener("click", () => {
         if (!group.keys.includes(fieldId)) group.keys.push(fieldId);
         state.focus[group.id] = fieldId;
+        state.anchor[group.id] = fieldId;
         closeAllPickers();
+        assignGroupStyles(group);
         refreshPanelControls(group);
         renderGroup(group);
       });
@@ -1034,9 +1303,15 @@
       const wrap = document.createElement("div");
       wrap.className = "chart-wrap";
       const chart = svgElement("svg", {
-        class: "chart", viewBox: "0 0 680 260", role: "img"
+        class: "chart", viewBox: `0 0 664 ${CHART_HEIGHT}`, role: "img"
       });
-      wrap.appendChild(chart);
+      const tooltip = document.createElement("div");
+      tooltip.className = "tooltip";
+      tooltip.hidden = true;
+      tooltip.setAttribute("role", "tooltip");
+      wrap.append(chart, tooltip);
+      chart.addEventListener("pointermove", event => showTooltip(group, event));
+      chart.addEventListener("pointerleave", () => hideTooltip(panel));
       panel.append(head, tags, picker, wrap);
       grid.appendChild(panel);
       refreshPanelControls(group);
@@ -1053,28 +1328,58 @@
     state.historyRecords = [];
     state.historyRange = "";
     state.historyFetchedAt = 0;
+    state.historyCursor = 0;
+    state.historyFields = "";
     renderAllPanels();
   };
+  // 关闭自动刷新后画面会停在最后一次拉取的数据上，
+  // 必须显式提示，否则容易被误读为训练已停止。
+  const updateRefreshNote = (text) => {
+    const suffix = state.refreshMs > 0 ? "" : " · 自动刷新已关闭";
+    if (text !== undefined) state.lastRefreshText = text;
+    byId("last-refresh").textContent =
+      `${state.lastRefreshText || "尚未刷新"}${suffix}`;
+  };
+  // 当前所有面板追踪的字段并集：历史端点按此裁剪响应，
+  // 未裁剪时单次 24h 响应可达 20MB 量级。
+  const trackedFieldSignature = () => [...new Set(
+    groups.flatMap(group => group.keys)
+  )].sort().join(",");
   // 6h/24h/all 大范围切换到服务端粗粒度历史层；服务端无该端点时降级为仅保留段。
   const loadHistory = async force => {
     if (!HISTORY_RANGES.has(state.timeRange)) {
       state.historyRecords = [];
       state.historyRange = "";
+      state.historyCursor = 0;
       byId("history-status").textContent = "";
       return;
     }
-    if (!force && state.historyRange === state.timeRange) return;
+    const fields = trackedFieldSignature();
+    if (!fields) return;
+    // 范围或字段集变化必须整段重取，否则只按游标增量追加。
+    const reload = force || state.historyRange !== state.timeRange ||
+      state.historyFields !== fields;
+    if (!reload && state.historyCursor === 0) return;
+    const afterSequence = reload ? 0 : state.historyCursor;
     try {
       const response = await fetch(
-        `/api/metrics/history?range=${encodeURIComponent(state.timeRange)}`,
+        `/api/metrics/history?range=${encodeURIComponent(state.timeRange)}` +
+        `&fields=${encodeURIComponent(fields)}` +
+        `&after_sequence=${encodeURIComponent(afterSequence)}`,
         {cache: "no-store"}
       );
       if (!response.ok) throw new Error(`history HTTP ${response.status}`);
       const document = await response.json();
-      state.historyRecords = (document.records || []).filter(
+      const fetched = (document.records || []).filter(
         record => record.metrics_source_id === state.sourceId
       );
+      state.historyRecords = reload
+        ? fetched
+        : state.historyRecords.concat(fetched);
+      const newest = state.historyRecords[state.historyRecords.length - 1];
+      state.historyCursor = newest ? Number(newest.sequence) || 0 : 0;
       state.historyRange = state.timeRange;
+      state.historyFields = fields;
       state.historyFetchedAt = Date.now();
       state.historyAvailable = true;
       byId("history-status").textContent = state.historyRecords.length
@@ -1084,6 +1389,7 @@
       state.historyAvailable = false;
       state.historyRecords = [];
       state.historyRange = "";
+      state.historyCursor = 0;
       byId("history-status").textContent = "历史层不可用，仅显示保留段";
     }
   };
@@ -1254,8 +1560,9 @@
       renderSummary(latest);
       groups.forEach(refreshPanelControls);
       renderAllPanels();
-      byId("last-refresh").textContent =
-        `最近刷新 ${new Date().toLocaleTimeString("zh-CN")}`;
+      updateRefreshNote(
+        `最近刷新 ${new Date().toLocaleTimeString("zh-CN")}`
+      );
     } catch (error) {
       setStatus(byId("live-status"), "连接失败", "bad");
       setStatus(byId("learner-state"), "未连接", "bad");
@@ -1263,8 +1570,9 @@
       byId("learner-count").textContent = "— / 1";
       byId("server-count").textContent = "— / 1";
       byId("stream-status").textContent = `指标流：${String(error)}`;
-      byId("last-refresh").textContent =
-        `连接中断 ${new Date().toLocaleTimeString("zh-CN")}`;
+      updateRefreshNote(
+        `连接中断 ${new Date().toLocaleTimeString("zh-CN")}`
+      );
     } finally {
       state.polling = false;
     }
@@ -1285,11 +1593,16 @@
     state.timer = state.refreshMs > 0
       ? setInterval(() => poll(), state.refreshMs)
       : null;
+    updateRefreshNote();
   };
-  byId("time-range").addEventListener("change", event => {
+  byId("time-range").addEventListener("change", async event => {
     state.timeRange = event.target.value;
     state.domains.clear();
-    loadHistory(true).then(renderAllPanels);
+    // 历史档需要等待数据到位后再统一渲染，避免"先空后满"的两段式闪烁。
+    if (HISTORY_RANGES.has(state.timeRange)) {
+      byId("history-status").textContent = "正在加载历史…";
+    }
+    await loadHistory(true);
     renderAllPanels();
   });
   byId("refresh-interval").addEventListener("change", event => {
@@ -1298,6 +1611,15 @@
     applyRefreshInterval();
   });
   byId("refresh-now").addEventListener("click", () => poll());
+  // viewBox 依赖容器实际宽度，布局变化后需重算，否则字号与刻度会失配。
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    if (resizeTimer !== null) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      renderAllPanels();
+    }, 160);
+  });
 
   populateSelect("time-range", TIME_RANGES, state.timeRange);
   populateSelect("refresh-interval", REFRESH_INTERVALS, "5s");
