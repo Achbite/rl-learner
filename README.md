@@ -5,6 +5,22 @@
 Learner 容器内运行 PPO、SamplePoolService、ModelDistributor 和可选监控。本地训练时先启动
 Learner，再启动 AIServer 和 Client。
 
+本地训练只运行 Learner、AIServer 和 Client 三个容器。`make shell` 是宿主机命令，会从同一父目录的
+源码准备开发制品，但不会自动下载依赖仓库。冷启动工作区至少需要以下同级目录：
+
+```text
+workspace/
+  rl-contracts/
+  rl-sample-pool/
+  rl-model-distributor/
+  rl-learner/
+  rl-aiserver/
+  maze-client/
+```
+
+前三个依赖仓只提供开发制品，不会增加运行容器。完整的三容器启动顺序也可参阅
+[rl-framework](https://github.com/Achbite/rl-framework)。
+
 ## 1. 组件开发环境
 
 ```bash
@@ -23,9 +39,15 @@ bash ./test.sh
 
 ## 2. 启动 Learner 侧服务
 
-进入容器后修改 config，并直接启动 Learner。Learner 只有 training workload，不接受位置 workload：
+打开第一个宿主终端，进入开发容器后直接启动 Learner。Learner 只有 training workload，不接受位置
+workload：
 
 ```bash
+# 宿主机
+cd /path/to/workspace/rl-learner
+make shell
+
+# 以下命令在 Learner 容器内执行
 ./run.sh --help
 ./run.sh --monitor --config configs/learner_config.yaml
 # 只关闭本地三容器预览，不关闭原始指标或训练
@@ -114,16 +136,16 @@ models/train/runtime/checkpoints/
 
 ## 5. 构建运行镜像
 
-运行镜像只接受 clean source 和正式 Contracts、Sample Pool、Model Distributor 制品。在宿主机
-完成依赖同步后构建：
+运行镜像封装当前 Learner 源码和已同步的 Contracts、Sample Pool、Model Distributor 运行产物。
+在宿主机完成依赖同步后，以明确的项目 tag 构建：
 
 ```bash
 bash scripts/sync_runtime_artifacts.sh
-bash build_image.sh
+RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
-脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录，并输出按当前 stack source
-identity 计算的镜像引用。
+脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录，不计算跨仓 stack source
+identity。未指定时使用 `maze-tag-001`；同名 tag 允许由后续微调构建直接覆盖。
 
 ## 6. 端口
 

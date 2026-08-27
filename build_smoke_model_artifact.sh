@@ -4,7 +4,7 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
-image_ref="${RL_LEARNER_IMAGE_REF:-rl-training/learner:${RL_LEARNER_IMAGE_TAG:-test-001}}"
+image_ref="${RL_LEARNER_IMAGE_REF:-rl-training/learner:${RL_PROJECT_IMAGE_TAG:-maze-tag-001}}"
 artifact_root="${workspace_root}/.workspace/artifacts/rl-smoke-model"
 source "${repo_dir}/artifact_versions.env"
 version="${RL_SMOKE_MODEL_VERSION}"

@@ -6,6 +6,25 @@ The Learner container runs PPO, SamplePoolService, ModelDistributor, and the
 optional monitor. For local training, start Learner first, followed by AIServer
 and Client.
 
+Local training runs only three containers: Learner, AIServer, and Client.
+`make shell` is a host command that prepares development artifacts from sibling
+source repositories; it does not download those repositories. A fresh workspace
+therefore needs at least these sibling directories:
+
+```text
+workspace/
+  rl-contracts/
+  rl-sample-pool/
+  rl-model-distributor/
+  rl-learner/
+  rl-aiserver/
+  maze-client/
+```
+
+The first three repositories supply development artifacts only and do not add
+runtime containers. See [rl-framework](https://github.com/Achbite/rl-framework)
+for the complete three-container startup order.
+
 ## 1. Component development environment
 
 ```bash
@@ -26,10 +45,16 @@ on the host.
 
 ## 2. Start Learner-side services
 
-Inside the container, edit the config and start Learner directly. Learner has
-only the training workload and accepts no positional workload:
+Open the first host terminal, enter the development container, and start Learner
+directly. Learner has only the training workload and accepts no positional
+workload:
 
 ```bash
+# Host
+cd /path/to/workspace/rl-learner
+make shell
+
+# Run the following commands inside the Learner container
 ./run.sh --help
 ./run.sh --monitor --config configs/learner_config.yaml
 # Disable only the local three-container preview, not raw metrics or training
@@ -133,18 +158,19 @@ update counter automatically.
 
 ## 5. Build the runtime image
 
-The runtime image accepts only clean source and formal Contracts, Sample Pool,
-and Model Distributor artifacts. Synchronize the runtime dependencies and build
-from the host:
+The runtime image packages the current Learner source and the synchronized
+Contracts, Sample Pool, and Model Distributor runtime artifacts. Synchronize the
+runtime dependencies and build it with an explicit project tag from the host:
 
 ```bash
 bash scripts/sync_runtime_artifacts.sh
-bash build_image.sh
+RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
 The scripts never consume `.workspace/dev-artifacts` or a mutable development
-container build directory. The build prints the image reference derived from
-the current stack source identity.
+container build directory. The build does not derive a cross-repository stack
+source identity. Without an override it uses `maze-tag-001`; a later tuning build
+may overwrite the same tag.
 
 ## 6. Ports
 

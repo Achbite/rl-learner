@@ -2,19 +2,20 @@
 
 set -euo pipefail
 
-requested_image_tag="${RL_LEARNER_IMAGE_TAG:-}"
-development_worktree="${RL_P1A_DEVELOPMENT_BUILD:-0}"
-
 repo_dir="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
 contract_root="${workspace_root}/.workspace/artifacts/rl-contracts"
 context_dir="${workspace_root}/.workspace/build-contexts/rl-learner-$$"
 source "${repo_dir}/artifact_versions.env"
-if test -n "$(git -C "${repo_dir}" status --porcelain --untracked-files=all)" &&
-   [ "${development_worktree}" != "1" ]; then
-    echo "refusing to build a Learner runtime image from a dirty worktree" >&2
-    exit 1
+image_name="rl-training/learner"
+image_tag="${RL_PROJECT_IMAGE_TAG:-maze-tag-001}"
+
+if [[ ! "${image_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo "RL_PROJECT_IMAGE_TAG is not a valid Docker tag" >&2
+    exit 2
 fi
+
+image_ref="${image_name}:${image_tag}"
 # 运行产物由各上游仓库的 build_artifact.sh 按当前 Docker 服务端平台生成，
 # 因此镜像构建同样以实时平台定位产物目录；artifact_versions.env 中的
 # RL_RUNTIME_ARTIFACT_PLATFORM 仅作为主力环境的参考默认值，不参与硬校验，
@@ -39,103 +40,12 @@ if ! test -x "${model_distributor_dir}/bin/maze_model_distributor"; then
     exit 1
 fi
 
-python3 "${repo_dir}/scripts/verify_runtime_artifacts.py" \
-    --contract-dir "${contract_dir}" \
-    --sample-pool-dir "${sample_pool_dir}" \
-    --model-distributor-dir "${model_distributor_dir}" \
-    --contract-version "${RL_CONTRACTS_VERSION}" \
-    --sample-pool-version "${RL_SAMPLE_POOL_VERSION}" \
-    --model-distributor-version "${RL_MODEL_DISTRIBUTOR_VERSION}" \
-    --platform "${platform}"
-
-stack_identity_tool="${workspace_root}/rl-framework/tools/compute_stack_source_id.py"
-if [ ! -f "${stack_identity_tool}" ]; then
-    echo "stack source identity tool is missing: ${stack_identity_tool}" >&2
-    exit 1
-fi
-stack_identity_arguments=(--workspace-root "${workspace_root}")
-if [ "${development_worktree}" = "1" ]; then
-    stack_identity_arguments+=(--development-worktree)
-fi
-stack_identity_json="$(
-    python3 "${stack_identity_tool}" "${stack_identity_arguments[@]}"
-)"
-identity_fields="$(
-    python3 -c '
-import json
-import sys
-
-document = json.loads(sys.argv[1])
-print("\t".join((
-    document["stack_source_id"],
-    document["repositories"]["rl-learner"],
-    document["artifacts"]["rl-contracts"]["artifact_digest"],
-    document["artifacts"]["rl-contracts"]["manifest_sha256"],
-    document["artifacts"]["rl-sample-pool"]["manifest_sha256"],
-    document["artifacts"]["rl-model-distributor"]["manifest_sha256"],
-    document["configs"]["learner"]["sha256"],
-)))
-' "${stack_identity_json}"
-)"
-IFS=$'\t' read -r \
-    stack_source_id component_commit contracts_artifact_digest \
-    contracts_manifest_digest sample_pool_manifest_digest \
-    model_distributor_manifest_digest component_config_digest \
-    <<< "${identity_fields}"
-component_contract_tool="${workspace_root}/rl-framework/tools/generate_component_contract.py"
-if [ ! -f "${component_contract_tool}" ]; then
-    echo "component contract generator is missing: ${component_contract_tool}" >&2
-    exit 1
-fi
-contract_temp_dir="$(mktemp -d)"
-trap 'rm -rf "${context_dir}" "${contract_temp_dir}"' EXIT
-contract_manifest_digest="$(
-    python3 "${component_contract_tool}" \
-        --component learner \
-        --output "${contract_temp_dir}/manifest.json" \
-        --schema-source "${repo_dir}/component-contract/config.schema.json" \
-        --schema-image-path /opt/rl/component-contract/config.schema.json \
-        --config-file "main=/opt/rl/learner/configs/learner_config.yaml=learner.yaml=${repo_dir}/configs/learner_config.yaml" \
-        --config-file "sample_pool=/opt/rl/learner/sample-pool/config/pool_config.yaml=sample-pool.yaml=${sample_pool_dir}/config/pool_config.yaml" \
-        --config-file "model_distributor=/opt/rl/learner/model-distributor/config/model_distributor_config.yaml=model-distributor.yaml=${model_distributor_dir}/config/model_distributor_config.yaml" \
-        --contracts-version "${RL_CONTRACTS_VERSION}" \
-        --contracts-artifact-digest "${contracts_artifact_digest}"
-)"
-canonical_image_tag="p1a-${RL_CONTRACTS_VERSION}-${stack_source_id:0:12}"
-if [ -n "${requested_image_tag}" ] &&
-   [ "${requested_image_tag}" != "${canonical_image_tag}" ]; then
-    echo "Learner image tag must match the canonical stack identity:" >&2
-    echo "  expected=${canonical_image_tag}" >&2
-    echo "  requested=${requested_image_tag}" >&2
-    exit 1
-fi
-image_ref="rl-training/learner:${canonical_image_tag}"
-
-if docker image inspect "${image_ref}" >/dev/null 2>&1; then
-    existing_identity="$(
-        docker image inspect --format \
-            '{{index .Config.Labels "org.rl-training.stack-source-id"}}|{{index .Config.Labels "org.rl-training.component"}}|{{index .Config.Labels "org.rl-training.component-commit"}}|{{index .Config.Labels "org.rl-training.contracts-version"}}|{{index .Config.Labels "org.rl-training.contracts-artifact-digest"}}|{{index .Config.Labels "org.rl-training.contracts-manifest-digest"}}|{{index .Config.Labels "org.rl-training.component-config-digest"}}|{{index .Config.Labels "org.rl-training.sample-pool-manifest-digest"}}|{{index .Config.Labels "org.rl-training.model-distributor-manifest-digest"}}|{{index .Config.Labels "org.rl-training.component-contract.sha256"}}' \
-            "${image_ref}"
-    )"
-    expected_identity="${stack_source_id}|learner|${component_commit}|${RL_CONTRACTS_VERSION}|${contracts_artifact_digest}|${contracts_manifest_digest}|${component_config_digest}|${sample_pool_manifest_digest}|${model_distributor_manifest_digest}|${contract_manifest_digest}"
-    if [ "${existing_identity}" != "${expected_identity}" ]; then
-        echo "refusing to overwrite an existing Learner tag with another identity: ${image_ref}" >&2
-        exit 1
-    fi
-    if [ "${development_worktree}" != "1" ]; then
-        RL_LEARNER_IMAGE_REF="${image_ref}" \
-            bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
-    fi
-    printf '%s\n' "${image_ref}"
-    exit 0
-fi
-
+trap 'rm -rf "${context_dir}"' EXIT
 mkdir -p "${context_dir}/_deps/contracts" \
     "${context_dir}/_deps/sample-pool/bin" \
     "${context_dir}/_deps/sample-pool/config" \
     "${context_dir}/_deps/model-distributor/bin" \
-    "${context_dir}/_deps/model-distributor/config" \
-    "${context_dir}/_deps/identity"
+    "${context_dir}/_deps/model-distributor/config"
 rsync -a \
     --exclude='.git/' \
     --exclude='build/' \
@@ -151,42 +61,16 @@ cp "${sample_pool_dir}/bin/maze_sample_pool" \
     "${context_dir}/_deps/sample-pool/bin/maze_sample_pool"
 cp "${sample_pool_dir}/config/pool_config.yaml" \
     "${context_dir}/_deps/sample-pool/config/pool_config.yaml"
-cp "${sample_pool_dir}/manifest.json" \
-    "${context_dir}/_deps/sample-pool/manifest.json"
 cp "${model_distributor_dir}/bin/maze_model_distributor" \
     "${context_dir}/_deps/model-distributor/bin/maze_model_distributor"
 cp "${model_distributor_dir}/config/model_distributor_config.yaml" \
     "${context_dir}/_deps/model-distributor/config/model_distributor_config.yaml"
-cp "${model_distributor_dir}/manifest.json" \
-    "${context_dir}/_deps/model-distributor/manifest.json"
-cp "${contract_dir}/manifest.json" \
-    "${context_dir}/_deps/identity/contracts.json"
-cp "${sample_pool_dir}/manifest.json" \
-    "${context_dir}/_deps/identity/sample-pool.json"
-cp "${model_distributor_dir}/manifest.json" \
-    "${context_dir}/_deps/identity/model-distributor.json"
-printf '%s\n' "${stack_identity_json}" \
-    > "${context_dir}/_deps/identity/stack-source.json"
-cp "${contract_temp_dir}/manifest.json" \
-    "${context_dir}/component-contract/manifest.json"
 
 docker build \
-    --label "org.opencontainers.image.revision=${component_commit}" \
     --label "org.rl-training.component=learner" \
-    --label "org.rl-training.component-commit=${component_commit}" \
-    --label "org.rl-training.stack-source-id=${stack_source_id}" \
     --label "org.rl-training.contracts-version=${RL_CONTRACTS_VERSION}" \
-    --label "org.rl-training.contracts-artifact-digest=${contracts_artifact_digest}" \
-    --label "org.rl-training.contracts-manifest-digest=${contracts_manifest_digest}" \
-    --label "org.rl-training.component-config-digest=${component_config_digest}" \
-    --label "org.rl-training.sample-pool-manifest-digest=${sample_pool_manifest_digest}" \
-    --label "org.rl-training.model-distributor-manifest-digest=${model_distributor_manifest_digest}" \
     --label "org.rl-training.component-contract.path=/opt/rl/component-contract/manifest.json" \
-    --label "org.rl-training.component-contract.sha256=${contract_manifest_digest}" \
+    --label "org.rl-training.project-image-tag=${image_tag}" \
     --tag "${image_ref}" \
     "${context_dir}"
-if [ "${development_worktree}" != "1" ]; then
-    RL_LEARNER_IMAGE_REF="${image_ref}" \
-        bash "${repo_dir}/build_smoke_model_artifact.sh" >/dev/null
-fi
 printf '%s\n' "${image_ref}"

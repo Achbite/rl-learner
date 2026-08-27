@@ -27,14 +27,6 @@ RUN cp -a _deps/contracts/python/. proto/ && \
     cp -a _deps/contracts/schemas/. schemas/ && \
     cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
     cp -a _deps/model-distributor /opt/rl/learner/model-distributor && \
-    mkdir -p /opt/rl/identity && \
-    cp _deps/identity/contracts.json /opt/rl/identity/contracts.json && \
-    cp _deps/identity/sample-pool.json \
-        /opt/rl/identity/sample-pool.json && \
-    cp _deps/identity/model-distributor.json \
-        /opt/rl/identity/model-distributor.json && \
-    cp _deps/identity/stack-source.json \
-        /opt/rl/identity/stack-source.json && \
     mkdir -p /opt/rl/component-contract && \
     cp component-contract/manifest.json \
         component-contract/config.schema.json \

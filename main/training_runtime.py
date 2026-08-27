@@ -268,6 +268,7 @@ class ModelPublisher:
         "sample_count",
         "train_updates",
         "trained_samples",
+        "retention",
     }
     WIRE_MANIFEST_KEYS = {
         "manifest_schema_version",
@@ -723,8 +724,9 @@ class ModelPublisher:
                 "ready": True,
             }
             document = finalize_manifest_digest(document)
+            retention = self.retention_for_updates(int(train_updates))
             local_metadata = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "model_identity": document["identity"],
                 "training_config_digest": self.training_digest.hex,
                 "rollout_estimator_profile_digest": (
@@ -737,9 +739,9 @@ class ModelPublisher:
                 "sample_count": int(sample_count),
                 "train_updates": int(train_updates),
                 "trained_samples": int(trained_samples),
+                "retention": retention,
                 **self.initial_model_provenance,
             }
-            retention = self.retention_for_updates(int(train_updates))
             runtime_document = {
                 **document,
                 "train_update_id": train_update_id,
@@ -909,7 +911,7 @@ class ModelPublisher:
             or not document.get("ready")
             or checkpoint.get("model_step") != version
             or metadata != expected_checkpoint_metadata
-            or local_metadata.get("schema_version") != 3
+            or local_metadata.get("schema_version") != 4
             or local_metadata.get("model_identity") != document.get("identity")
             or local_metadata.get("training_config_digest")
             != document.get("training_config_digest")
@@ -934,6 +936,7 @@ class ModelPublisher:
             != metadata.get("train_updates")
             or local_metadata.get("trained_samples")
             != metadata.get("trained_samples")
+            or local_metadata.get("retention") != retention
             or metadata.get("model_lineage_id") != self.lineage_id
             or metadata.get("observation_schema")
             != schema_document(self.semantics.observation_schema)

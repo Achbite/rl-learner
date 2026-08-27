@@ -1,0 +1,34 @@
+{
+  "schema_version": "rl.component-contract.v1",
+  "component": "learner",
+  "bootstrap": {
+    "config_path_environment": "RL_CONFIG_PATH"
+  },
+  "config_schema": {
+    "path": "/opt/rl/component-contract/config.schema.json"
+  },
+  "config_files": [
+    {
+      "role": "main",
+      "image_path": "/opt/rl/learner/configs/learner_config.yaml",
+      "mount_filename": "learner.yaml"
+    },
+    {
+      "role": "model_distributor",
+      "image_path": "/opt/rl/learner/model-distributor/config/model_distributor_config.yaml",
+      "mount_filename": "model-distributor.yaml"
+    },
+    {
+      "role": "sample_pool",
+      "image_path": "/opt/rl/learner/sample-pool/config/pool_config.yaml",
+      "mount_filename": "sample-pool.yaml"
+    }
+  ],
+  "readiness": {
+    "receipt_path": "/run/rl/readiness.json",
+    "schema_version": "rl.component-readiness.v1"
+  },
+  "compatibility": {
+    "package_version": "0.14.0"
+  }
+}
