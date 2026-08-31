@@ -17,6 +17,7 @@ import torch.nn as nn
 from onnx import numpy_helper
 from torch.distributions import Categorical
 
+from src.contracts.identity import training_contract
 from src.log.logger import setup_logger
 
 
@@ -109,6 +110,17 @@ class PPOTrainer:
     """
 
     MAX_MODEL_STEP = (1 << 64) - 1
+    CHECKPOINT_KEYS = frozenset(
+        {
+            "model_state_dict",
+            "optimizer_state_dict",
+            "model_step",
+            "model_training",
+            "torch_rng_state",
+            "numpy_rng_state",
+            "metadata",
+        }
+    )
 
     def __init__(self, config: dict):
         """
@@ -118,10 +130,10 @@ class PPOTrainer:
         self._logger = setup_logger("PPOTrainer")
 
         # ---- 读取模型参数 ----
-        model_cfg = config["model"]
-        self._obs_dim = int(model_cfg["obs_dim"])
-        self._action_dim = int(model_cfg["action_dim"])
-        self._hidden_dim = int(model_cfg["hidden_dim"])
+        contract = training_contract(config)
+        self._obs_dim = int(contract["observation_dimension"])
+        self._action_dim = int(contract["action_count"])
+        self._hidden_dim = int(contract["hidden_dimension"])
 
         # ---- 读取训练超参 ----
         train_cfg = config["training"]
@@ -542,7 +554,7 @@ class PPOTrainer:
     # ---- ONNX 模型导出 ----
     def export_onnx(self, export_path: str):
         """
-        将当前模型导出为 ONNX 格式（兼容 PyTorch 2.6+ 新版导出器）
+        将当前模型导出为 ONNX 格式。
 
         Args:
             export_path: ONNX 文件输出路径
@@ -564,21 +576,14 @@ class PPOTrainer:
             opset_version=11,
         )
 
-        # PyTorch 2.6+ 默认走 dynamo 导出路径，简单网络使用 TorchScript 导出即可
         try:
-            try:
-                torch.onnx.export(
-                    self._model,
-                    dummy_input,
-                    export_path,
-                    dynamo=False,
-                    **export_kwargs,
-                )
-            except TypeError:
-                # PyTorch < 2.6 不支持 dynamo 参数
-                torch.onnx.export(
-                    self._model, dummy_input, export_path, **export_kwargs
-                )
+            torch.onnx.export(
+                self._model,
+                dummy_input,
+                export_path,
+                dynamo=False,
+                **export_kwargs,
+            )
         finally:
             self._model.train(was_training)
 
@@ -599,30 +604,40 @@ class PPOTrainer:
         }, path)
         self._logger.info("Checkpoint 已保存: %s", path)
 
+    @classmethod
+    def read_checkpoint(cls, path: str, map_location) -> dict:
+        checkpoint = torch.load(
+            path, map_location=map_location, weights_only=False
+        )
+        if not isinstance(checkpoint, dict) or set(checkpoint) != cls.CHECKPOINT_KEYS:
+            raise RuntimeError("checkpoint does not match the current format")
+        if not isinstance(checkpoint["metadata"], dict):
+            raise RuntimeError("checkpoint metadata is invalid")
+        if not isinstance(checkpoint["model_training"], bool):
+            raise RuntimeError("checkpoint model_training is invalid")
+        model_step = checkpoint["model_step"]
+        if (
+            isinstance(model_step, bool)
+            or not isinstance(model_step, int)
+            or model_step < 0
+            or model_step > cls.MAX_MODEL_STEP
+        ):
+            raise RuntimeError("checkpoint model_step is invalid")
+        return checkpoint
+
     def load_checkpoint(self, path: str):
         """加载 PyTorch checkpoint"""
         if not os.path.isfile(path):
             self._logger.warning("Checkpoint 不存在: %s", path)
             return False
-        try:
-            checkpoint = torch.load(
-                path, map_location=self._device, weights_only=False
-            )
-        except TypeError:
-            checkpoint = torch.load(path, map_location=self._device)
+        checkpoint = self.read_checkpoint(path, self._device)
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "model_version" in checkpoint:
-            raise RuntimeError("legacy model_version checkpoint is not accepted")
-        self._model_step = int(checkpoint.get("model_step", 0))
-        if self._model_step < 0 or self._model_step > self.MAX_MODEL_STEP:
-            raise RuntimeError("checkpoint model_step is invalid")
+        self._model_step = checkpoint["model_step"]
         self._model_weights_inherited = False
-        self._model.train(bool(checkpoint.get("model_training", True)))
-        if "torch_rng_state" in checkpoint:
-            torch.set_rng_state(checkpoint["torch_rng_state"])
-        if "numpy_rng_state" in checkpoint:
-            np.random.set_state(checkpoint["numpy_rng_state"])
+        self._model.train(checkpoint["model_training"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        np.random.set_state(checkpoint["numpy_rng_state"])
         self._logger.info("Checkpoint 已加载: %s (step=%d)", path, self._model_step)
         return True
 

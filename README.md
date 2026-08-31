@@ -34,7 +34,7 @@ make build
 bash ./test.sh
 ```
 
-开发入口不依赖旧 runtime image，也不要求正式 0.14 artifact 或 clean source。开发依赖只写入
+开发入口不依赖旧 runtime image，也不要求预先生成正式 artifact 或 clean source。开发依赖只写入
 `.workspace/dev-artifacts`，不得用于正式镜像。`make shell` 只能在宿主机执行。
 
 ## 2. 启动 Learner 侧服务
@@ -122,12 +122,14 @@ config 的 `model.initial_model_path` 默认为 `null`；在 config 中显式设
 ```text
 models/train/0000200/
   SaveModel.onnx
-  manifest.json
-  metadata.json
+  manifest.pb
 
 models/train/runtime/checkpoints/
   publication-0000200.checkpoint.pt
 ```
+
+`manifest.pb` 是模型包的唯一权威清单；Learner 私有 checkpoint 保存本次 Update
+的运行元数据，公开模型目录不再维护一份 JSON manifest 或 metadata 副本。
 
 正常停止不会立即删除公开模型包；它们会保留到下一次 `run.sh` 清空同一个
 `model.local_train_dir`。私有 checkpoint 不属于模型包，也不能作为后续训练的入口；要保留或

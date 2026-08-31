@@ -27,8 +27,5 @@
   "readiness": {
     "receipt_path": "/run/rl/readiness.json",
     "schema_version": "rl.component-readiness.v1"
-  },
-  "compatibility": {
-    "package_version": "0.14.0"
   }
 }

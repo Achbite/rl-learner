@@ -54,10 +54,10 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-manifest_path = root / "manifest.json"
-if not manifest_path.is_file():
+artifact_path = root / "artifact.json"
+if not artifact_path.is_file():
     raise SystemExit(1)
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
 expected = {
     "package": "rl-smoke-model",
     "version": os.environ["PACKAGE_VERSION"],
@@ -65,17 +65,17 @@ expected = {
     "source_sha256": os.environ["SOURCE_SHA256"],
     "platform": "any",
 }
-if any(manifest.get(key) != value for key, value in expected.items()):
+if any(artifact.get(key) != value for key, value in expected.items()):
     raise SystemExit(1)
-model_path = root / manifest.get("model_file", "")
-if not model_path.is_file():
+files = artifact.get("files", {})
+if set(files) != {"SaveModel.onnx", "manifest.pb"}:
     raise SystemExit(1)
-payload = model_path.read_bytes()
-if len(payload) != manifest.get("size_bytes"):
-    raise SystemExit(1)
-identity = manifest.get("identity", {})
-if hashlib.sha256(payload).hexdigest() != identity.get("artifact_digest"):
-    raise SystemExit(1)
+for name, expected_digest in files.items():
+    path = root / name
+    if not path.is_file():
+        raise SystemExit(1)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
+        raise SystemExit(1)
 PY
     then
         printf '%s\n' "${output_dir}"
@@ -99,32 +99,34 @@ docker run --rm \
     "${image_ref}" \
     -m main.model_bootstrap \
     --config /workspace/rl-learner/configs/learner_config.yaml \
-    --output-root /output \
-    --artifact-uri-prefix file:///opt/rl/aiserver/models/smoke
+    --output-root /output
 
 generated="${temp_dir}"
 python3 - \
-    "${generated}/manifest.json" \
+    "${generated}/artifact.json" \
     "${version}" \
     "${source_commit}" \
     "${source_id}" \
     "${source_sha256}" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-document = json.loads(path.read_text(encoding="utf-8"))
-document.update(
-    {
-        "package": "rl-smoke-model",
-        "version": sys.argv[2],
-        "source_commit": sys.argv[3],
-        "source_id": sys.argv[4],
-        "source_sha256": sys.argv[5],
-        "platform": "any",
-    }
-)
+root = path.parent
+files = {}
+for name in ("SaveModel.onnx", "manifest.pb"):
+    files[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+document = {
+    "package": "rl-smoke-model",
+    "version": sys.argv[2],
+    "source_commit": sys.argv[3],
+    "source_id": sys.argv[4],
+    "source_sha256": sys.argv[5],
+    "platform": "any",
+    "files": files,
+}
 path.write_text(
     json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
     encoding="utf-8",

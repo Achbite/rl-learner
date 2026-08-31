@@ -115,23 +115,6 @@ _INTERNAL_ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
     ),
 }
 
-_ALLOWED_NONCONFIG_ENVIRONMENT = {
-    "RL_DEVELOPMENT_MONITOR_CONTAINER_PORT",
-    "RL_DEVELOPMENT_MONITOR_URL",
-    "RL_TRAINING_WORKSPACE",
-    "RL_MODEL_LINEAGE_ID",
-    "RL_METRICS_PUBLIC_URL",
-    "RL_METRICS_SOURCE_ID",
-    "RL_LEARNER_INSTANCE",
-}
-
-_RETIRED_RUNTIME_ENVIRONMENT = {
-    "RL_ARCHIVE_INTERVAL_UPDATES",
-    "RL_LOCAL_TRAIN_ROOT",
-    "RL_METRICS_PORT",
-    "RL_MODEL_ARTIFACT_ROOT",
-}
-
 CLI_OVERRIDE_FIELDS = {
     ("model", "initial_model_path"),
     ("model_distributor", "host"),
@@ -143,29 +126,6 @@ CLI_OVERRIDE_FIELDS = {
 }
 
 _PLATFORM_IDENTITY_KEYS = {"task_id", "run_id", "pod_attempt_id"}
-
-
-def _environment_warnings(environment: Mapping[str, str]) -> list[dict[str, str]]:
-    warnings: list[dict[str, str]] = []
-    for name in sorted(environment):
-        if (
-            name in ENVIRONMENT_OVERRIDES
-            or name in _INTERNAL_ENVIRONMENT_OVERRIDES
-            or name in _ALLOWED_NONCONFIG_ENVIRONMENT
-        ):
-            continue
-        if name in {"RL_TASK_ID", "RL_RUN_ID", "RL_POD_ATTEMPT_ID"}:
-            raise ValueError(
-                f"platform control identity is not a Learner input: {name}"
-            )
-        if name.startswith("RL_"):
-            warnings.append(
-                {
-                    "environment": name,
-                    "reason": "unknown_or_retired_override_ignored",
-                }
-            )
-    return warnings
 
 
 def _assign(document: dict, path: tuple[str, ...], value: object) -> None:
@@ -244,7 +204,6 @@ def load_effective_config(
 ) -> dict:
     """Apply allowlisted startup overrides and return a validated config."""
     selected_environment = os.environ if environment is None else environment
-    environment_warnings = _environment_warnings(selected_environment)
 
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as stream:
@@ -253,6 +212,12 @@ def load_effective_config(
         raise ValueError("Learner config root must be a mapping")
     _reject_platform_config_keys(loaded)
     config = copy.deepcopy(loaded)
+
+    config["contract"]["training_contract_path"] = _resolve_path(
+        config_path,
+        "contract.training_contract_path",
+        config["contract"].get("training_contract_path"),
+    )
 
     applied: list[dict[str, object]] = []
     for name, (target, parser) in ENVIRONMENT_OVERRIDES.items():
@@ -342,7 +307,6 @@ def load_effective_config(
         "environment_overrides": applied,
         "internal_environment_overrides": internal_applied,
         "cli_overrides": cli_applied,
-        "warnings": environment_warnings,
         "training_config_digest": digest,
     }
     return config

@@ -14,15 +14,15 @@ if ! test -f "${artifact_dir}/python/training_pb2.py"; then
     echo "rl-contracts artifact is missing" >&2
     exit 1
 fi
-if ! test -f "${artifact_dir}/schemas/maze.metrics.v4.json" ||
-   ! test -f "${artifact_dir}/schemas/maze.metrics.v4.sha256"; then
+if ! test -f "${artifact_dir}/schemas/maze.metrics.json" ||
+   ! test -f "${artifact_dir}/schemas/maze.metrics.sha256"; then
     echo "rl-contracts metric schema artifact is missing" >&2
     exit 1
 fi
 
 mkdir -p "${output_dir}" "${output_dir}/schemas"
 cp "${artifact_dir}"/python/*.py "${output_dir}/"
-cp "${artifact_dir}"/schemas/maze.metrics.v4.json \
-   "${artifact_dir}"/schemas/maze.metrics.v4.sha256 \
+cp "${artifact_dir}"/schemas/maze.metrics.json \
+   "${artifact_dir}"/schemas/maze.metrics.sha256 \
    "${output_dir}/schemas/"
 printf '%s\n' "${output_dir}"

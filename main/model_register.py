@@ -1,20 +1,32 @@
-"""Register an exact 0.8 model manifest with the local distributor."""
+"""Register one canonical protobuf model manifest with the distributor."""
 
 import argparse
 import json
 import time
+from pathlib import Path
 
 import grpc
+import yaml
 
-from main.training_runtime import TrainingRuntime
 from proto import training_pb2, training_pb2_grpc
-from src.contracts.identity import manifest_message, model_identity_document
+from src.contracts.identity import (
+    contract_identity,
+    model_identity_document,
+    read_manifest_file,
+)
 
 
-def register(manifest_path: str, address: str, timeout: float) -> dict:
-    with open(manifest_path, "r", encoding="utf-8") as stream:
-        document = json.load(stream)
-    manifest = manifest_message(TrainingRuntime._manifest_for_wire(document))
+def register(
+    manifest_path: str,
+    config_path: str,
+    address: str,
+    timeout: float,
+) -> dict:
+    selected_manifest = Path(manifest_path).resolve()
+    manifest = read_manifest_file(selected_manifest)
+    with Path(config_path).open("r", encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+    contract = contract_identity(config)
     deadline = time.monotonic() + timeout
     last_error = ""
     with grpc.insecure_channel(address) as channel:
@@ -22,7 +34,14 @@ def register(manifest_path: str, address: str, timeout: float) -> dict:
         while time.monotonic() < deadline:
             try:
                 response = stub.RegisterModel(
-                    training_pb2.RegisterModelReq(manifest=manifest), timeout=2.0
+                    training_pb2.RegisterModelReq(
+                        manifest=manifest,
+                        contract=contract,
+                        local_artifact_path=str(
+                            selected_manifest.parent / "SaveModel.onnx"
+                        ),
+                    ),
+                    timeout=2.0,
                 )
                 if response.result in (
                     training_pb2.MODEL_REGISTER_RESULT_REGISTERED,
@@ -53,12 +72,18 @@ def register(manifest_path: str, address: str, timeout: float) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--config", default="configs/learner_config.yaml")
     parser.add_argument("--address", default="127.0.0.1:9200")
     parser.add_argument("--timeout", type=float, default=30.0)
     arguments = parser.parse_args()
     print(
         json.dumps(
-            register(arguments.manifest, arguments.address, arguments.timeout),
+            register(
+                arguments.manifest,
+                arguments.config,
+                arguments.address,
+                arguments.timeout,
+            ),
             ensure_ascii=False,
             sort_keys=True,
         )

@@ -382,11 +382,11 @@
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const COLORS = ["--blue", "--green", "--orange", "--red", "--purple", "--teal", "--pink", "--indigo"];
-  const MODEL_STEP_ID = "learner.model_step.v1";
-  const TRAIN_UPDATE_ID = "learner.train_update.total.v1";
-  const TRAINED_SAMPLES_ID = "learner.trained_samples.total.v1";
-  const TRAINING_EPISODE_ID = "server.training.episode.completed.total.v1";
-  const PRODUCED_SAMPLES_ID = "sample.flow.produced.total.v1";
+  const MODEL_STEP_ID = "learner.model_step";
+  const TRAIN_UPDATE_ID = "learner.train_update.total";
+  const TRAINED_SAMPLES_ID = "learner.trained_samples.total";
+  const TRAINING_EPISODE_ID = "server.training.episode.completed.total";
+  const PRODUCED_SAMPLES_ID = "sample.flow.produced.total";
   // 时间范围与自动刷新档位（Grafana 同款快速档），EVENT_WINDOW 固定为
   // 服务端 episode 聚合窗口，避免时间档被误当作事件窗口下发。
   const TIME_RANGES = [
@@ -411,22 +411,22 @@
     3600, 7200, 21600, 43200, 86400
   ];
   const REWARD_COMPONENT_IDS = [
-    "server.training.reward.component.goal_reward.episode_mean.v1",
-    "server.training.reward.component.timeout_penalty.episode_mean.v1",
-    "server.training.reward.component.geodesic_progress.episode_mean.v1",
-    "server.training.reward.component.first_visit_bonus.episode_mean.v1",
-    "server.training.reward.component.wasted_action_penalty.episode_mean.v1"
+    "server.training.reward.component.goal_reward.episode_mean",
+    "server.training.reward.component.timeout_penalty.episode_mean",
+    "server.training.reward.component.geodesic_progress.episode_mean",
+    "server.training.reward.component.first_visit_bonus.episode_mean",
+    "server.training.reward.component.wasted_action_penalty.episode_mean"
   ];
   const groups = [
     {
       id: "loss", title: "Loss", catalogGroup: "loss",
-      initial: ["learner.loss.policy.v1", "learner.loss.value.v1"]
+      initial: ["learner.loss.policy", "learner.loss.value"]
     },
     {
       id: "episode-return", title: "Agent Episode Return", catalogGroup: "episode_return",
       initial: [
-        "server.training.episode.learning_return.mean.v1",
-        "server.training.episode.learning_return.latest_mean.v1"
+        "server.training.episode.learning_return.mean",
+        "server.training.episode.learning_return.latest_mean"
       ]
     },
     {
@@ -436,44 +436,44 @@
     {
       id: "episode-success", title: "Agent Success Rate", catalogGroup: "episode_success",
       initial: [
-        "server.training.episode.success.any_rate.v1",
-        "server.training.episode.success.all_rate.v1"
+        "server.training.episode.success.any_rate",
+        "server.training.episode.success.all_rate"
       ]
     },
     {
       id: "sample-throughput", title: "Sample Throughput", catalogGroup: "sample_throughput",
       initial: [
-        "sample.throughput.produced_per_second.v1",
-        "sample.throughput.accepted_per_second.v1",
-        "sample.throughput.trained_per_second.v1"
+        "sample.throughput.produced_per_second",
+        "sample.throughput.accepted_per_second",
+        "sample.throughput.trained_per_second"
       ]
     },
     {
       id: "sample-flow", title: "Sample Flow", catalogGroup: "sample_flow",
       initial: [
-        "sample.flow.produced.total.v1",
-        "sample.flow.accepted.total.v1",
-        "sample.flow.acknowledged.total.v1",
-        "sample.flow.trained.total.v1"
+        "sample.flow.produced.total",
+        "sample.flow.accepted.total",
+        "sample.flow.acknowledged.total",
+        "sample.flow.trained.total"
       ]
     },
     {
       id: "latency", title: "Latency", catalogGroup: "latency",
       initial: [
-        "server.latency.sample_send.mean_ms.v1",
-        "server.latency.inference.mean_ms.v1",
-        "server.latency.inference.max_ms.v1"
+        "server.latency.sample_send.mean_ms",
+        "server.latency.inference.mean_ms",
+        "server.latency.inference.max_ms"
       ]
     },
     {
       id: "ppo-stability", title: "PPO Stability", catalogGroup: "ppo_stability",
       initial: [
-        "learner.ppo.entropy.v1",
-        "learner.ppo.approx_kl.v1",
-        "learner.ppo.clip_fraction.v1",
-        "learner.value.prediction_mean.v1",
-        "learner.value.return_target_mean.v1",
-        "learner.value.explained_variance.v1"
+        "learner.ppo.entropy",
+        "learner.ppo.approx_kl",
+        "learner.ppo.clip_fraction",
+        "learner.value.prediction_mean",
+        "learner.value.return_target_mean",
+        "learner.value.explained_variance"
       ]
     }
   ].map(group => ({...group, keys: [], initialized: false, styles: new Map()}));

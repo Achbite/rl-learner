@@ -1,4 +1,4 @@
-"""R-PIN processed-transition PPO runtime for rl-contracts 0.14.0."""
+"""R-PIN processed-transition PPO runtime for the current rl-contracts."""
 
 from __future__ import annotations
 
@@ -24,20 +24,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from proto import common_pb2, training_pb2, training_pb2_grpc
 from src.contracts.identity import (
     bind_runtime_lineage,
+    content_digest,
     contract_document,
     contract_identity,
-    finalize_manifest_digest,
-    manifest_message,
+    finalize_manifest,
     model_identity_document,
-    policy_spec_digest,
+    read_manifest_file,
     rollout_estimator_profile,
-    rollout_estimator_profile_document,
-    schema_document,
-    semantics_document,
     service_identity,
     training_config_digest,
-    training_semantics,
+    training_contract,
+    training_contract_digest,
     validate_config,
+    write_manifest_file,
 )
 from src.config.command_line import parse_startup_arguments
 from src.config.effective_config import effective_config_log, load_effective_config
@@ -75,6 +74,28 @@ class _UpdateCommitNotApplied(_UpdateCommitError):
 
 class _SamplePoolUnavailable(RuntimeError):
     """The current Sample Pool authority is temporarily unable to serve."""
+
+
+def train_processed_delivery(items, trainer) -> tuple[list[dict], dict]:
+    """Translate leased wire items and pass the exact batch to PPOTrainer."""
+    training_samples = [
+        {
+            "observation": list(item.transition.observation),
+            "action": int(item.transition.action),
+            "old_log_probability": float(
+                item.transition.behavior_log_probability
+            ),
+            "old_value_prediction": float(item.transition.behavior_value),
+            "advantage": float(item.transition.advantage),
+            "value_target": float(item.transition.value_target),
+            "behavior_model_step": int(
+                item.transition.behavior_model_step
+            ),
+            "item_id": item.transition.item_id,
+        }
+        for item in items
+    ]
+    return training_samples, trainer.train_on_batch(training_samples)
 
 
 def _handle_signal(_signal, _frame) -> None:
@@ -158,8 +179,6 @@ def training_chain_status(
             reasons.append(f"{name}_instance_missing")
     if sample_pool.get("ingress_ready") is not True:
         reasons.append("sample_pool_ingress_ready_false")
-    if actor.get("client_session_recent") is not True:
-        reasons.append("client_session_not_recent")
 
     learner_model = learner.get("model_identity", {})
     actor_model = actor.get("model_identity", {})
@@ -191,8 +210,6 @@ def training_chain_status(
         server_pod_reasons.append("actor_lifecycle_not_ready")
     if actor_step < 0:
         server_pod_reasons.append("active_model_missing")
-    if actor.get("client_session_recent") is not True:
-        server_pod_reasons.append("client_session_not_recent")
 
     staged_step = int(
         _identity_dict(actor.get("staged_model_identity", {})).get(
@@ -248,62 +265,21 @@ def training_chain_status(
 
 class ModelPublisher:
     MODEL_FILE = "SaveModel.onnx"
-    MANIFEST_FILE = "manifest.json"
-    METADATA_FILE = "metadata.json"
+    MANIFEST_FILE = "manifest.pb"
     MIN_ROLLING_PUBLICATIONS = 101
     MAX_MODEL_STEP = (1 << 64) - 1
     PROVENANCE_KEYS = (
         "initial_model_path",
         "initial_model_artifact_digest",
     )
-    LOCAL_METADATA_KEYS = {
-        "schema_version",
-        "model_identity",
-        "training_config_digest",
-        "rollout_estimator_profile_digest",
-        "train_update_id",
-        "behavior_model",
-        "item_ids",
-        "stats",
-        "sample_count",
-        "train_updates",
-        "trained_samples",
-        "retention",
-    }
-    WIRE_MANIFEST_KEYS = {
-        "manifest_schema_version",
-        "contract",
-        "identity",
-        "observation_schema",
-        "action_schema",
-        "model_architecture_id",
-        "tensor_dtype",
-        "input_shape",
-        "action_shape",
-        "value_shape",
-        "artifact_uri",
-        "model_file",
-        "size_bytes",
-        "seed",
-        "train_updates",
-        "trained_samples",
-        "training_config_digest",
-        "training_semantics",
-        "rollout_estimator_profile",
-        "published_at_unix_ms",
-        "ready",
-    }
-
     def __init__(self, config: dict):
         validate_config(config)
         model = config["model"]
+        training_contract_document = training_contract(config)
         self.config = config
-        self.seed = int(model["bootstrap_seed"])
-        self.obs_dim = int(model["obs_dim"])
-        self.action_dim = int(model["action_dim"])
-        self.tensor_dtype = str(model["tensor_dtype"])
-        self.contract = contract_identity(config)
-        self.semantics = training_semantics(config)
+        self.obs_dim = int(training_contract_document["observation_dimension"])
+        self.action_dim = int(training_contract_document["action_count"])
+        self.training_contract_digest = training_contract_digest(config)
         self.rollout_profile = rollout_estimator_profile(config)
         self.training_digest = training_config_digest(config)
         self.lineage_id = str(config["identity"]["model_lineage_id"])
@@ -467,18 +443,12 @@ class ModelPublisher:
     def publication_path(self, step: int) -> Path:
         return self.publication_dir / self.step_name(step)
 
-    def metadata_path(self, step: int) -> Path:
-        return self.publication_path(step) / self.METADATA_FILE
-
     def receipt_path(self, train_update_id: str) -> Path:
         return self.update_dir / f"{train_update_id}.json"
 
     @staticmethod
     def _load_checkpoint(path: Path) -> dict:
-        try:
-            return torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            return torch.load(path, map_location="cpu")
+        return PPOTrainer.read_checkpoint(str(path), "cpu")
 
     def load_initial_model(
         self, trainer: PPOTrainer, model_value: str
@@ -530,12 +500,6 @@ class ModelPublisher:
             "train_updates": int(train_updates),
             "trained_samples": int(trained_samples),
             "model_lineage_id": self.lineage_id,
-            "observation_schema": schema_document(
-                self.semantics.observation_schema
-            ),
-            "action_schema": schema_document(self.semantics.action_schema),
-            "model_architecture_id": self.semantics.model_architecture_id,
-            "tensor_dtype": self.tensor_dtype,
             "training_config_digest": self.training_digest.hex,
             "rollout_estimator_profile_digest": (
                 self.rollout_profile.profile_digest.hex
@@ -637,7 +601,6 @@ class ModelPublisher:
         temporary.mkdir(parents=False, exist_ok=False)
         temporary_model = temporary / self.MODEL_FILE
         temporary_manifest = temporary / self.MANIFEST_FILE
-        temporary_metadata = temporary / self.METADATA_FILE
         private_checkpoint = self.checkpoint_path(step)
         checkpoint_existed = (
             private_checkpoint.exists() or private_checkpoint.is_symlink()
@@ -688,75 +651,33 @@ class ModelPublisher:
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
             artifact_digest = sha256_file(temporary_model)
-            final_model_path = self.model_path(step)
-            document = {
-                "manifest_schema_version": 3,
-                "contract": contract_document(self.contract),
-                "identity": {
-                    "model_lineage_id": self.lineage_id,
-                    "model_step": step,
-                    "artifact_digest": artifact_digest,
-                    "manifest_digest": "0" * 64,
-                },
-                "observation_schema": schema_document(
-                    self.semantics.observation_schema
+            manifest = training_pb2.ModelArtifactManifest(
+                identity=training_pb2.ModelIdentity(
+                    model_lineage_id=self.lineage_id,
+                    model_step=step,
+                    artifact_digest=content_digest(artifact_digest),
                 ),
-                "action_schema": schema_document(
-                    self.semantics.action_schema
-                ),
-                "model_architecture_id": self.semantics.model_architecture_id,
-                "tensor_dtype": self.tensor_dtype,
-                "input_shape": [1, self.obs_dim],
-                "action_shape": [1, self.action_dim],
-                "value_shape": [1, 1],
-                "artifact_uri": final_model_path.as_uri(),
-                "model_file": self.MODEL_FILE,
-                "size_bytes": temporary_model.stat().st_size,
-                "seed": self.seed,
-                "train_updates": int(train_updates),
-                "trained_samples": int(trained_samples),
-                "training_config_digest": self.training_digest.hex,
-                "training_semantics": semantics_document(self.semantics),
-                "rollout_estimator_profile": (
-                    rollout_estimator_profile_document(self.rollout_profile)
-                ),
-                "published_at_unix_ms": int(time.time() * 1000),
-                "ready": True,
-            }
-            document = finalize_manifest_digest(document)
+                size_bytes=temporary_model.stat().st_size,
+                trained_samples=int(trained_samples),
+                training_config_digest=self.training_digest,
+                training_contract_digest=self.training_contract_digest,
+                published_at_unix_ms=int(time.time() * 1000),
+                rollout_estimator_profile=self.rollout_profile,
+            )
+            manifest = finalize_manifest(manifest)
+            identity = model_identity_document(manifest.identity)
             retention = self.retention_for_updates(int(train_updates))
-            local_metadata = {
-                "schema_version": 4,
-                "model_identity": document["identity"],
-                "training_config_digest": self.training_digest.hex,
-                "rollout_estimator_profile_digest": (
-                    self.rollout_profile.profile_digest.hex
-                ),
-                "train_update_id": train_update_id,
-                "behavior_model": behavior_model or {},
-                "item_ids": list(item_ids),
-                "stats": dict(stats or {}),
-                "sample_count": int(sample_count),
-                "train_updates": int(train_updates),
-                "trained_samples": int(trained_samples),
-                "retention": retention,
-                **self.initial_model_provenance,
-            }
             runtime_document = {
-                **document,
+                "manifest": manifest,
+                "identity": identity,
                 "train_update_id": train_update_id,
                 "behavior_model": behavior_model or {},
                 "item_ids": list(item_ids),
                 "retention": retention,
                 **self.initial_model_provenance,
             }
-            atomic_write_json(temporary_manifest, document)
-            atomic_write_json(temporary_metadata, local_metadata)
-            for path in (
-                temporary_model,
-                temporary_manifest,
-                temporary_metadata,
-            ):
+            write_manifest_file(temporary_manifest, manifest)
+            for path in (temporary_model, temporary_manifest):
                 if path.is_symlink() or not path.is_file():
                     raise RuntimeError(
                         f"publication file is not a regular file: {path}"
@@ -770,7 +691,6 @@ class ModelPublisher:
             atomic_write_json(
                 self.state_path,
                 {
-                    "schema_version": 1,
                     "latest_model": runtime_document["identity"],
                     "latest_manifest": str(self.manifest_path(step)),
                     "latest_checkpoint": str(self.checkpoint_path(step)),
@@ -800,15 +720,14 @@ class ModelPublisher:
             raise
 
     def complete_manifest(
-        self, version: int, train_update_id: str | None = None
+        self, model_step: int, train_update_id: str | None = None
     ) -> dict | None:
-        publication = self.publication_path(version)
-        path = self.manifest_path(version)
-        model_path = self.model_path(version)
-        checkpoint_path = self.checkpoint_path(version)
-        metadata_path = self.metadata_path(version)
+        publication = self.publication_path(model_step)
+        path = self.manifest_path(model_step)
+        model_path = self.model_path(model_step)
+        checkpoint_path = self.checkpoint_path(model_step)
         if (
-            not self._is_canonical_publication_path(publication, version)
+            not self._is_canonical_publication_path(publication, model_step)
             or not publication.is_dir()
         ):
             return None
@@ -819,7 +738,6 @@ class ModelPublisher:
         required = {
             self.MODEL_FILE,
             self.MANIFEST_FILE,
-            self.METADATA_FILE,
         }
         if set(entries) != required or any(
             entry.is_symlink() or not entry.is_file()
@@ -827,146 +745,86 @@ class ModelPublisher:
         ):
             return None
         try:
-            document = read_json(path)
-            local_metadata = read_json(metadata_path)
+            manifest = read_manifest_file(path)
             if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
                 return None
             checkpoint = self._load_checkpoint(checkpoint_path)
-            if set(document) != self.WIRE_MANIFEST_KEYS:
-                return None
-            expected = finalize_manifest_digest(document)
             artifact_digest = sha256_file(model_path)
             model_size = model_path.stat().st_size
         except (OSError, ValueError, KeyError, RuntimeError, TypeError):
             return None
         metadata = checkpoint.get("metadata", {})
-        if not isinstance(local_metadata, dict):
+        if not isinstance(metadata, dict):
             return None
-        local_metadata_keys = set(local_metadata)
-        if local_metadata_keys not in (
-            self.LOCAL_METADATA_KEYS,
-            self.LOCAL_METADATA_KEYS | set(self.PROVENANCE_KEYS),
+        metadata_keys = {
+            "train_update_id",
+            "behavior_model",
+            "item_ids",
+            "stats",
+            "sample_count",
+            "train_updates",
+            "trained_samples",
+            "model_lineage_id",
+            "training_config_digest",
+            "rollout_estimator_profile_digest",
+        }
+        if set(metadata) not in (
+            metadata_keys,
+            metadata_keys | set(self.PROVENANCE_KEYS),
         ):
             return None
-        retention = self.retention_for_updates(
-            int(local_metadata.get("train_updates", -1))
-        )
-        expected_checkpoint_metadata = {
-            "train_update_id": local_metadata.get("train_update_id"),
-            "behavior_model": local_metadata.get("behavior_model", {}),
-            "item_ids": local_metadata.get("item_ids", []),
-            "stats": local_metadata.get("stats", {}),
-            "sample_count": local_metadata.get("sample_count"),
-            "train_updates": local_metadata.get("train_updates"),
-            "trained_samples": local_metadata.get("trained_samples"),
-            "model_lineage_id": self.lineage_id,
-            "observation_schema": schema_document(
-                self.semantics.observation_schema
-            ),
-            "action_schema": schema_document(self.semantics.action_schema),
-            "model_architecture_id": self.semantics.model_architecture_id,
-            "tensor_dtype": self.tensor_dtype,
-            "training_config_digest": self.training_digest.hex,
-            "rollout_estimator_profile_digest": (
-                self.rollout_profile.profile_digest.hex
-            ),
-            **{
-                key: local_metadata[key]
-                for key in self.PROVENANCE_KEYS
-                if key in local_metadata
-            },
-        }
         if (
-            document.get("manifest_schema_version") != 3
-            or document.get("contract") != contract_document(self.contract)
-            or document.get("identity", {}).get("model_lineage_id")
-            != self.lineage_id
-            or document.get("identity", {}).get("model_step") != version
-            or document.get("identity", {}).get("model_step")
-            != document.get("train_updates")
-            or document.get("identity", {}).get("artifact_digest")
-            != artifact_digest
-            or document.get("identity", {}).get("manifest_digest")
-            != expected["identity"]["manifest_digest"]
-            or document.get("artifact_uri") != model_path.as_uri()
-            or document.get("model_file") != self.MODEL_FILE
-            or document.get("size_bytes") != model_size
-            or document.get("training_semantics")
-            != semantics_document(self.semantics)
-            or document.get("observation_schema")
-            != schema_document(self.semantics.observation_schema)
-            or document.get("action_schema")
-            != schema_document(self.semantics.action_schema)
-            or document.get("model_architecture_id")
-            != self.semantics.model_architecture_id
-            or document.get("tensor_dtype") != self.tensor_dtype
-            or document.get("input_shape") != [1, self.obs_dim]
-            or document.get("action_shape") != [1, self.action_dim]
-            or document.get("value_shape") != [1, 1]
-            or document.get("seed") != self.seed
-            or document.get("training_config_digest")
-            != self.training_digest.hex
-            or document.get("rollout_estimator_profile")
-            != rollout_estimator_profile_document(self.rollout_profile)
-            or not document.get("ready")
-            or checkpoint.get("model_step") != version
-            or metadata != expected_checkpoint_metadata
-            or local_metadata.get("schema_version") != 4
-            or local_metadata.get("model_identity") != document.get("identity")
-            or local_metadata.get("training_config_digest")
-            != document.get("training_config_digest")
-            or local_metadata.get("training_config_digest")
-            != metadata.get("training_config_digest")
-            or local_metadata.get("rollout_estimator_profile_digest")
-            != self.rollout_profile.profile_digest.hex
-            or local_metadata.get("rollout_estimator_profile_digest")
-            != metadata.get("rollout_estimator_profile_digest")
-            or local_metadata.get("train_updates")
-            != document.get("train_updates")
-            or local_metadata.get("train_updates") != version
-            or local_metadata.get("trained_samples")
-            != document.get("trained_samples")
-            or local_metadata.get("behavior_model")
-            != metadata.get("behavior_model")
-            or local_metadata.get("item_ids") != metadata.get("item_ids")
-            or local_metadata.get("stats") != metadata.get("stats")
-            or local_metadata.get("sample_count")
-            != metadata.get("sample_count")
-            or local_metadata.get("train_updates")
-            != metadata.get("train_updates")
-            or local_metadata.get("trained_samples")
-            != metadata.get("trained_samples")
-            or local_metadata.get("retention") != retention
+            not _same_message(
+                manifest.training_contract_digest,
+                self.training_contract_digest,
+            )
+            or not _same_message(
+                manifest.training_config_digest, self.training_digest
+            )
+            or not _same_message(
+                manifest.rollout_estimator_profile, self.rollout_profile
+            )
+            or manifest.identity.model_lineage_id != self.lineage_id
+            or not manifest.identity.HasField("model_step")
+            or int(manifest.identity.model_step) != model_step
+            or manifest.identity.artifact_digest.hex != artifact_digest
+            or int(manifest.size_bytes) != model_size
+            or int(manifest.published_at_unix_ms) <= 0
+            or checkpoint.get("model_step") != model_step
+            or not metadata.get("train_update_id")
+            or not isinstance(metadata.get("behavior_model"), dict)
+            or not isinstance(metadata.get("item_ids"), list)
+            or not all(
+                isinstance(item_id, str) and item_id
+                for item_id in metadata.get("item_ids", [])
+            )
+            or not isinstance(metadata.get("stats"), dict)
+            or int(metadata.get("sample_count", -1)) < 0
+            or int(metadata.get("train_updates", -1)) != model_step
+            or int(metadata.get("trained_samples", -1))
+            != int(manifest.trained_samples)
             or metadata.get("model_lineage_id") != self.lineage_id
-            or metadata.get("observation_schema")
-            != schema_document(self.semantics.observation_schema)
-            or metadata.get("action_schema")
-            != schema_document(self.semantics.action_schema)
-            or metadata.get("model_architecture_id")
-            != self.semantics.model_architecture_id
-            or metadata.get("tensor_dtype") != self.tensor_dtype
             or metadata.get("training_config_digest")
             != self.training_digest.hex
-            or any(
-                local_metadata.get(key) != metadata.get(key)
-                for key in self.PROVENANCE_KEYS
-            )
+            or metadata.get("rollout_estimator_profile_digest")
+            != self.rollout_profile.profile_digest.hex
             or (
                 train_update_id is not None
-                and local_metadata.get("train_update_id") != train_update_id
+                and metadata.get("train_update_id") != train_update_id
             )
         ):
             return None
         return {
-            **document,
-            "train_update_id": local_metadata["train_update_id"],
-            "behavior_model": local_metadata.get("behavior_model", {}),
-            "item_ids": local_metadata.get("item_ids", []),
-            "retention": retention,
+            "manifest": manifest,
+            "identity": model_identity_document(manifest.identity),
+            "train_update_id": metadata["train_update_id"],
+            "behavior_model": metadata.get("behavior_model", {}),
+            "item_ids": metadata.get("item_ids", []),
+            "retention": self.retention_for_updates(model_step),
             **{
-                key: local_metadata[key]
+                key: metadata[key]
                 for key in self.PROVENANCE_KEYS
-                if key in local_metadata
+                if key in metadata
             },
         }
 
@@ -996,8 +854,8 @@ class ModelPublisher:
         manifests = self.complete_manifests()
         if not manifests:
             return None
-        version = int(manifests[-1]["identity"]["model_step"])
-        return self.checkpoint_path(version)
+        model_step = int(manifests[-1]["identity"]["model_step"])
+        return self.checkpoint_path(model_step)
 
     def should_mark_permanent(self, run_train_updates: int) -> bool:
         return (
@@ -1010,20 +868,20 @@ class ModelPublisher:
             return {"class": "permanent", "reason": "interval"}
         return {"class": "rolling", "reason": ""}
 
-    def remove_publication_for_rollback(self, version: int) -> None:
-        target = self.publication_path(version)
+    def remove_publication_for_rollback(self, model_step: int) -> None:
+        target = self.publication_path(model_step)
         if not target.exists():
             return
-        manifest = self.complete_manifest(version)
+        manifest = self.complete_manifest(model_step)
         if (
             manifest is None
-            or not self._is_canonical_publication_path(target, version)
+            or not self._is_canonical_publication_path(target, model_step)
         ):
             raise RuntimeError(
                 f"refusing to rollback unverified publication: {target}"
             )
         quarantine = self.publication_dir / (
-            f".rollback-delete-{self.step_name(version)}-"
+            f".rollback-delete-{self.step_name(model_step)}-"
             f"{os.getpid()}-{time.time_ns()}"
         )
         os.replace(target, quarantine)
@@ -1040,13 +898,13 @@ class ModelPublisher:
             0,
             current - self.publication_retention_steps + 1,
         )
-        protected = {int(version) for version in protected_steps}
+        protected = {int(step) for step in protected_steps}
         protected.add(current)
         removed: list[int] = []
-        for version, target in self._canonical_step_directories():
-            if version >= minimum or version in protected:
+        for model_step, target in self._canonical_step_directories():
+            if model_step >= minimum or model_step in protected:
                 continue
-            verified = self.complete_manifest(version)
+            verified = self.complete_manifest(model_step)
             if verified is None:
                 raise RuntimeError(
                     f"refusing to prune unverified publication: {target}"
@@ -1055,34 +913,34 @@ class ModelPublisher:
                 continue
             if (
                 verified.get("retention", {}).get("class") != "rolling"
-                or not self._is_canonical_publication_path(target, version)
+                or not self._is_canonical_publication_path(target, model_step)
             ):
                 raise RuntimeError(
                     f"refusing to prune invalid publication: {target}"
                 )
             quarantine = self.publication_dir / (
-                f".prune-{self.step_name(version)}-"
+                f".prune-{self.step_name(model_step)}-"
                 f"{os.getpid()}-{time.time_ns()}"
             )
             os.replace(target, quarantine)
             self._fsync_directory(self.publication_dir)
             if (
                 self._private_publication_directory_step(quarantine)
-                != version
+                != model_step
             ):
                 raise RuntimeError(
                     f"prune quarantine identity mismatch: {quarantine}"
                 )
             shutil.rmtree(quarantine)
             self._fsync_directory(self.publication_dir)
-            checkpoint_path = self.checkpoint_path(version)
+            checkpoint_path = self.checkpoint_path(model_step)
             if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
                 raise RuntimeError(
                     f"private checkpoint disappeared during pruning: {checkpoint_path}"
                 )
             checkpoint_path.unlink()
             self._fsync_directory(self.checkpoint_dir)
-            removed.append(version)
+            removed.append(model_step)
         return removed
 
 
@@ -1121,11 +979,6 @@ class LeaseRenewer:
                 training_pb2.DELIVERY_RESULT_APPLIED,
                 training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
             )
-            if (response.ret_code == 0) != positive_result:
-                raise RuntimeError(
-                    "lease renewal response is contradictory: "
-                    f"ret_code={response.ret_code}, result={response.result}"
-                )
             if not positive_result:
                 raise RuntimeError(response.message or "lease renewal rejected")
             if response.delivery_id != self.request.delivery_id:
@@ -1182,8 +1035,7 @@ class TrainingRuntime:
             json.dumps(effective_config_log(config), sort_keys=True),
         )
         self.contract = contract_identity(config)
-        self.semantics = training_semantics(config)
-        self.policy_digest = policy_spec_digest(config)
+        self.training_contract_digest = training_contract_digest(config)
         self.rollout_profile = rollout_estimator_profile(config)
         self.trainer = PPOTrainer(config)
         self.publisher = ModelPublisher(config)
@@ -1317,8 +1169,6 @@ class TrainingRuntime:
             config["metric_events"]["aiserver_relay_enabled"]
         )
         self._metric_event_disabled_reason = ""
-        self._metric_event_write_failure_count = 0
-        self._metric_event_write_failure_started_at = 0.0
         self._initialize_metric_events()
 
     def _create_metrics_backend(self, backend_type: str, metrics_dir: str):
@@ -1371,15 +1221,12 @@ class TrainingRuntime:
             if store is not None:
                 try:
                     store.close()
-                except Exception:
-                    pass
-            self._metric_event_disabled_reason = str(error)
-            self.logger.error(
-                "immutable metric-event persistence unavailable; PPO training "
-                "continues with this source marked unavailable: %s",
-                error,
-            )
-            return
+                except Exception as close_error:
+                    raise RuntimeError(
+                        "metric-event initialization and store cleanup failed: "
+                        f"{close_error}"
+                    ) from error
+            raise
         self.metric_event_store = store
         self.metric_event_writer = writer
         self.metric_event_relay = relay
@@ -1430,11 +1277,7 @@ class TrainingRuntime:
         relay = getattr(self, "metric_event_relay", None)
         if relay is None:
             return
-        try:
-            relay.start()
-        except Exception as error:
-            self._metric_event_disabled_reason = str(error)
-            self.logger.error("metric-event relay start failed: %s", error)
+        relay.start()
 
     def _stop_metric_events(self) -> None:
         writer = getattr(self, "metric_event_writer", None)
@@ -1540,35 +1383,6 @@ class TrainingRuntime:
             return {"status": "incomplete", "reason": str(error)}
 
     @staticmethod
-    def _manifest_for_wire(document: dict) -> dict:
-        return {
-            key: document[key]
-            for key in (
-                "manifest_schema_version",
-                "contract",
-                "identity",
-                "observation_schema",
-                "action_schema",
-                "model_architecture_id",
-                "tensor_dtype",
-                "input_shape",
-                "action_shape",
-                "value_shape",
-                "artifact_uri",
-                "model_file",
-                "size_bytes",
-                "seed",
-                "train_updates",
-                "trained_samples",
-                "training_config_digest",
-                "training_semantics",
-                "rollout_estimator_profile",
-                "published_at_unix_ms",
-                "ready",
-            )
-        }
-
-    @staticmethod
     def _model_distributor_authority(
         authority: common_pb2.ServiceInstanceIdentity,
     ) -> common_pb2.ServiceInstanceIdentity:
@@ -1670,7 +1484,7 @@ class TrainingRuntime:
     def _validate_model_manifest_available_range(
         cls,
         response,
-        manifest_version: int,
+        model_step: int,
         *,
         latest_selector: bool,
     ) -> tuple[int, int]:
@@ -1678,15 +1492,15 @@ class TrainingRuntime:
             response, "available_floor_model_step"
         ) or not cls._has_field(response, "latest_available_model_step"):
             raise RuntimeError(
-                "model manifest response is missing the 0.14 available range"
+                "model manifest response is missing the available range"
             )
         floor = int(response.available_floor_model_step)
         latest = int(response.latest_available_model_step)
         if (
             floor < 0
             or floor > latest
-            or not floor <= int(manifest_version) <= latest
-            or (latest_selector and int(manifest_version) != latest)
+            or not floor <= int(model_step) <= latest
+            or (latest_selector and int(model_step) != latest)
         ):
             raise RuntimeError(
                 "model manifest response has an incoherent available range"
@@ -1710,7 +1524,7 @@ class TrainingRuntime:
             return None
         if not has_floor or not has_latest:
             raise RuntimeError(
-                "model status is missing the 0.14 available range"
+                "model status is missing the available range"
             )
         floor = int(status.available_floor_model_step)
         latest = int(status.latest_available_model_step)
@@ -1729,19 +1543,19 @@ class TrainingRuntime:
         self,
         *,
         pinned_authority: common_pb2.ServiceInstanceIdentity,
-        version: int | None = None,
+        model_step: int | None = None,
         latest: bool = False,
     ) -> tuple[
         training_pb2.ModelArtifactManifest | None,
         common_pb2.ServiceInstanceIdentity,
     ]:
-        if latest == (version is not None):
+        if latest == (model_step is not None):
             raise ValueError(
                 "initial model lookup requires exactly one selector"
             )
         selector = training_pb2.ModelIdentity(
             model_lineage_id=self.publisher.lineage_id,
-            model_step=0 if version is None else int(version),
+            model_step=0 if model_step is None else int(model_step),
         )
         try:
             response = self.model_stub.GetModelManifest(
@@ -1768,11 +1582,10 @@ class TrainingRuntime:
             manifest_present = response.HasField("manifest")
         except (AttributeError, ValueError):
             manifest_present = getattr(response, "manifest", None) is not None
-        if response.ret_code != 0:
+        if response.result == training_pb2.MODEL_LOOKUP_RESULT_NOT_FOUND:
             if manifest_present:
                 raise RuntimeError(
-                    "initial model preflight returned a manifest with a "
-                    "negative ret_code"
+                    "initial model preflight returned NOT_FOUND with a manifest"
                 )
             if not self._same_authority(
                 response_authority, pinned_authority
@@ -1782,9 +1595,13 @@ class TrainingRuntime:
                     "authority changed"
                 )
             return None, response_authority
+        if response.result != training_pb2.MODEL_LOOKUP_RESULT_FOUND:
+            raise RuntimeError(
+                response.message or "initial model preflight was rejected"
+            )
         if not manifest_present:
             raise RuntimeError(
-                "initial model preflight returned success without a manifest"
+                "initial model preflight returned FOUND without a manifest"
             )
         manifest = response.manifest
         identity = manifest.identity
@@ -1794,11 +1611,9 @@ class TrainingRuntime:
             latest_selector=latest,
         )
         if (
-            not manifest.ready
-            or int(manifest.manifest_schema_version) != 3
-            or not _same_message(manifest.contract, self.contract)
-            or not _same_message(
-                manifest.training_semantics, self.semantics
+            not _same_message(
+                manifest.training_contract_digest,
+                self.training_contract_digest,
             )
             or not _same_message(
                 manifest.training_config_digest,
@@ -1806,18 +1621,18 @@ class TrainingRuntime:
             )
             or not _same_message(
                 manifest.rollout_estimator_profile,
-                self.rollout_profile,
-            )
-            or not _same_message(
-                manifest.rollout_estimator_profile,
                 self.publisher.rollout_profile,
             )
             or identity.model_lineage_id != self.publisher.lineage_id
             or not self._has_field(identity, "model_step")
-            or (version is not None and int(identity.model_step) != version)
+            or (
+                model_step is not None
+                and int(identity.model_step) != model_step
+            )
             or not identity.artifact_digest.hex
             or not identity.manifest_digest.hex
-            or int(identity.model_step) != int(manifest.train_updates)
+            or int(manifest.size_bytes) <= 0
+            or int(manifest.published_at_unix_ms) <= 0
         ):
             raise RuntimeError(
                 "initial model preflight returned an incompatible manifest"
@@ -1858,7 +1673,7 @@ class TrainingRuntime:
         document: dict,
         pinned_authority: common_pb2.ServiceInstanceIdentity,
     ) -> tuple[bool, common_pb2.ServiceInstanceIdentity]:
-        expected = manifest_message(self._manifest_for_wire(document))
+        expected = document["manifest"]
         target_step = int(expected.identity.model_step)
         latest, latest_authority = self._lookup_initial_model_manifest(
             pinned_authority=pinned_authority,
@@ -1880,7 +1695,7 @@ class TrainingRuntime:
 
         target, target_authority = self._lookup_initial_model_manifest(
             pinned_authority=pinned_authority,
-            version=target_step,
+            model_step=target_step,
         )
         if target is None:
             return True, target_authority
@@ -1894,9 +1709,14 @@ class TrainingRuntime:
     def _register(
         self, document: dict
     ) -> common_pb2.ServiceInstanceIdentity:
+        expected = document["manifest"]
         response = self.model_stub.RegisterModel(
             training_pb2.RegisterModelReq(
-                manifest=manifest_message(self._manifest_for_wire(document))
+                manifest=expected,
+                contract=self.contract,
+                local_artifact_path=str(
+                    self.publisher.model_path(int(expected.identity.model_step))
+                ),
             ),
             timeout=5.0,
         )
@@ -1904,16 +1724,10 @@ class TrainingRuntime:
             training_pb2.MODEL_REGISTER_RESULT_REGISTERED,
             training_pb2.MODEL_REGISTER_RESULT_ALREADY_REGISTERED,
         )
-        if (response.ret_code == 0) != positive_result:
-            raise _UpdateCommitOutcomeUncertain(
-                "model registration response is contradictory: "
-                f"ret_code={response.ret_code}, result={response.result}"
-            )
         if not positive_result:
             raise RuntimeError(
                 f"model registration rejected: {response.message}"
             )
-        expected = manifest_message(self._manifest_for_wire(document))
         if not _same_message(response.manifest, expected):
             raise RuntimeError("model distributor returned a different manifest")
         try:
@@ -1930,7 +1744,7 @@ class TrainingRuntime:
     ) -> tuple[
         bool | None, common_pb2.ServiceInstanceIdentity | None
     ]:
-        expected = manifest_message(self._manifest_for_wire(document))
+        expected = document["manifest"]
         try:
             response = self.model_stub.GetModelManifest(
                 training_pb2.GetModelManifestReq(
@@ -1949,15 +1763,14 @@ class TrainingRuntime:
             raise _UpdateCommitOutcomeUncertain(
                 "exact model lookup has invalid distributor authority"
             ) from error
-        if response.ret_code != 0:
+        if response.result == training_pb2.MODEL_LOOKUP_RESULT_NOT_FOUND:
             try:
                 manifest_present = response.HasField("manifest")
             except (AttributeError, ValueError):
                 manifest_present = getattr(response, "manifest", None) is not None
             if manifest_present:
                 raise _UpdateCommitOutcomeUncertain(
-                    "exact model lookup returned a manifest with a negative "
-                    "ret_code"
+                    "exact model lookup returned NOT_FOUND with a manifest"
                 )
             if not self._same_authority(
                 response_authority, pinned_authority
@@ -1966,6 +1779,10 @@ class TrainingRuntime:
                     "model distributor authority changed before exact absence"
                 )
             return False, response_authority
+        if response.result != training_pb2.MODEL_LOOKUP_RESULT_FOUND:
+            raise _UpdateCommitOutcomeUncertain(
+                response.message or "exact model lookup was rejected"
+            )
         if not _same_message(response.manifest, expected):
             raise _UpdateCommitOutcomeUncertain(
                 "model distributor returned a conflicting exact identity"
@@ -2042,7 +1859,7 @@ class TrainingRuntime:
         ) from last_error
 
     def _wait_initial_model_loaded(self, document: dict) -> bool:
-        expected = manifest_message(self._manifest_for_wire(document)).identity
+        expected = document["manifest"].identity
         deadline = (
             None
             if self.initial_model_ack_timeout is None
@@ -2107,16 +1924,16 @@ class TrainingRuntime:
         )
 
     def _initialize_models(self) -> bool:
-        version = self.trainer.model_step
+        model_step = self.trainer.model_step
         self.initial_model_step = 0
         update_id = (
-            "inherited-bootstrap-v0"
+            "inherited-bootstrap"
             if self._startup_mode == "inherited-weights"
-            else "bootstrap-v0"
+            else "bootstrap"
         )
         pinned_authority = self._pin_model_distributor_authority()
         pinned_authority = self._assert_initial_latest_not_newer(
-            version, pinned_authority
+            model_step, pinned_authority
         )
         document = self.publisher.publish_runtime(
             self.trainer,
@@ -2137,12 +1954,12 @@ class TrainingRuntime:
                 lambda: "",
                 pinned_authority,
             )
-        self.model_manifests[version] = document
+        self.model_manifests[model_step] = document
         if not self._wait_initial_model_loaded(document):
             self.logger.info(
                 "Learner bootstrap published and registered; stopping before "
                 "AIServer activation: model_step=%d artifact=%s",
-                version,
+                model_step,
                 document["identity"]["artifact_digest"],
             )
             return False
@@ -2158,7 +1975,7 @@ class TrainingRuntime:
         )
         self.logger.info(
             "Learner training ready: model_step=%d artifact=%s startup=%s",
-            version,
+            model_step,
             document["identity"]["artifact_digest"],
             self._startup_mode,
         )
@@ -2291,14 +2108,13 @@ class TrainingRuntime:
         if not isinstance(document, dict):
             return None
         try:
-            manifest = manifest_message(self._manifest_for_wire(document))
+            manifest = document["manifest"]
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
         if (
-            not manifest.ready
-            or not _same_message(manifest.contract, self.contract)
-            or not _same_message(
-                manifest.training_semantics, self.semantics
+            not _same_message(
+                manifest.training_contract_digest,
+                self.training_contract_digest,
             )
             or not _same_message(
                 manifest.training_config_digest,
@@ -2308,7 +2124,6 @@ class TrainingRuntime:
             != self.publisher.lineage_id
             or not self._has_field(manifest.identity, "model_step")
             or int(manifest.identity.model_step) != int(step)
-            or int(manifest.identity.model_step) != int(manifest.train_updates)
         ):
             return None
         return manifest.identity
@@ -2485,9 +2300,8 @@ class TrainingRuntime:
                 timeout_ms=self.get_timeout_ms,
                 consumer=self.learner_service,
                 lease_timeout_ms=self.lease_timeout_ms,
-                required_semantics=self.semantics,
-                required_rollout_estimator_profile_digest=(
-                    self.rollout_profile.profile_digest
+                required_training_contract_digest=(
+                    self.training_contract_digest
                 ),
             ),
             timeout=max(2.0, self.get_timeout_ms / 1000.0 + 1.0),
@@ -2505,12 +2319,11 @@ class TrainingRuntime:
                     ready_authority
                 )
             if (
-                response.ret_code == 0
-                or not self._same_authority(
+                not self._same_authority(
                     response_authority, ready_authority
                 )
-                or int(response.leased_transitions) <= 0
                 or bool(response.delivery_id)
+                or int(response.lease_deadline_unix_ms) != 0
                 or len(response.items) != 0
             ):
                 raise RuntimeError(
@@ -2518,6 +2331,24 @@ class TrainingRuntime:
                 )
             return response
         if response.result != training_pb2.GET_BATCH_RESULT_LEASED:
+            response_authority = self._sample_pool_authority(
+                response.sample_pool
+            )
+            if ready_authority is not None and not self._same_authority(
+                response_authority,
+                self._sample_pool_authority(ready_authority),
+            ):
+                raise RuntimeError(
+                    "sample pool authority changed during GetBatch"
+                )
+            if (
+                response.delivery_id
+                or int(response.lease_deadline_unix_ms) != 0
+                or response.items
+            ):
+                raise RuntimeError(
+                    "sample pool returned a non-leased result with lease payload"
+                )
             return response
         if ready_authority is None:
             ready_authority = self._ready_sample_pool_authority(
@@ -2531,14 +2362,10 @@ class TrainingRuntime:
             response.sample_pool
         )
         if (
-            response.ret_code != 0
-            or not self._same_authority(
+            not self._same_authority(
                 response_authority, ready_authority
             )
             or not response.delivery_id
-            or int(response.actual_transition_count) != self.train_batch_size
-            or int(response.returned_transitions) != self.train_batch_size
-            or int(response.leased_transitions) != self.train_batch_size
             or len(response.items) != self.train_batch_size
             or int(response.lease_deadline_unix_ms)
             <= int(time.time() * 1000)
@@ -2592,129 +2419,32 @@ class TrainingRuntime:
             return None
         return response
 
-    @staticmethod
-    def _valid_sha256_digest(digest: common_pb2.ContentDigest) -> bool:
-        return (
-            digest.algorithm == common_pb2.DIGEST_ALGORITHM_SHA256
-            and len(digest.hex) == 64
-            and all(character in "0123456789abcdef" for character in digest.hex)
-        )
-
     def _validate_transition(
         self, transition: training_pb2.ProcessedTransition
     ) -> None:
         values = [
             *transition.observation,
-            *transition.next_observation,
-            transition.reward,
             transition.behavior_log_probability,
             transition.behavior_value,
             transition.advantage,
             transition.value_target,
         ]
-        if self._has_field(transition, "bootstrap_value"):
-            values.append(transition.bootstrap_value)
         if not all(math.isfinite(value) for value in values):
             raise ValueError("processed transition contains non-finite values")
         if (
             not transition.item_id
-            or not transition.environment_session_id
-            or not transition.episode_id
-            or not transition.segment_id
-            or int(transition.segment_transition_count) <= 0
-            or int(transition.transition_index)
-            >= int(transition.segment_transition_count)
+            or not self._has_field(transition, "behavior_model_step")
+            or int(transition.behavior_model_step) > int(self.trainer.model_step)
             or int(transition.action) < 0
             or int(transition.action) >= self.publisher.action_dim
             or len(transition.observation) != self.publisher.obs_dim
-            or len(transition.next_observation) != self.publisher.obs_dim
             or int(transition.created_at_unix_ms) <= 0
         ):
             raise ValueError("processed transition identity or shape is invalid")
 
-        behavior = transition.behavior_policy
-        if (
-            not behavior.model_lineage_id
-            or behavior.model_lineage_id != self.publisher.lineage_id
-            or not self._has_field(behavior, "model_step")
-            or int(behavior.model_step) > int(self.trainer.model_step)
-            or behavior.distribution_schema_id
-            != self.semantics.policy_distribution_schema_id
-            or not _same_message(behavior.policy_spec_digest, self.policy_digest)
-            or not self._valid_sha256_digest(behavior.artifact_digest)
-            or not self._valid_sha256_digest(behavior.manifest_digest)
-            or not _same_message(
-                transition.rollout_estimator_profile_digest,
-                self.rollout_profile.profile_digest,
-            )
-        ):
-            raise ValueError("processed transition behavior identity is invalid")
-
-        final_index = (
-            int(transition.segment_transition_count) - 1
-        )
-        bootstrap_present = self._has_field(transition, "bootstrap_value")
-        if not transition.segment_boundary:
-            if (
-                int(transition.transition_index) == final_index
-                or transition.environment_terminal
-                or transition.end_kind
-                != training_pb2.TRANSITION_END_KIND_CONTINUING
-                or transition.segment_close_reason
-                != training_pb2.SEGMENT_CLOSE_REASON_UNSPECIFIED
-                or transition.bootstrap_applied
-                or bootstrap_present
-            ):
-                raise ValueError(
-                    "non-boundary transition has contradictory segment facts"
-                )
-            return
-
-        if int(transition.transition_index) != final_index:
-            raise ValueError("segment boundary is not the final transition")
-        terminal_reasons = {
-            training_pb2.SEGMENT_CLOSE_REASON_GOAL,
-            training_pb2.SEGMENT_CLOSE_REASON_TIME_LIMIT,
-        }
-        cut_reasons = {
-            training_pb2.SEGMENT_CLOSE_REASON_TMAX,
-            training_pb2.SEGMENT_CLOSE_REASON_CLIENT_CONTROLLED_CLOSE,
-            training_pb2.SEGMENT_CLOSE_REASON_CLIENT_RECOVERY_TIMEOUT,
-            training_pb2.SEGMENT_CLOSE_REASON_AISERVER_CONTROLLED_SHUTDOWN,
-        }
-        if transition.segment_close_reason in terminal_reasons:
-            if (
-                not transition.environment_terminal
-                or transition.end_kind
-                != training_pb2.TRANSITION_END_KIND_ENVIRONMENT_TERMINATED
-                or transition.bootstrap_applied
-                or not bootstrap_present
-                or float(transition.bootstrap_value) != 0.0
-            ):
-                raise ValueError("terminal segment has contradictory bootstrap facts")
-            return
-        if transition.segment_close_reason not in cut_reasons:
-            raise ValueError("segment boundary has an unknown close reason")
-        expected_end_kind = (
-            training_pb2.TRANSITION_END_KIND_EXTERNAL_TRUNCATION
-            if transition.segment_close_reason
-            == training_pb2.SEGMENT_CLOSE_REASON_TMAX
-            else training_pb2.TRANSITION_END_KIND_PRODUCER_ABORT
-        )
-        if (
-            transition.environment_terminal
-            or transition.end_kind != expected_end_kind
-            or not transition.bootstrap_applied
-            or not bootstrap_present
-        ):
-            raise ValueError("cut segment has contradictory bootstrap facts")
-
     def _validate_delivery(self, response) -> dict:
         if (
             response.result != training_pb2.GET_BATCH_RESULT_LEASED
-            or int(response.actual_transition_count) != self.train_batch_size
-            or int(response.returned_transitions) != self.train_batch_size
-            or int(response.leased_transitions) != self.train_batch_size
             or len(response.items) != self.train_batch_size
             or not response.delivery_id
         ):
@@ -2738,15 +2468,14 @@ class TrainingRuntime:
             ):
                 raise ValueError("sample pool item facts are invalid or duplicated")
             item_ids.add(transition.item_id)
-            behavior = transition.behavior_policy
-            step = int(behavior.model_step)
+            step = int(transition.behavior_model_step)
             behavior_steps.add(step)
-            identity = {
-                "model_lineage_id": behavior.model_lineage_id,
-                "model_step": step,
-                "artifact_digest": behavior.artifact_digest.hex,
-                "manifest_digest": behavior.manifest_digest.hex,
-            }
+            resolved = self._resolvable_model_identity(step)
+            if resolved is None:
+                raise ValueError(
+                    "processed transition behavior model is not locally resolvable"
+                )
+            identity = model_identity_document(resolved)
             previous = behavior_models.setdefault(step, identity)
             if previous != identity:
                 raise ValueError(
@@ -2760,21 +2489,6 @@ class TrainingRuntime:
         maximum_step = max(behavior_steps)
         oldest_created_at = min(transition_created_at)
         newest_created_at = max(transition_created_at)
-        if (
-            not self._has_field(response, "minimum_behavior_model_step")
-            or not self._has_field(response, "maximum_behavior_model_step")
-            or response.minimum_behavior_model_step != minimum_step
-            or response.maximum_behavior_model_step != maximum_step
-            or not self._has_field(
-                response, "oldest_transition_created_at_unix_ms"
-            )
-            or not self._has_field(
-                response, "newest_transition_created_at_unix_ms"
-            )
-            or response.oldest_transition_created_at_unix_ms != oldest_created_at
-            or response.newest_transition_created_at_unix_ms != newest_created_at
-        ):
-            raise ValueError("delivery summary does not match transition facts")
         return {
             "model_lineage_id": self.publisher.lineage_id,
             "minimum_model_step": minimum_step,
@@ -2788,31 +2502,6 @@ class TrainingRuntime:
             "draw_count_minimum": min(draw_counts),
             "draw_count_maximum": max(draw_counts),
         }
-
-    @staticmethod
-    def _training_samples(items) -> list[dict]:
-        return [
-            {
-                "observation": list(item.transition.observation),
-                "next_observation": list(item.transition.next_observation),
-                "action": int(item.transition.action),
-                "reward": float(item.transition.reward),
-                "old_log_probability": float(
-                    item.transition.behavior_log_probability
-                ),
-                "old_value_prediction": float(
-                    item.transition.behavior_value
-                ),
-                "advantage": float(item.transition.advantage),
-                "value_target": float(item.transition.value_target),
-                "action_step": int(item.transition.action_step),
-                "behavior_model_step": int(
-                    item.transition.behavior_policy.model_step
-                ),
-                "item_id": item.transition.item_id,
-            }
-            for item in items
-        ]
 
     def _ack(
         self,
@@ -2834,11 +2523,6 @@ class TrainingRuntime:
             training_pb2.DELIVERY_RESULT_APPLIED,
             training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
         )
-        if (response.ret_code == 0) != positive_result:
-            raise _UpdateCommitOutcomeUncertain(
-                "sample ACK response is contradictory: "
-                f"ret_code={response.ret_code}, result={response.result}"
-            )
         if not positive_result:
             if response.delivery_id != delivery_id:
                 raise _UpdateCommitOutcomeUncertain(
@@ -3046,17 +2730,16 @@ class TrainingRuntime:
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
         item_ids = [item.transition.item_id for item in response.items]
-        pool_draw_slot_count = int(response.actual_transition_count)
+        pool_draw_slot_count = len(response.items)
         unique_item_count = len(set(item_ids))
         duplicate_item_slot_count = len(item_ids) - unique_item_count
         receipt = {
-            "schema_version": 2,
             "train_update_id": update_id,
             "delivery_id": response.delivery_id,
             "behavior_model": behavior_identity,
             "item_ids": item_ids,
             "state": "LEASED",
-            "transition_count": int(response.actual_transition_count),
+            "transition_count": len(response.items),
             "pool_draw_slot_count": pool_draw_slot_count,
             "unique_item_count": unique_item_count,
             "duplicate_item_slot_count": duplicate_item_slot_count,
@@ -3094,8 +2777,9 @@ class TrainingRuntime:
                 raise RuntimeError(
                     f"pre-update rollback capture failed: {error}"
                 ) from error
-            training_samples = self._training_samples(response.items)
-            stats = self.trainer.train_on_batch(training_samples)
+            training_samples, stats = train_processed_delivery(
+                response.items, self.trainer
+            )
             sample_evaluation_count = int(stats["sample_evaluation_count"])
             optimizer_step_count = int(stats["optimizer_step_count"])
             if sample_evaluation_count <= 0 or optimizer_step_count <= 0:
@@ -3208,7 +2892,7 @@ class TrainingRuntime:
                     optimizer_step_count=optimizer_step_count,
                 )
                 transaction_complete = True
-            self._record_train_update_fact_best_effort(
+            self._record_train_update_fact(
                 update_id=update_id,
                 delivery_id=response.delivery_id,
                 manifest=manifest,
@@ -3355,84 +3039,6 @@ class TrainingRuntime:
                 self._discard_update_rollback(rollback)
 
     @staticmethod
-    def _metric_snapshot(
-        snapshot: training_pb2.MetricSnapshot,
-    ) -> tuple[dict, dict, dict, dict]:
-        descriptors = {item.field_id: item for item in snapshot.descriptors}
-        values: dict[str, float] = {}
-        labels: dict[str, str] = {}
-        statistics: dict[str, dict] = {}
-        descriptor_documents: dict[str, dict] = {}
-        for item in snapshot.values:
-            descriptor = descriptors.get(item.field_id)
-            if descriptor is None:
-                raise ValueError(
-                    f"metric {item.field_id} has no descriptor"
-                )
-            value = float(item.value)
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"metric {item.field_id} has a non-finite value"
-                )
-            values[item.field_id] = value
-            labels[item.field_id] = descriptor.label
-            descriptor_documents[item.field_id] = {
-                "field_id": descriptor.field_id,
-                "label": descriptor.label,
-                "group": descriptor.group,
-                "dimension": descriptor.dimension,
-                "unit": descriptor.unit,
-                "scope": descriptor.scope,
-                "statistic": descriptor.statistic,
-                "value_kind": training_pb2.MetricValueKind.Name(
-                    descriptor.value_kind
-                ),
-                "owner_component": descriptor.owner_component,
-                "aggregation_kind": training_pb2.MetricAggregationKind.Name(
-                    descriptor.aggregation_kind
-                ),
-                "window_kind": training_pb2.MetricWindowKind.Name(
-                    descriptor.window_kind
-                ),
-                "schema_identity": {
-                    "schema_id": descriptor.schema_identity.schema_id,
-                    "schema_version": int(
-                        descriptor.schema_identity.schema_version
-                    ),
-                    "canonical_digest": {
-                        "algorithm": common_pb2.DigestAlgorithm.Name(
-                            descriptor.schema_identity.canonical_digest.algorithm
-                        ),
-                        "hex": descriptor.schema_identity.canonical_digest.hex,
-                    },
-                },
-            }
-            statistic = {
-                "value": value,
-                "scope": descriptor.scope,
-                "statistic": descriptor.statistic,
-                "aggregation_kind": training_pb2.MetricAggregationKind.Name(
-                    descriptor.aggregation_kind
-                ),
-                "window_kind": training_pb2.MetricWindowKind.Name(
-                    descriptor.window_kind
-                ),
-                "window_start_unix_ms": int(item.window_start_unix_ms),
-                "window_end_unix_ms": int(item.window_end_unix_ms),
-            }
-            count = int(item.count)
-            raw_sum = float(item.sum)
-            if count > 0:
-                if not math.isfinite(raw_sum):
-                    raise ValueError(
-                        f"metric {item.field_id} has a non-finite raw sum"
-                    )
-                statistic["sum"] = raw_sum
-                statistic["count"] = count
-            statistics[item.field_id] = statistic
-        return values, labels, statistics, descriptor_documents
-
-    @staticmethod
     def _component_error_snapshot(component: str, error: str) -> dict:
         return {
             "component": component,
@@ -3447,15 +3053,6 @@ class TrainingRuntime:
             raise ValueError("raw sum/count metric is invalid")
         return None if count == 0 else raw_sum / count
 
-    @staticmethod
-    def _metric_boolean(values: dict[str, float], field_id: str) -> bool | None:
-        if field_id not in values:
-            return None
-        value = values[field_id]
-        if value not in (0.0, 1.0):
-            raise ValueError(f"metric {field_id} is not a boolean fact")
-        return value == 1.0
-
     def _actor_snapshot(self) -> dict:
         try:
             status = self.actor_stub.GetAIServerStatus(
@@ -3463,40 +3060,6 @@ class TrainingRuntime:
             )
             if not _same_message(status.contract, self.contract):
                 raise RuntimeError("AIServer contract identity mismatch")
-            values, labels, statistics, descriptors = self._metric_snapshot(
-                status.metrics
-            )
-            reward_components: dict[str, float] = {}
-            transition_reward_components: dict[str, float] = {}
-            latest_reward_components: dict[str, float] = {}
-            prefix = "server.training.reward.component."
-            episode_suffix = ".episode_mean.v1"
-            transition_suffix = ".transition_mean.v1"
-            latest_suffix = ".latest_episode_mean.v1"
-            for field_id, value in values.items():
-                if not field_id.startswith(prefix):
-                    continue
-                if field_id.endswith(episode_suffix):
-                    reward_components[
-                        field_id[len(prefix) : -len(episode_suffix)]
-                    ] = value
-                elif field_id.endswith(transition_suffix):
-                    transition_reward_components[
-                        field_id[len(prefix) : -len(transition_suffix)]
-                    ] = value
-                elif field_id.endswith(latest_suffix):
-                    latest_reward_components[
-                        field_id[len(prefix) : -len(latest_suffix)]
-                    ] = value
-            episode_return = values.get(
-                "server.training.episode.learning_return.mean.v1"
-            )
-            latest_episode_return = values.get(
-                "server.training.episode.learning_return.latest_mean.v1"
-            )
-            success_value = values.get(
-                "server.training.episode.success.agent_rate.v1"
-            )
             inference_count = int(status.inference_count)
             push_rpc_count = int(status.push_rpc_count)
             segment_close_counts = {
@@ -3514,12 +3077,6 @@ class TrainingRuntime:
                     status.active_actor_session_count
                 ),
                 "active_segments": int(status.active_segment_count),
-                "client_session_recent": self._metric_boolean(
-                    values, "server.client.session_recent.v1"
-                ),
-                "client_last_activity_unix_ms": values.get(
-                    "server.client.last_activity_unix_ms.v1"
-                ),
                 "model_identity": model_identity_document(status.loaded_model),
                 "staged_model_identity": model_identity_document(
                     status.staged_model
@@ -3597,42 +3154,6 @@ class TrainingRuntime:
                 "quarantined_envelope_count": int(
                     status.quarantined_envelope_count
                 ),
-                "metric_source": {
-                    "instance_id": status.metrics.source.instance_id,
-                    "lifecycle_epoch": int(
-                        status.metrics.source.lifecycle_epoch
-                    ),
-                    "sequence": int(status.metrics.sequence),
-                    "timestamp_unix_ms": int(
-                        status.metrics.timestamp_unix_ms
-                    ),
-                },
-                "metric_values": values,
-                "metric_labels": labels,
-                "metric_statistics": statistics,
-                "metric_descriptors": descriptors,
-                "episodes": {
-                    "mean_agent_return": episode_return,
-                    "latest_agent_return": latest_episode_return,
-                    "min_agent_return": values.get(
-                        "server.episode.learning_return.min.v1",
-                    ),
-                    "max_agent_return": values.get(
-                        "server.episode.learning_return.max.v1",
-                    ),
-                    "agent_success_rate": success_value,
-                    "any_success_rate": values.get(
-                        "server.training.episode.success.any_rate.v1"
-                    ),
-                    "all_success_rate": values.get(
-                        "server.training.episode.success.all_rate.v1"
-                    ),
-                    "reward_components": reward_components,
-                    "transition_reward_components": (
-                        transition_reward_components
-                    ),
-                    "latest_reward_components": latest_reward_components,
-                },
                 "error": status.last_error,
                 "timestamp": int(status.timestamp_unix_ms) / 1000.0,
             }
@@ -3963,7 +3484,7 @@ class TrainingRuntime:
                 "error": "",
             }
 
-    def _record_train_update_fact_best_effort(
+    def _record_train_update_fact(
         self,
         *,
         update_id: str,
@@ -3982,120 +3503,75 @@ class TrainingRuntime:
         optimizer_step_count: int,
     ) -> None:
         writer = getattr(self, "metric_event_writer", None)
-        if writer is None or manifest is None:
-            return
-        try:
-            if (
-                actual_batch_size <= 0
-                or requested_train_batch_size != actual_batch_size
-                or pool_draw_slot_count != actual_batch_size
-                or unique_item_count < 0
-                or duplicate_item_slot_count < 0
-                or unique_item_count + duplicate_item_slot_count
-                != pool_draw_slot_count
-                or sample_evaluation_count <= 0
-                or optimizer_step_count <= 0
-            ):
+        if writer is None:
+            raise RuntimeError("Learner TrainUpdate metric writer is unavailable")
+        if manifest is None:
+            raise RuntimeError("committed TrainUpdate has no model manifest")
+        if (
+            actual_batch_size <= 0
+            or requested_train_batch_size != actual_batch_size
+            or pool_draw_slot_count != actual_batch_size
+            or unique_item_count < 0
+            or duplicate_item_slot_count < 0
+            or unique_item_count + duplicate_item_slot_count
+            != pool_draw_slot_count
+            or sample_evaluation_count <= 0
+            or optimizer_step_count <= 0
+        ):
+            raise MetricEventContractError(
+                "TrainUpdate execution facts are contradictory"
+            )
+        statistics = []
+        for field_id in sorted(raw_metric_sum_counts):
+            statistic = raw_metric_sum_counts[field_id]
+            raw_sum = float(statistic["sum"])
+            count = int(statistic["count"])
+            if count <= 0 or not math.isfinite(raw_sum):
                 raise MetricEventContractError(
-                    "TrainUpdate execution facts are contradictory"
+                    f"PPO raw sum/count is invalid: {field_id}"
                 )
-            statistics = []
-            for field_id in sorted(raw_metric_sum_counts):
-                statistic = raw_metric_sum_counts[field_id]
-                raw_sum = float(statistic["sum"])
-                count = int(statistic["count"])
-                if count <= 0 or not math.isfinite(raw_sum):
-                    raise MetricEventContractError(
-                        f"PPO raw sum/count is invalid: {field_id}"
-                    )
-                statistics.append(
-                    training_pb2.RawMetricSumCount(
-                        field_id=field_id,
-                        sum=raw_sum,
-                        count=count,
-                    )
+            statistics.append(
+                training_pb2.RawMetricSumCount(
+                    field_id=field_id,
+                    sum=raw_sum,
+                    count=count,
                 )
-            if not statistics:
-                raise MetricEventContractError(
-                    "committed train update has no raw PPO statistics"
-                )
-            writer.append(
-                training_pb2.TrainUpdateMetricFact(
-                    train_update_id=update_id,
-                    train_update_sequence=int(train_updates),
-                    published_model=manifest_message(manifest).identity,
-                    delivery_id=delivery_id,
-                    training_semantics=self.semantics,
-                    cumulative_trained_samples=int(trained_samples),
-                    actual_batch_size=int(actual_batch_size),
-                    minimum_behavior_model_step=int(
-                        behavior_identity["minimum_model_step"]
-                    ),
-                    maximum_behavior_model_step=int(
-                        behavior_identity["maximum_model_step"]
-                    ),
-                    ppo_statistics=statistics,
-                    behavior_model_lineage_id=str(
-                        behavior_identity["model_lineage_id"]
-                    ),
-                    requested_train_batch_size=int(
-                        requested_train_batch_size
-                    ),
-                    pool_draw_slot_count=int(pool_draw_slot_count),
-                    unique_item_count=int(unique_item_count),
-                    duplicate_item_slot_count=int(
-                        duplicate_item_slot_count
-                    ),
-                    sample_evaluation_count=int(sample_evaluation_count),
-                    optimizer_step_count=int(optimizer_step_count),
-                    rollout_estimator_profile_digest=(
-                        self.rollout_profile.profile_digest
-                    ),
+            )
+        if not statistics:
+            raise MetricEventContractError(
+                "committed train update has no raw PPO statistics"
+            )
+        writer.append(
+            training_pb2.TrainUpdateMetricFact(
+                train_update_id=update_id,
+                train_update_sequence=int(train_updates),
+                published_model=manifest["manifest"].identity,
+                delivery_id=delivery_id,
+                training_contract_digest=self.training_contract_digest,
+                cumulative_trained_samples=int(trained_samples),
+                actual_batch_size=int(actual_batch_size),
+                minimum_behavior_model_step=int(
+                    behavior_identity["minimum_model_step"]
                 ),
-                observed_at_unix_ms=int(time.time() * 1000),
-            )
-            failure_count = int(
-                getattr(self, "_metric_event_write_failure_count", 0)
-            )
-            if failure_count:
-                elapsed = time.monotonic() - float(
-                    getattr(
-                        self,
-                        "_metric_event_write_failure_started_at",
-                        time.monotonic(),
-                    )
-                )
-                self.logger.info(
-                    "TrainUpdate metric persistence recovered after %d "
-                    "failed update(s) and %.1fs; any recorded sequence gap "
-                    "remains visible in history",
-                    failure_count,
-                    elapsed,
-                )
-                self._metric_event_write_failure_count = 0
-                self._metric_event_write_failure_started_at = 0.0
-        except Exception as error:
-            failure_count = int(
-                getattr(self, "_metric_event_write_failure_count", 0)
-            ) + 1
-            self._metric_event_write_failure_count = failure_count
-            if failure_count == 1:
-                self._metric_event_write_failure_started_at = time.monotonic()
-                self.logger.error(
-                    "committed TrainUpdate metric fact was not persisted; PPO "
-                    "transaction remains committed and repeated failures will "
-                    "be suppressed until recovery: %s",
-                    error,
-                )
-            store = getattr(self, "metric_event_store", None)
-            if store is not None and failure_count == 1:
-                try:
-                    store.mark_incomplete(
-                        self.learner_service,
-                        "train_update_fact_persistence_failed",
-                    )
-                except Exception:
-                    pass
+                maximum_behavior_model_step=int(
+                    behavior_identity["maximum_model_step"]
+                ),
+                ppo_statistics=statistics,
+                behavior_model_lineage_id=str(
+                    behavior_identity["model_lineage_id"]
+                ),
+                requested_train_batch_size=int(requested_train_batch_size),
+                pool_draw_slot_count=int(pool_draw_slot_count),
+                unique_item_count=int(unique_item_count),
+                duplicate_item_slot_count=int(duplicate_item_slot_count),
+                sample_evaluation_count=int(sample_evaluation_count),
+                optimizer_step_count=int(optimizer_step_count),
+                rollout_estimator_profile_digest=(
+                    self.rollout_profile.profile_digest
+                ),
+            ),
+            observed_at_unix_ms=int(time.time() * 1000),
+        )
 
     def _learner_metrics_snapshot(self) -> dict:
         with self._metrics_lock:
@@ -4148,7 +3624,6 @@ class TrainingRuntime:
                 str(context.get("error", "")),
             )
             record = {
-                "schema_version": 3,
                 "mode": "training",
                 "metrics_source_id": self.metrics_source_id,
                 "sequence": sequence,
@@ -4160,7 +3635,9 @@ class TrainingRuntime:
                 ),
                 "configured_poll_interval_ms": 1000,
                 "contract": contract_document(self.contract),
-                "training_semantics": semantics_document(self.semantics),
+                "training_contract_digest": (
+                    self.training_contract_digest.hex
+                ),
                 "learner": learner,
                 "actor": actor,
                 "sample_pool": sample_pool,
@@ -4222,15 +3699,6 @@ class TrainingRuntime:
         ).hexdigest()
         return f"learner-shutdown-{digest}"
 
-    @staticmethod
-    def _finalization_count_fields(message) -> tuple[int, ...]:
-        return (
-            int(message.settled_transitions),
-            int(message.ready_transitions),
-            int(message.leased_transitions),
-            int(message.resident_transitions),
-        )
-
     def _validate_finalized_sample_pool_status(
         self,
         status,
@@ -4255,8 +3723,6 @@ class TrainingRuntime:
             or int(status.finalized_at_unix_ms) <= 0
             or int(status.finalized_at_unix_ms)
             != int(response.finalized_at_unix_ms)
-            or int(status.finalized_transition_count)
-            != int(response.settled_transitions)
         ):
             raise RuntimeError(
                 "sample pool returned contradictory finalization identity"
@@ -4355,21 +3821,10 @@ class TrainingRuntime:
                 raise RuntimeError(
                     "sample pool returned another finalization identity"
                 )
-            response_counts = self._finalization_count_fields(response)
-            if min(response_counts) < 0:
-                raise RuntimeError(
-                    "sample pool returned negative finalization counts"
-                )
-
             if (
                 response.result
                 == training_pb2.SAMPLE_POOL_FINALIZE_RESULT_REJECTED_ACTIVE_LEASE
             ):
-                if int(response.leased_transitions) <= 0:
-                    raise RuntimeError(
-                        "sample pool rejected finalization without an active "
-                        "lease"
-                    )
                 if not self._reconcile_get_batch_outcome(
                     expected,
                     "SamplePool finalization observed an active delivery",
@@ -4379,7 +3834,7 @@ class TrainingRuntime:
                     break
                 continue
 
-            if response.ret_code != 0 or response.result not in (
+            if response.result not in (
                 training_pb2.SAMPLE_POOL_FINALIZE_RESULT_FINALIZED,
                 training_pb2.SAMPLE_POOL_FINALIZE_RESULT_ALREADY_FINALIZED,
             ):
@@ -4388,8 +3843,7 @@ class TrainingRuntime:
                     f"{response.message}"
                 )
             if (
-                any(response_counts[1:])
-                or not self._has_field(response, "finalized_at_unix_ms")
+                not self._has_field(response, "finalized_at_unix_ms")
                 or int(response.finalized_at_unix_ms) <= 0
             ):
                 raise RuntimeError(
@@ -4417,7 +3871,7 @@ class TrainingRuntime:
             self.logger.info(
                 "SamplePool finalized: id=%s settled_transitions=%d",
                 finalization_id,
-                int(response.settled_transitions),
+                int(status.finalized_transition_count),
             )
             return
         raise RuntimeError(

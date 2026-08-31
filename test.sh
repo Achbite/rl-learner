@@ -15,10 +15,7 @@ trap 'rm -rf "${test_runtime_dir}"' EXIT
 cd "${test_runtime_dir}"
 
 python3 -m unittest -v \
-    tests.test_monitor_startup.LocalMonitorStartupTest.test_run_flags_override_the_local_monitor \
-    tests.test_monitor_startup.LocalMonitorStartupTest.test_infra_environment_disables_only_the_local_monitor \
-    tests.test_metric_consumer_identity.MetricConsumerIdentityTest.test_wrong_get_cursor_source_cannot_pin_fresh_journal \
-    tests.test_metric_consumer_identity.MetricConsumerIdentityTest.test_wrong_ack_cursor_source_cannot_pin_fresh_journal \
-    tests.test_model_retention_metadata.ModelRetentionMetadataTest.test_public_metadata_uses_interval_classification_and_separate_window \
-    tests.test_delivery_contract.LearnerDevelopmentTest.test_fixed_processed_transitions_enter_training_batch \
-    tests.test_ppo_contract.LearnerDevelopmentTest.test_fixed_processed_transitions_match_ppo_loss
+    tests.test_delivery_contract.LearnerDevelopmentTest.test_processed_transitions_reach_real_trainer \
+    tests.test_metric_calculations.LearnerMetricCalculationTest.test_episode_metrics_are_derived_from_raw_agent_facts \
+    tests.test_metric_calculations.LearnerMetricCalculationTest.test_train_metrics_are_derived_from_raw_sum_counts \
+    tests.test_ppo_contract.PPOCalculationTest.test_clipped_ppo_loss_matches_reference_values
