@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -12,18 +11,17 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main.training_runtime import atomic_write_json, sha256_file
+from main.training_runtime import sha256_file
+from proto import training_pb2
 from src.config.effective_config import load_effective_config
 from src.contracts.identity import (
-    bind_runtime_lineage,
-    contract_document,
-    contract_identity,
-    finalize_manifest_digest,
-    schema_document,
-    semantics_document,
+    content_digest,
+    finalize_manifest,
+    rollout_estimator_profile,
     training_config_digest,
-    training_semantics,
+    training_contract_digest,
     validate_config,
+    write_manifest_file,
 )
 from src.log.logger import setup_logger
 from src.training.ppo_trainer import PPOTrainer
@@ -37,8 +35,7 @@ def export_initial_model(
     config: dict,
     logger,
     output_root: str,
-    artifact_uri_prefix: str = "",
-) -> dict:
+) -> training_pb2.ModelArtifactManifest:
     validate_config(config)
     root = Path(output_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -50,57 +47,34 @@ def export_initial_model(
     with temporary.open("rb") as stream:
         os.fsync(stream.fileno())
     os.replace(temporary, model_path)
-    semantics = training_semantics(config)
-    artifact_uri = (
-        f"{artifact_uri_prefix.rstrip('/')}/{model_file}"
-        if artifact_uri_prefix
-        else model_path.as_uri()
-    )
-    document = {
-        "manifest_schema_version": 2,
-        "contract": contract_document(contract_identity(config)),
-        "identity": {
-            "model_lineage_id": config["identity"]["model_lineage_id"],
-            "model_step": 0,
-            "artifact_digest": sha256_file(model_path),
-            "manifest_digest": "0" * 64,
-        },
-        "observation_schema": schema_document(
-            semantics.observation_schema
+    manifest = training_pb2.ModelArtifactManifest(
+        identity=training_pb2.ModelIdentity(
+            model_lineage_id=config["identity"]["model_lineage_id"],
+            model_step=0,
+            artifact_digest=content_digest(sha256_file(model_path)),
         ),
-        "action_schema": schema_document(semantics.action_schema),
-        "model_architecture_id": semantics.model_architecture_id,
-        "tensor_dtype": config["model"]["tensor_dtype"],
-        "input_shape": [1, int(config["model"]["obs_dim"])],
-        "action_shape": [1, int(config["model"]["action_dim"])],
-        "value_shape": [1, 1],
-        "artifact_uri": artifact_uri,
-        "model_file": model_file,
-        "size_bytes": model_path.stat().st_size,
-        "seed": int(config["model"]["bootstrap_seed"]),
-        "train_updates": 0,
-        "trained_samples": 0,
-        "training_config_digest": training_config_digest(config).hex,
-        "training_semantics": semantics_document(semantics),
-        "published_at_unix_ms": int(time.time() * 1000),
-        "ready": True,
-    }
-    document = finalize_manifest_digest(document)
-    atomic_write_json(root / "manifest.json", document)
+        size_bytes=model_path.stat().st_size,
+        trained_samples=0,
+        training_config_digest=training_config_digest(config),
+        training_contract_digest=training_contract_digest(config),
+        published_at_unix_ms=int(time.time() * 1000),
+        rollout_estimator_profile=rollout_estimator_profile(config),
+    )
+    manifest = finalize_manifest(manifest)
+    write_manifest_file(root / "manifest.pb", manifest)
     logger.info(
         "initial model exported: lineage=%s step=0 artifact=%s manifest=%s",
-        document["identity"]["model_lineage_id"],
-        document["identity"]["artifact_digest"],
-        document["identity"]["manifest_digest"],
+        manifest.identity.model_lineage_id,
+        manifest.identity.artifact_digest.hex,
+        manifest.identity.manifest_digest.hex,
     )
-    return document
+    return manifest
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/learner_config.yaml")
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--artifact-uri-prefix", default="")
     arguments = parser.parse_args()
     config = load_config(arguments.config)
     log = config["log"]
@@ -114,7 +88,6 @@ def main() -> int:
         config,
         logger,
         arguments.output_root,
-        arguments.artifact_uri_prefix,
     )
     return 0
 

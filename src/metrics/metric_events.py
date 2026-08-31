@@ -21,8 +21,8 @@ from proto import common_pb2, training_pb2, training_pb2_grpc
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-METRIC_SCHEMA_ID = "maze.metrics.v4"
-METRIC_SCHEMA_VERSION = 4
+METRIC_SCHEMA_ID = "maze.metrics"
+METRIC_SCHEMA_VERSION = 1
 
 
 class MetricEventContractError(ValueError):
@@ -125,8 +125,8 @@ class MetricSchemaCatalog:
 
     @classmethod
     def load(cls, directory: Path) -> "MetricSchemaCatalog":
-        catalog_path = directory / "maze.metrics.v4.json"
-        digest_path = directory / "maze.metrics.v4.sha256"
+        catalog_path = directory / "maze.metrics.json"
+        digest_path = directory / "maze.metrics.sha256"
         catalog_bytes = catalog_path.read_bytes()
         actual_digest = hashlib.sha256(catalog_bytes).hexdigest()
         declared_digest = digest_path.read_text(encoding="utf-8").strip()
@@ -156,7 +156,7 @@ def default_metric_schema_directory() -> Path:
         return Path(configured).resolve()
     repository = Path(__file__).resolve().parents[2]
     local = repository / "schemas"
-    if (local / "maze.metrics.v4.json").is_file():
+    if (local / "maze.metrics.json").is_file():
         return local
     sibling_contracts = repository.parent / "rl-contracts" / "schemas"
     return sibling_contracts
@@ -173,7 +173,7 @@ def _validate_sum_counts(
     for item in values:
         if item.field_id not in allowed_fields:
             raise MetricEventContractError(
-                f"{owner} field_id is outside maze.metrics.v4: {item.field_id}"
+                f"{owner} field_id is outside maze.metrics: {item.field_id}"
             )
         if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
             raise MetricEventContractError(
@@ -183,15 +183,8 @@ def _validate_sum_counts(
 
 def _validate_event(
     event: training_pb2.MetricEvent,
-    batch: training_pb2.MetricBatch,
     catalog: MetricSchemaCatalog,
 ) -> None:
-    if not _same_message(event.contract, batch.contract):
-        raise MetricEventContractError("metric event contract differs from batch")
-    if not _same_message(event.schema_identity, batch.schema_identity):
-        raise MetricEventContractError("metric event schema differs from batch")
-    if not _same_message(event.source, batch.source):
-        raise MetricEventContractError("metric event source differs from batch")
     if int(event.event_sequence) <= 0 or not _has_field(
         event, "observed_at_unix_ms"
     ):
@@ -338,7 +331,7 @@ def validate_metric_batch(
         ):
             raise MetricEventContractError("metric event batch bounds are invalid")
         for event in batch.events:
-            _validate_event(event, batch, catalog)
+            _validate_event(event, catalog)
         next_event = sequences[-1]
     elif batch.HasField("gap"):
         gap = batch.gap
@@ -816,7 +809,7 @@ class RawMetricBatchStore:
         counts = {row["status"]: int(row["count"]) for row in batches}
         return {
             "enabled": True,
-            "store": "sqlite-raw-batch-v1",
+            "store": "sqlite-raw-batch",
             "committed_batch_count": counts.get("committed", 0),
             "pending_batch_count": counts.get("pending", 0),
             "incomplete_source_count": sum(
@@ -1115,7 +1108,6 @@ class LearnerMetricEventService(
             or not self._valid_consumer(request.consumer)
             or not _same_message(request.cursor.source, self.source)
         ):
-            response.ret_code = -1
             response.result = (
                 training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
             )
@@ -1124,7 +1116,6 @@ class LearnerMetricEventService(
         if not self.store.bind_export_consumer(
             self.source, request.consumer
         ):
-            response.ret_code = -1
             response.result = (
                 training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
             )
@@ -1132,7 +1123,6 @@ class LearnerMetricEventService(
             return response
         committed = self.store.export_cursor(self.source)
         if not _same_message(request.cursor, committed):
-            response.ret_code = -1
             response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
             response.message = "metric cursor does not match committed cursor"
             return response
@@ -1144,7 +1134,6 @@ class LearnerMetricEventService(
             or int(request.wait_timeout_ms) < 0
             or int(request.wait_timeout_ms) > 5000
         ):
-            response.ret_code = -1
             response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
             response.message = "metric batch limits are invalid"
             return response
@@ -1157,13 +1146,11 @@ class LearnerMetricEventService(
                     len(batch.events) > int(request.max_events)
                     or batch.ByteSize() > int(request.max_bytes)
                 ):
-                    response.ret_code = -1
                     response.result = (
                         training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
                     )
                     response.message = "requested limits are smaller than the next durable batch"
                     return response
-                response.ret_code = 0
                 response.result = training_pb2.METRIC_BATCH_RESULT_DELIVERED
                 response.message = "durable learner metric batch delivered"
                 response.batch.CopyFrom(batch)
@@ -1171,13 +1158,11 @@ class LearnerMetricEventService(
                 return response
             _, _, source_final = self.store.export_availability(self.source)
             if source_final:
-                response.ret_code = 0
                 response.result = training_pb2.METRIC_BATCH_RESULT_FINAL
                 response.message = "learner metric source final batch is acknowledged"
                 return response
             remaining = deadline - time.monotonic()
             if remaining <= 0.0 or not context.is_active():
-                response.ret_code = 0
                 response.result = training_pb2.METRIC_BATCH_RESULT_WAIT
                 response.message = "no learner metric batch is currently available"
                 return response
@@ -1195,7 +1180,6 @@ class LearnerMetricEventService(
                 self.source, request.consumer
             )
         ):
-            response.ret_code = -1
             response.result = (
                 training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_IDENTITY
             )
@@ -1207,7 +1191,6 @@ class LearnerMetricEventService(
         committed = self.store.export_cursor(self.source)
         response.committed_cursor.CopyFrom(committed)
         if _same_message(request.cursor, committed):
-            response.ret_code = 0
             response.result = (
                 training_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED
             )
@@ -1216,13 +1199,11 @@ class LearnerMetricEventService(
         try:
             self.store.acknowledge_export(self.source, request.cursor)
         except MetricEventContractError as error:
-            response.ret_code = -1
             response.result = (
                 training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
             )
             response.message = str(error)
             return response
-        response.ret_code = 0
         response.result = training_pb2.METRIC_BATCH_ACK_RESULT_APPLIED
         response.message = "learner metric batch acknowledged"
         response.committed_cursor.CopyFrom(
@@ -1966,9 +1947,6 @@ class LocalTrainUpdateMetricWriter:
             event_sequence = int(committed.acknowledged_event_sequence) + 1
             batch_sequence = int(committed.acknowledged_batch_sequence) + 1
             event = training_pb2.MetricEvent(
-                contract=self.store.contract,
-                schema_identity=self.store.catalog.schema_identity(),
-                source=self.source,
                 event_sequence=event_sequence,
                 observed_at_unix_ms=observed_at,
                 train_update=fact,
@@ -2169,10 +2147,6 @@ class AIServerMetricRelay:
             training_pb2.METRIC_BATCH_ACK_RESULT_APPLIED,
             training_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED,
         )
-        if (int(response.ret_code) == 0) != positive:
-            raise MetricEventContractError(
-                "AIServer metric ACK ret_code/result mismatch"
-            )
         if not positive:
             raise MetricEventContractError(
                 response.message or "AIServer metric ACK rejected"
@@ -2209,10 +2183,6 @@ class AIServerMetricRelay:
             training_pb2.METRIC_BATCH_RESULT_WAIT,
             training_pb2.METRIC_BATCH_RESULT_FINAL,
         )
-        if (int(response.ret_code) == 0) != positive:
-            raise MetricEventContractError(
-                "AIServer metric Get ret_code/result mismatch"
-            )
         if not positive:
             raise MetricEventContractError(
                 response.message or "AIServer metric Get rejected"

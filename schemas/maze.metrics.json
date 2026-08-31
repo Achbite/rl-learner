@@ -122,6 +122,6 @@
       "unit": "reward"
     }
   ],
-  "schema_id": "maze.metrics.v4",
-  "schema_version": 4
+  "schema_id": "maze.metrics",
+  "schema_version": 1
 }

@@ -3,35 +3,12 @@
 
 contract:
   package_name: rl-contracts
-  package_version: 0.14.0
-  source_digest: 61d633bde1ad4a8dccc2a5e8505d122bbabc8c8cd69eb1cfa97b253c4c2d4c0d
-  artifact_digest: 4642b1a7e18150f9dfc0b7dba6e6ff3b5f0173cb10dee4c432c0155bfa596779
+  package_version: 0.15.0
+  source_digest: ebcad0a4c652243ca16fc2c8c14d3f7b4b3b95f1bbd925c7063d22907374c026
+  artifact_digest: 0c278cfcf85ab4dbff72177eeeea165ebb113bb36867ae71975bf8c14da2be33
   platform: linux/arm64
   generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
-
-training_semantics:
-  training_contract_id: maze.training.v3
-  observation_schema:
-    schema_id: maze.observation.v3
-    schema_version: 1
-    canonical_digest: 7cee41136020f3ffc8c6ae799f630d55d0588c6a99ab7f717eac3b3d08aa18b4
-  action_schema:
-    schema_id: maze.action.v1
-    schema_version: 1
-    canonical_digest: ce84c564e128f98adcc48fd420ac0df5acea61774a25de8705b602464009cfd8
-  reward_schema:
-    schema_id: maze.reward.v4
-    schema_version: 1
-    canonical_digest: ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929
-  policy_distribution_schema_id: categorical.logits.v1
-  model_architecture_id: maze.mlp-17x64x64.v1
-  semantics_digest: 6cd834542f8263135b4bfd069f372ddfdb99334060d305f58b00ce56eea10b4c
-
-policy:
-  distribution_schema_id: categorical.logits.v1
-  training_sampling: stochastic
-  training_temperature: 1.0        # unitless; fixed for behavior log-prob identity
-  policy_spec_digest: e1efb81040681fd13fdae439caab09778c8e0b0f6bba16b7808c30fbbb632617
+  training_contract_path: ../schemas/training-contract.json
 
 identity:
   model_lineage_id: __FRESH_INTERNAL_LINEAGE_REQUIRED__
@@ -60,11 +37,7 @@ model:
   local_train_dir: ../models/train
   archive_interval_updates: 200
   publication_retention_steps: 101
-  obs_dim: 17
-  action_dim: 9
-  hidden_dim: 64
   bootstrap_seed: 0
-  tensor_dtype: float32
 
 sample_pool:
   host: 127.0.0.1
@@ -86,9 +59,10 @@ aiserver_status:
   # A positive value enables an explicit bounded diagnostic timeout.
   initial_model_ack_timeout_sec: null
 
-# The raw MetricEvent service is independently owned by the Learner. Local A3
-# keeps the historical single-AIServer relay; Infra managed config disables
-# that relay because Infra is the sole durable consumer for every source.
+# The raw MetricEvent service is independently owned by the Learner. The local
+# three-container preview relays its single AIServer source; Infra managed
+# config disables that relay because Infra is the sole durable consumer for
+# every source.
 metric_events:
   server_enabled: false
   server_port: 9006

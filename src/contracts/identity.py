@@ -1,4 +1,4 @@
-"""Build and validate the exact rl-contracts 0.14.0 training identities."""
+"""Build identities from the canonical rl-contracts training descriptor."""
 
 from __future__ import annotations
 
@@ -8,22 +8,144 @@ import json
 import math
 import os
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Mapping
 
 from proto import common_pb2, training_pb2
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.14.0"
+CONTRACT_VERSION = "0.15.0"
 RUNTIME_LINEAGE_PLACEHOLDER = "__FRESH_INTERNAL_LINEAGE_REQUIRED__"
 RUNTIME_LINEAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-REWARD_SCHEMA_ID = "maze.reward.v4"
-REWARD_SCHEMA_DIGEST = (
-    "ed284084b79413473d5053b6d3f69320d2a4639c81451ba598ca45ac8ce15929"
-)
-TRAINING_SEMANTICS_DIGEST = (
-    "6cd834542f8263135b4bfd069f372ddfdb99334060d305f58b00ce56eea10b4c"
-)
+
+
+def _require_exact_keys(value: dict, expected: set[str], name: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        raise ValueError(
+            f"{name} keys differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+@lru_cache(maxsize=8)
+def _load_training_contract(path_text: str) -> dict:
+    path = Path(path_text)
+    digest_path = path.with_suffix(".sha256")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"training contract must be a regular file: {path}")
+    if digest_path.is_symlink() or not digest_path.is_file():
+        raise ValueError(
+            f"training contract digest must be a regular file: {digest_path}"
+        )
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest_path.read_text(encoding="utf-8").strip() != digest:
+        raise ValueError("training contract digest does not match its bytes")
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("training contract is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise ValueError("training contract root must be an object")
+    _require_exact_keys(
+        document,
+        {
+            "action_count",
+            "action_schema",
+            "hidden_dimension",
+            "model_architecture_id",
+            "observation_dimension",
+            "observation_schema",
+            "policy",
+            "reward_schema",
+            "rollout",
+            "tensor_dtype",
+            "training_contract_id",
+        },
+        "training contract",
+    )
+    for name in ("observation_schema", "action_schema", "reward_schema"):
+        schema = document[name]
+        if not isinstance(schema, dict):
+            raise ValueError(f"training contract {name} must be an object")
+        _require_exact_keys(
+            schema,
+            {"canonical_digest", "schema_id", "schema_version"},
+            f"training contract {name}",
+        )
+        if (
+            not isinstance(schema["schema_id"], str)
+            or not schema["schema_id"]
+            or re.search(r"\.v[0-9]+$", schema["schema_id"])
+            or isinstance(schema["schema_version"], bool)
+            or not isinstance(schema["schema_version"], int)
+            or schema["schema_version"] <= 0
+            or SHA256.fullmatch(str(schema["canonical_digest"])) is None
+        ):
+            raise ValueError(f"training contract {name} is invalid")
+    policy = document["policy"]
+    if not isinstance(policy, dict):
+        raise ValueError("training contract policy must be an object")
+    _require_exact_keys(
+        policy,
+        {"distribution_schema_id", "sampling", "temperature"},
+        "training contract policy",
+    )
+    rollout = document["rollout"]
+    if not isinstance(rollout, dict):
+        raise ValueError("training contract rollout must be an object")
+    _require_exact_keys(
+        rollout,
+        {
+            "finite_rule_id",
+            "gae_formula_id",
+            "model_pin_semantics_id",
+            "numeric_dtype",
+            "terminal_bootstrap_semantics_id",
+            "value_head_abi_id",
+            "value_target_formula_id",
+        },
+        "training contract rollout",
+    )
+    identifiers = [
+        document["training_contract_id"],
+        document["model_architecture_id"],
+        policy["distribution_schema_id"],
+        *rollout.values(),
+    ]
+    if any(
+        not isinstance(value, str)
+        or not value
+        or re.search(r"\.v[0-9]+$", value)
+        for value in identifiers
+    ):
+        raise ValueError("training contract contains a versioned or empty ID")
+    if (
+        document["training_contract_id"] != "maze.training"
+        or document["model_architecture_id"] != "maze.mlp-17x64x64"
+        or document["tensor_dtype"] != "float32"
+        or document["observation_dimension"] != 17
+        or document["action_count"] != 9
+        or document["hidden_dimension"] != 64
+        or policy != {
+            "distribution_schema_id": "categorical.logits",
+            "sampling": "stochastic",
+            "temperature": 1.0,
+        }
+        or rollout["numeric_dtype"] != "float32"
+    ):
+        raise ValueError("training contract is unsupported by this Learner")
+    result = copy.deepcopy(document)
+    result["canonical_digest"] = digest
+    return result
+
+
+def training_contract(config: dict) -> dict:
+    path = str(config["contract"]["training_contract_path"])
+    return copy.deepcopy(_load_training_contract(path))
 
 
 def _digest(value: str) -> common_pb2.ContentDigest:
@@ -33,6 +155,10 @@ def _digest(value: str) -> common_pb2.ContentDigest:
         algorithm=common_pb2.DIGEST_ALGORITHM_SHA256,
         hex=str(value),
     )
+
+
+def content_digest(value: str) -> common_pb2.ContentDigest:
+    return _digest(value)
 
 
 def service_identity(
@@ -56,7 +182,7 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         or SHA256.fullmatch(str(contract.get("generator_identity", "")))
         is None
     ):
-        raise ValueError("contract identity is not the selected 0.14.0 artifact")
+        raise ValueError("contract identity is not the selected 0.15.0 artifact")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
@@ -80,32 +206,9 @@ def schema_identity(document: dict) -> common_pb2.SchemaIdentity:
     )
 
 
-def training_semantics(config: dict) -> training_pb2.TrainingSemanticsIdentity:
-    semantics = config["training_semantics"]
-    result = training_pb2.TrainingSemanticsIdentity(
-        training_contract_id=str(semantics["training_contract_id"]),
-        observation_schema=schema_identity(semantics["observation_schema"]),
-        action_schema=schema_identity(semantics["action_schema"]),
-        reward_schema=schema_identity(semantics["reward_schema"]),
-        policy_distribution_schema_id=str(
-            semantics["policy_distribution_schema_id"]
-        ),
-        model_architecture_id=str(semantics["model_architecture_id"]),
-        semantics_digest=_digest(semantics["semantics_digest"]),
-    )
-    if not all(
-        (
-            result.training_contract_id,
-            result.policy_distribution_schema_id,
-            result.model_architecture_id,
-        )
-    ):
-        raise ValueError("training semantics is incomplete")
-    return result
-
-
-def policy_spec_digest(config: dict) -> common_pb2.ContentDigest:
-    return _digest(config["policy"]["policy_spec_digest"])
+def training_contract_digest(config: dict) -> common_pb2.ContentDigest:
+    """Return the sole wire identity for the canonical training descriptor."""
+    return _digest(training_contract(config)["canonical_digest"])
 
 
 def rollout_estimator_profile(
@@ -113,85 +216,14 @@ def rollout_estimator_profile(
 ) -> training_pb2.RolloutEstimatorProfile:
     training = config["training"]
     profile = training_pb2.RolloutEstimatorProfile(
-        profile_schema_version=1,
         gamma=float(training["gamma"]),
         gae_lambda=float(training["gae_lambda"]),
         tmax=int(training["tmax"]),
-        gae_formula_id="gae.backward.v1",
-        terminal_bootstrap_semantics_id=(
-            "maze.timeout-keep-and-cut-bootstrap.v1"
-        ),
-        value_target_formula_id="advantage-plus-behavior-value.v1",
-        value_head_abi_id="scalar-value.float32.v1",
-        reward_semantics_digest=_digest(REWARD_SCHEMA_DIGEST),
-        numeric_dtype="float32",
-        finite_rule_id="reject-nonfinite.v1",
-        model_pin_semantics_id="per-agent-segment-pin.v1",
     )
     digest = hashlib.sha256(
         profile.SerializeToString(deterministic=True)
     ).hexdigest()
     profile.profile_digest.CopyFrom(_digest(digest))
-    return profile
-
-
-def rollout_estimator_profile_document(
-    profile: training_pb2.RolloutEstimatorProfile,
-) -> dict:
-    return {
-        "profile_schema_version": int(profile.profile_schema_version),
-        "gamma": float(profile.gamma),
-        "gae_lambda": float(profile.gae_lambda),
-        "tmax": int(profile.tmax),
-        "gae_formula_id": profile.gae_formula_id,
-        "terminal_bootstrap_semantics_id": (
-            profile.terminal_bootstrap_semantics_id
-        ),
-        "value_target_formula_id": profile.value_target_formula_id,
-        "value_head_abi_id": profile.value_head_abi_id,
-        "reward_semantics_digest": profile.reward_semantics_digest.hex,
-        "numeric_dtype": profile.numeric_dtype,
-        "finite_rule_id": profile.finite_rule_id,
-        "model_pin_semantics_id": profile.model_pin_semantics_id,
-        "profile_digest": profile.profile_digest.hex,
-    }
-
-
-def _rollout_estimator_profile_from_document(
-    document: dict,
-) -> training_pb2.RolloutEstimatorProfile:
-    profile = training_pb2.RolloutEstimatorProfile(
-        profile_schema_version=int(document["profile_schema_version"]),
-        gamma=float(document["gamma"]),
-        gae_lambda=float(document["gae_lambda"]),
-        tmax=int(document["tmax"]),
-        gae_formula_id=str(document["gae_formula_id"]),
-        terminal_bootstrap_semantics_id=str(
-            document["terminal_bootstrap_semantics_id"]
-        ),
-        value_target_formula_id=str(document["value_target_formula_id"]),
-        value_head_abi_id=str(document["value_head_abi_id"]),
-        reward_semantics_digest=_digest(
-            document["reward_semantics_digest"]
-        ),
-        numeric_dtype=str(document["numeric_dtype"]),
-        finite_rule_id=str(document["finite_rule_id"]),
-        model_pin_semantics_id=str(document["model_pin_semantics_id"]),
-        profile_digest=_digest(document["profile_digest"]),
-    )
-    expected = rollout_estimator_profile(
-        {
-            "training": {
-                "gamma": profile.gamma,
-                "gae_lambda": profile.gae_lambda,
-                "tmax": profile.tmax,
-            }
-        }
-    )
-    if profile.SerializeToString(deterministic=True) != (
-        expected.SerializeToString(deterministic=True)
-    ):
-        raise ValueError("rollout estimator profile is not canonical")
     return profile
 
 
@@ -224,12 +256,11 @@ def bind_runtime_lineage(
 
 def training_config_document(config: dict) -> dict:
     """Return the exact task-neutral configuration bound to model identity."""
-    semantics = config["training_semantics"]
+    contract = training_contract(config)
     training = config["training"]
     model = config["model"]
     return {
-        "training_semantics_digest": semantics["semantics_digest"],
-        "policy_spec_digest": config["policy"]["policy_spec_digest"],
+        "training_contract_digest": contract["canonical_digest"],
         "training": {
             key: training[key]
             for key in (
@@ -251,14 +282,7 @@ def training_config_document(config: dict) -> dict:
             )
         },
         "model": {
-            key: model[key]
-            for key in (
-                "obs_dim",
-                "action_dim",
-                "hidden_dim",
-                "bootstrap_seed",
-                "tensor_dtype",
-            )
+            "bootstrap_seed": model["bootstrap_seed"],
         },
     }
 
@@ -266,28 +290,6 @@ def training_config_document(config: dict) -> dict:
 def training_config_digest(config: dict) -> common_pb2.ContentDigest:
     actual = canonical_config_digest(training_config_document(config))
     return _digest(actual)
-
-
-def model_identity(document: dict) -> training_pb2.ModelIdentity:
-    identity = document["identity"]
-    if not identity.get("model_lineage_id"):
-        raise ValueError("model lineage is required")
-    if "model_version" in identity:
-        raise ValueError("legacy model_version is not accepted")
-    model_step = identity.get("model_step")
-    if (
-        isinstance(model_step, bool)
-        or not isinstance(model_step, int)
-        or model_step < 0
-        or model_step > (1 << 64) - 1
-    ):
-        raise ValueError("model_step must be a uint64 integer")
-    return training_pb2.ModelIdentity(
-        model_lineage_id=str(identity["model_lineage_id"]),
-        model_step=model_step,
-        artifact_digest=_digest(identity["artifact_digest"]),
-        manifest_digest=_digest(identity["manifest_digest"]),
-    )
 
 
 def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
@@ -315,89 +317,11 @@ def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
     }
 
 
-def manifest_message(document: dict) -> training_pb2.ModelArtifactManifest:
-    if int(document["manifest_schema_version"]) != 3:
-        raise ValueError("training manifest_schema_version must be 3")
-    if "model_version" in document or "model_version" in document.get(
-        "identity", {}
-    ):
-        raise ValueError("legacy model_version is not accepted")
-    message = training_pb2.ModelArtifactManifest(
-        manifest_schema_version=int(document["manifest_schema_version"]),
-        contract=contract_identity({"contract": document["contract"]}),
-        identity=model_identity(document),
-        observation_schema=schema_identity(document["observation_schema"]),
-        action_schema=schema_identity(document["action_schema"]),
-        model_architecture_id=str(document["model_architecture_id"]),
-        tensor_dtype=str(document["tensor_dtype"]),
-        artifact_uri=str(document["artifact_uri"]),
-        model_file=str(document["model_file"]),
-        size_bytes=int(document["size_bytes"]),
-        seed=int(document["seed"]),
-        train_updates=int(document["train_updates"]),
-        trained_samples=int(document["trained_samples"]),
-        training_config_digest=_digest(document["training_config_digest"]),
-        training_semantics=_semantics_from_document(
-            document["training_semantics"]
-        ),
-        rollout_estimator_profile=(
-            _rollout_estimator_profile_from_document(
-                document["rollout_estimator_profile"]
-            )
-        ),
-        published_at_unix_ms=int(document["published_at_unix_ms"]),
-        ready=bool(document["ready"]),
-    )
-    message.input_shape.extend(int(value) for value in document["input_shape"])
-    message.action_shape.extend(
-        int(value) for value in document["action_shape"]
-    )
-    message.value_shape.extend(int(value) for value in document["value_shape"])
-    if (
-        not message.identity.HasField("model_step")
-        or int(message.identity.model_step) != int(message.train_updates)
-    ):
-        raise ValueError("model_step must equal train_updates")
-    return message
-
-
-def _semantics_from_document(
-    document: dict,
-) -> training_pb2.TrainingSemanticsIdentity:
-    return training_pb2.TrainingSemanticsIdentity(
-        training_contract_id=str(document["training_contract_id"]),
-        observation_schema=schema_identity(document["observation_schema"]),
-        action_schema=schema_identity(document["action_schema"]),
-        reward_schema=schema_identity(document["reward_schema"]),
-        policy_distribution_schema_id=str(
-            document["policy_distribution_schema_id"]
-        ),
-        model_architecture_id=str(document["model_architecture_id"]),
-        semantics_digest=_digest(document["semantics_digest"]),
-    )
-
-
 def schema_document(message: common_pb2.SchemaIdentity) -> dict:
     return {
         "schema_id": message.schema_id,
         "schema_version": int(message.schema_version),
         "canonical_digest": message.canonical_digest.hex,
-    }
-
-
-def semantics_document(
-    message: training_pb2.TrainingSemanticsIdentity,
-) -> dict:
-    return {
-        "training_contract_id": message.training_contract_id,
-        "observation_schema": schema_document(message.observation_schema),
-        "action_schema": schema_document(message.action_schema),
-        "reward_schema": schema_document(message.reward_schema),
-        "policy_distribution_schema_id": (
-            message.policy_distribution_schema_id
-        ),
-        "model_architecture_id": message.model_architecture_id,
-        "semantics_digest": message.semantics_digest.hex,
     }
 
 
@@ -412,25 +336,81 @@ def contract_document(message: common_pb2.ContractIdentity) -> dict:
     }
 
 
-def finalize_manifest_digest(document: dict) -> dict:
-    result = copy.deepcopy(document)
-    result["identity"]["manifest_digest"] = "0" * 64
-    message = manifest_message(result)
-    message.identity.ClearField("manifest_digest")
+def finalize_manifest(
+    message: training_pb2.ModelArtifactManifest,
+) -> training_pb2.ModelArtifactManifest:
+    """Return a manifest whose identity digest covers canonical protobuf bytes."""
+    result = training_pb2.ModelArtifactManifest()
+    result.CopyFrom(message)
+    result.identity.ClearField("manifest_digest")
     digest = hashlib.sha256(
-        message.SerializeToString(deterministic=True)
+        result.SerializeToString(deterministic=True)
     ).hexdigest()
-    result["identity"]["manifest_digest"] = digest
+    result.identity.manifest_digest.CopyFrom(_digest(digest))
     return result
+
+
+def validate_manifest_digest(
+    message: training_pb2.ModelArtifactManifest,
+) -> None:
+    expected = finalize_manifest(message).identity.manifest_digest
+    if (
+        message.identity.manifest_digest.algorithm
+        != common_pb2.DIGEST_ALGORITHM_SHA256
+        or message.identity.manifest_digest.hex != expected.hex
+    ):
+        raise ValueError("model manifest digest is invalid")
+
+
+def write_manifest_file(
+    path: Path, message: training_pb2.ModelArtifactManifest
+) -> None:
+    if path.name != "manifest.pb":
+        raise ValueError("model manifest must use the canonical protobuf name")
+    validate_manifest_digest(message)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("model manifest must not be a symbolic link")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = message.SerializeToString(deterministic=True)
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def read_manifest_file(path: Path) -> training_pb2.ModelArtifactManifest:
+    if path.name != "manifest.pb":
+        raise ValueError("model manifest must use the canonical protobuf name")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("model manifest must be a regular file")
+    payload = path.read_bytes()
+    message = training_pb2.ModelArtifactManifest()
+    try:
+        message.ParseFromString(payload)
+    except Exception as error:
+        raise ValueError("model manifest is not valid protobuf") from error
+    if message.SerializeToString(deterministic=True) != payload:
+        raise ValueError("model manifest bytes are not canonical")
+    validate_manifest_digest(message)
+    return message
 
 
 def validate_config(config: dict) -> None:
     required_sections = {
         "training",
         "model",
-        "policy",
         "identity",
-        "training_semantics",
         "contract",
         "sample_pool",
         "model_distributor",
@@ -439,44 +419,76 @@ def validate_config(config: dict) -> None:
         "dashboard",
         "log",
     }
-    missing = required_sections - config.keys()
-    if missing:
-        raise ValueError(f"missing config sections: {sorted(missing)}")
+    root_keys = set(config)
+    if root_keys not in (
+        required_sections,
+        required_sections | {"_effective_config"},
+    ):
+        raise ValueError(
+            "Learner config keys differ: "
+            f"missing={sorted(required_sections - root_keys)} "
+            f"unknown={sorted(root_keys - required_sections - {'_effective_config'})}"
+        )
+    expected_keys = {
+        "contract": {
+            "package_name", "package_version", "source_digest",
+            "artifact_digest", "platform", "generator_identity",
+            "training_contract_path",
+        },
+        "identity": {"model_lineage_id"},
+        "training": {
+            "device", "seed", "learning_rate", "gamma", "gae_lambda",
+            "tmax", "clip_epsilon", "value_clip_epsilon",
+            "entropy_coef", "value_coef", "max_grad_norm", "n_epochs",
+            "train_batch_size", "mini_batch_size", "normalize_advantage",
+        },
+        "model": {
+            "initial_model_path", "local_train_dir",
+            "archive_interval_updates", "publication_retention_steps",
+            "bootstrap_seed",
+        },
+        "sample_pool": {
+            "host", "port", "get_timeout_ms", "lease_timeout_ms",
+            "finalize_request_path", "finalize_complete_path",
+            "shutdown_drain_timeout_ms",
+        },
+        "model_distributor": {"host", "port"},
+        "aiserver_status": {"host", "port", "initial_model_ack_timeout_sec"},
+        "metric_events": {
+            "server_enabled", "server_port", "aiserver_relay_enabled",
+        },
+        "dashboard": {"enabled", "server_port", "backend"},
+        "log": {"console_level", "file_level", "log_dir"},
+    }
+    for section_name, keys in expected_keys.items():
+        section = config[section_name]
+        if not isinstance(section, dict):
+            raise ValueError(f"{section_name} must be a mapping")
+        _require_exact_keys(section, keys, section_name)
+    if "_effective_config" in config:
+        effective = config["_effective_config"]
+        if not isinstance(effective, dict):
+            raise ValueError("_effective_config must be a mapping")
+        _require_exact_keys(
+            effective,
+            {
+                "config_path", "environment_overrides",
+                "internal_environment_overrides", "cli_overrides",
+                "training_config_digest",
+            },
+            "_effective_config",
+        )
     contract_identity(config)
     lineage = str(config["identity"].get("model_lineage_id", ""))
     if lineage != RUNTIME_LINEAGE_PLACEHOLDER and (
         not lineage or RUNTIME_LINEAGE.fullmatch(lineage) is None
     ):
         raise ValueError("identity.model_lineage_id is invalid")
-    semantics = training_semantics(config)
-    policy_spec_digest(config)
-    actual_training_digest = training_config_digest(config).hex
-    expected_training_digest = config["identity"].get(
-        "expected_training_config_digest"
-    )
-    if expected_training_digest is not None and (
-        _digest(expected_training_digest).hex != actual_training_digest
-    ):
-        raise ValueError(
-            "expected_training_config_digest does not match the effective "
-            "training configuration"
-        )
+    contract = training_contract(config)
+    training_contract_digest(config)
+    training_config_digest(config)
     model = config["model"]
     training = config["training"]
-    policy = config["policy"]
-    retired_model_fields = {
-        "archive_on_graceful_shutdown",
-        "initial_checkpoint",
-        "initial_model_dir",
-        "serving_retention_versions",
-        "publication_retention_versions",
-    }
-    present_retired_fields = sorted(retired_model_fields.intersection(model))
-    if present_retired_fields:
-        raise ValueError(
-            "retired model publication fields are not allowed: "
-            + ", ".join(present_retired_fields)
-        )
     if "initial_model_path" not in model:
         raise ValueError("model.initial_model_path default is required")
     initial_model_path = model["initial_model_path"]
@@ -493,29 +505,8 @@ def validate_config(config: dict) -> None:
         or int(model["publication_retention_steps"]) <= 0
     ):
         raise ValueError("model publication parameters are invalid")
-    if (
-        int(model["obs_dim"]) != 17
-        or int(model["action_dim"]) != 9
-        or int(model["hidden_dim"]) != 64
-        or semantics.observation_schema.schema_id != "maze.observation.v3"
-        or semantics.action_schema.schema_id != "maze.action.v1"
-        or semantics.reward_schema.schema_id != REWARD_SCHEMA_ID
-        or semantics.reward_schema.schema_version != 1
-        or semantics.reward_schema.canonical_digest.hex
-        != REWARD_SCHEMA_DIGEST
-        or semantics.semantics_digest.hex != TRAINING_SEMANTICS_DIGEST
-        or semantics.model_architecture_id != "maze.mlp-17x64x64.v1"
-    ):
-        raise ValueError(
-            "model/schema does not match the locked Reward V4 17x64x64 contract"
-        )
-    if (
-        policy.get("distribution_schema_id")
-        != semantics.policy_distribution_schema_id
-        or policy.get("training_sampling") != "stochastic"
-        or float(policy.get("training_temperature")) != 1.0
-    ):
-        raise ValueError("policy sampling contract is invalid")
+    if contract["policy"]["sampling"] != "stochastic":
+        raise ValueError("training contract policy sampling is unsupported")
     finite_training_values = (
         "learning_rate",
         "gamma",
@@ -576,15 +567,6 @@ def validate_config(config: dict) -> None:
         port = section.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError(f"{section_name}.port must be in [1, 65535]")
-    if "startup_timeout_sec" in config["model_distributor"]:
-        raise ValueError(
-            "model_distributor.startup_timeout_sec is retired; initial model "
-            "ACK waiting belongs to aiserver_status"
-        )
-    if "initial_model_ack_timeout_sec" not in config["aiserver_status"]:
-        raise ValueError(
-            "aiserver_status.initial_model_ack_timeout_sec default is required"
-        )
     initial_ack_timeout = config["aiserver_status"][
         "initial_model_ack_timeout_sec"
     ]

@@ -6,8 +6,8 @@ import torch
 from src.training.ppo_trainer import PPOTrainer
 
 
-class LearnerDevelopmentTest(unittest.TestCase):
-    def test_fixed_processed_transitions_match_ppo_loss(self):
+class PPOCalculationTest(unittest.TestCase):
+    def test_clipped_ppo_loss_matches_reference_values(self):
         old_log_probability = torch.tensor([0.0, 0.0])
         new_log_probability = torch.tensor(
             [math.log(1.3), math.log(0.7)]

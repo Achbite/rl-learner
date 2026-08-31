@@ -38,7 +38,7 @@ make build
 bash ./test.sh
 ```
 
-The development path does not depend on an old runtime image, formal 0.14
+The development path does not depend on an old runtime image, prebuilt formal
 artifacts, or clean source. Development dependencies remain under
 `.workspace/dev-artifacts` and cannot feed a formal image. Run `make shell` only
 on the host.
@@ -142,12 +142,15 @@ that training invocation's private runtime:
 ```text
 models/train/0000200/
   SaveModel.onnx
-  manifest.json
-  metadata.json
+  manifest.pb
 
 models/train/runtime/checkpoints/
   publication-0000200.checkpoint.pt
 ```
+
+`manifest.pb` is the sole authoritative model-package manifest. Learner-private
+checkpoints retain update metadata; the public model directory no longer keeps
+parallel JSON manifest or metadata projections.
 
 A normal stop preserves public model packages until the next `run.sh` clears the
 same `model.local_train_dir`. A private checkpoint is not part of a model package

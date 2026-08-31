@@ -389,8 +389,8 @@ verify_development_artifact_permissions() {
         "${contract_dir}/python/common_pb2.py" \
         "${contract_dir}/python/training_pb2.py" \
         "${contract_dir}/python/training_pb2_grpc.py" \
-        "${contract_dir}/schemas/maze.metrics.v4.json" \
-        "${contract_dir}/schemas/maze.metrics.v4.sha256" \
+        "${contract_dir}/schemas/maze.metrics.json" \
+        "${contract_dir}/schemas/maze.metrics.sha256" \
         "${sample_pool_dir}/bin/maze_sample_pool" \
         "${model_distributor_dir}/bin/maze_model_distributor" <<'PY'
 import os
@@ -447,9 +447,7 @@ verify_development_artifacts() {
 }
 
 ensure_container() {
-    local legacy_binding
     local process_state
-    local start_error
     ensure_dev_image
     prepare_development_artifacts
     verify_development_artifacts
@@ -476,20 +474,7 @@ ensure_container() {
         docker rm --force "${container_name}" >/dev/null
         create_container
     elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
-        legacy_binding="$(docker port "${container_name}" 9005/tcp 2>/dev/null || true)"
-        if ! start_error="$(docker start "${container_name}" 2>&1)"; then
-            if [[ "${legacy_binding}" =~ :9005$ ]] &&
-               { [[ "${start_error}" == *"address already in use"* ]] ||
-                 [[ "${start_error}" == *"port is already allocated"* ]]; }; then
-                echo "Migrating stopped learner-dev from legacy fixed monitor port" >&2
-                stop_monitor_transport
-                docker rm "${container_name}" >/dev/null
-                create_container
-            else
-                echo "${start_error}" >&2
-                return 1
-            fi
-        fi
+        docker start "${container_name}" >/dev/null
     fi
 }
 
