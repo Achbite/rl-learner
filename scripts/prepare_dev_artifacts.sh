@@ -10,20 +10,14 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
-contract_dir="$(
-    RL_TRAINING_WORKSPACE="${workspace_root}" \
-        bash "${workspace_root}/rl-contracts/build_dev_artifact.sh"
-)"
-sample_pool_dir="$(
-    RL_TRAINING_WORKSPACE="${workspace_root}" \
-        bash "${workspace_root}/rl-sample-pool/build_dev_artifact.sh"
-)"
-model_distributor_dir="$(
-    RL_TRAINING_WORKSPACE="${workspace_root}" \
-        bash "${workspace_root}/rl-model-distributor/build_dev_artifact.sh"
-)"
-
-printf '%s\t%s\t%s\n' \
-    "${contract_dir}" \
-    "${sample_pool_dir}" \
-    "${model_distributor_dir}"
+RL_TRAINING_WORKSPACE="${workspace_root}" \
+    bash "${workspace_root}/rl-contracts/build_dev_artifact.sh" training \
+    >/dev/null
+RL_TRAINING_WORKSPACE="${workspace_root}" \
+    bash "${workspace_root}/rl-sample-pool/build_dev_artifact.sh" \
+    >/dev/null
+RL_TRAINING_WORKSPACE="${workspace_root}" \
+    bash "${workspace_root}/rl-model-distributor/build_dev_artifact.sh" \
+    >/dev/null
+RL_TRAINING_WORKSPACE="${workspace_root}" \
+    bash "${repo_dir}/scripts/sync_runtime_artifacts.sh" --development

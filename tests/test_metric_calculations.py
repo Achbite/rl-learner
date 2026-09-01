@@ -1,7 +1,15 @@
+import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
-from proto import training_pb2
+from proto import common_pb2, maze_metrics_pb2, training_metrics_pb2, training_pb2
 from src.metrics.metric_events import (
+    LocalMetricProjector,
+    LocalTrainUpdateMetricWriter,
+    MAZE_METRIC_SCHEMA_ID,
+    MetricSchemaCatalog,
+    RawMetricBatchStore,
     _episode_event_statistics,
     _render_episode_statistics,
     _render_train_statistics,
@@ -10,8 +18,15 @@ from src.metrics.metric_events import (
 
 
 class LearnerMetricCalculationTest(unittest.TestCase):
+    @staticmethod
+    def _digest(value: str) -> common_pb2.ContentDigest:
+        return common_pb2.ContentDigest(
+            algorithm=common_pb2.DIGEST_ALGORITHM_SHA256,
+            hex=value,
+        )
+
     def test_episode_metrics_are_derived_from_raw_agent_facts(self):
-        fact = training_pb2.EpisodeMetricFact(
+        fact = maze_metrics_pb2.EpisodeMetricFact(
             environment_instance_id="environment-fixed",
             episode_id="episode-fixed",
         )
@@ -85,7 +100,7 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         )
 
     def test_train_metrics_are_derived_from_raw_sum_counts(self):
-        fact = training_pb2.TrainUpdateMetricFact(
+        fact = training_metrics_pb2.TrainUpdateMetricFact(
             train_update_id="train-update-00000003",
             train_update_sequence=3,
             delivery_id="delivery-fixed",
@@ -116,6 +131,137 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         self.assertEqual(
             rendered["values"]["ppo"]["value_loss"]["mean"], 0.64
         )
+
+    def test_metric_payloads_follow_schema_owned_transport(self):
+        schema_directory = Path(__file__).resolve().parents[1] / "schemas"
+        catalog = MetricSchemaCatalog.load(schema_directory)
+        contract = common_pb2.ContractIdentity(
+            package_name="rl-contracts",
+            package_version="0.15.0",
+            platform="producer-platform",
+        )
+        learner = common_pb2.ServiceInstanceIdentity(
+            component="learner",
+            instance_id="learner-metric-test",
+            lifecycle_epoch=1,
+        )
+        aiserver = common_pb2.ServiceInstanceIdentity(
+            component="aiserver",
+            instance_id="aiserver-metric-test",
+            lifecycle_epoch=1,
+        )
+        train_fact = training_metrics_pb2.TrainUpdateMetricFact(
+            train_update_id="train-update-1",
+            train_update_sequence=1,
+            published_model=training_pb2.ModelIdentity(
+                model_lineage_id="lineage-test",
+                model_step=1,
+                artifact_digest=self._digest("a" * 64),
+                manifest_digest=self._digest("b" * 64),
+            ),
+            delivery_id="delivery-test",
+            training_contract_digest=self._digest("c" * 64),
+            cumulative_trained_samples=2,
+            actual_batch_size=2,
+            minimum_behavior_model_step=0,
+            maximum_behavior_model_step=0,
+            behavior_model_lineage_id="lineage-test",
+        )
+        train_fact.ppo_statistics.add(
+            field_id="policy_loss", sum=-0.4, count=2
+        )
+        episode_fact = maze_metrics_pb2.EpisodeMetricFact(
+            environment_instance_id="environment-test",
+            episode_id="episode-test",
+            training_contract_digest=self._digest("c" * 64),
+        )
+        agent = episode_fact.agents.add(
+            agent_id=0,
+            episode_return=1.0,
+            transition_count=2,
+            success=True,
+            termination_reason="completed",
+            shortest_action_steps=1,
+            unique_cell_count=2,
+            blocked_move_count=0,
+            attempted_move_count=2,
+            minimum_behavior_model_step=0,
+            maximum_behavior_model_step=0,
+            behavior_model_lineage_id="lineage-test",
+        )
+        agent.reward_components.add(
+            field_id="goal_reward", sum=1.0, count=2
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = RawMetricBatchStore(
+                Path(directory) / "metrics.sqlite3", contract, catalog
+            )
+            try:
+                writer = LocalTrainUpdateMetricWriter(store, learner)
+                train_bytes = train_fact.SerializeToString(deterministic=True)
+                writer.append(train_fact, observed_at_unix_ms=1700000000000)
+
+                episode_bytes = episode_fact.SerializeToString(
+                    deterministic=True
+                )
+                episode_batch = training_pb2.MetricBatch(
+                    contract=contract,
+                    schema_identity=catalog.schema_identity(
+                        MAZE_METRIC_SCHEMA_ID
+                    ),
+                    source=aiserver,
+                    batch_sequence=1,
+                    created_at_unix_ms=1700000000001,
+                    first_event_sequence=1,
+                    last_event_sequence=1,
+                    events=[
+                        training_pb2.MetricEvent(
+                            event_sequence=1,
+                            observed_at_unix_ms=1700000000001,
+                            fact_payload=episode_bytes,
+                        )
+                    ],
+                )
+                canonical = training_pb2.MetricBatch()
+                canonical.CopyFrom(episode_batch)
+                canonical.ClearField("batch_digest")
+                episode_batch.batch_digest.CopyFrom(
+                    self._digest(
+                        hashlib.sha256(
+                            canonical.SerializeToString(deterministic=True)
+                        ).hexdigest()
+                    )
+                )
+                cursor = store.persist_batch("aiserver", episode_batch)
+                store.mark_acknowledged(episode_batch, cursor)
+
+                batches = store.committed_batches_after(0)
+                payloads = {
+                    batch.schema_identity.schema_id:
+                    batch.events[0].fact_payload
+                    for _, _, _, batch in batches
+                    if batch.events
+                }
+                self.assertEqual(
+                    payloads["rl.training.metrics"], train_bytes
+                )
+                self.assertEqual(
+                    payloads["maze.episode.metrics"], episode_bytes
+                )
+                snapshot = LocalMetricProjector(store).snapshot()
+                self.assertEqual(
+                    snapshot["train_updates"]["windows"]["all"]
+                    ["raw"]["train_update_count"],
+                    1,
+                )
+                self.assertEqual(
+                    snapshot["episodes"]["windows"]["all"]
+                    ["raw"]["environment_episode_count"],
+                    1,
+                )
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

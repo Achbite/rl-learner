@@ -29,6 +29,9 @@ def resolve(arguments: Sequence[str]) -> dict:
         "metrics_port": int(config["dashboard"]["server_port"]),
         "metrics_enabled": 1 if config["dashboard"]["enabled"] else 0,
         "metric_event_port": int(config["metric_events"]["server_port"]),
+        "contract_package": config["contract"]["package_name"],
+        "contract_version": config["contract"]["package_version"],
+        "contract_platform": config["contract"]["platform"],
     }
 
 
@@ -57,6 +60,9 @@ def main() -> int:
             "metrics_port",
             "metrics_enabled",
             "metric_event_port",
+            "contract_package",
+            "contract_version",
+            "contract_platform",
         ):
             value = str(document[field])
             if "\n" in value or "\r" in value:

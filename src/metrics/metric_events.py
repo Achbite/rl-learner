@@ -17,12 +17,19 @@ from typing import Callable, Iterable
 
 import grpc
 
-from proto import common_pb2, training_pb2, training_pb2_grpc
+from proto import (
+    common_pb2,
+    maze_metrics_pb2,
+    training_metrics_pb2,
+    training_pb2,
+    training_pb2_grpc,
+)
 
 
 SHA256 = re.compile(r"[a-f0-9]{64}")
-METRIC_SCHEMA_ID = "maze.metrics"
 METRIC_SCHEMA_VERSION = 1
+MAZE_METRIC_SCHEMA_ID = "maze.episode.metrics"
+TRAINING_METRIC_SCHEMA_ID = "rl.training.metrics"
 
 
 class MetricEventContractError(ValueError):
@@ -32,6 +39,14 @@ class MetricEventContractError(ValueError):
 def _same_message(left, right) -> bool:
     return left.SerializeToString(deterministic=True) == right.SerializeToString(
         deterministic=True
+    )
+
+
+def _same_contract(left, right) -> bool:
+    return (
+        bool(left.package_name)
+        and left.package_name == right.package_name
+        and left.package_version == right.package_version
     )
 
 
@@ -79,75 +94,159 @@ def _content_digest(hex_digest: str) -> common_pb2.ContentDigest:
 
 
 class MetricSchemaCatalog:
-    """Canonical field catalog and SchemaIdentity loaded from contract bytes."""
+    """Schema-owned fact codecs selected by MetricBatch.schema_identity."""
 
-    def __init__(self, document: dict, canonical_digest: str):
-        if document.get("catalog_schema") != "rl.metric-field-catalog.v1":
-            raise MetricEventContractError("metric catalog format is unsupported")
-        if document.get("schema_id") != METRIC_SCHEMA_ID:
-            raise MetricEventContractError("metric catalog schema_id is invalid")
-        if int(document.get("schema_version", 0)) != METRIC_SCHEMA_VERSION:
-            raise MetricEventContractError("metric catalog schema_version is invalid")
-        fields = document.get("fields")
-        if not isinstance(fields, list) or not fields:
-            raise MetricEventContractError("metric catalog fields are missing")
-        identities: list[tuple[str, str]] = []
-        by_fact: dict[str, set[str]] = {
-            "agent_episode": set(),
-            "train_update": set(),
-        }
-        for field in fields:
-            if not isinstance(field, dict):
-                raise MetricEventContractError("metric catalog field is invalid")
-            fact = str(field.get("fact", ""))
-            field_id = str(field.get("field_id", ""))
-            if fact not in by_fact or not field_id:
-                raise MetricEventContractError("metric catalog identity is invalid")
-            if field.get("aggregation") != "raw_sum_count":
+    FILES = {
+        MAZE_METRIC_SCHEMA_ID: "maze.episode.metrics.json",
+        TRAINING_METRIC_SCHEMA_ID: "training.metrics.json",
+    }
+    FACT_NAMES = {
+        MAZE_METRIC_SCHEMA_ID: "agent_episode",
+        TRAINING_METRIC_SCHEMA_ID: "train_update",
+    }
+    MESSAGE_TYPES = {
+        MAZE_METRIC_SCHEMA_ID: maze_metrics_pb2.EpisodeMetricFact,
+        TRAINING_METRIC_SCHEMA_ID: training_metrics_pb2.TrainUpdateMetricFact,
+    }
+    ROLE_SCHEMAS = {
+        "aiserver": MAZE_METRIC_SCHEMA_ID,
+        "learner": TRAINING_METRIC_SCHEMA_ID,
+    }
+
+    def __init__(self, entries: dict[str, tuple[dict, str]]):
+        if set(entries) != set(self.FILES):
+            raise MetricEventContractError("metric schema set is incomplete")
+        self._documents: dict[str, dict] = {}
+        self._digests: dict[str, str] = {}
+        self._fields: dict[str, set[str]] = {}
+        for schema_id, (document, canonical_digest) in entries.items():
+            if document.get("catalog_schema") != "rl.metric-field-catalog.v1":
                 raise MetricEventContractError(
-                    "metric catalog aggregation must be raw_sum_count"
+                    "metric catalog format is unsupported"
                 )
-            identities.append((fact, field_id))
-            by_fact[fact].add(field_id)
-        if identities != sorted(identities) or len(identities) != len(
-            set(identities)
-        ):
-            raise MetricEventContractError(
-                "metric catalog identities must be unique and sorted"
-            )
-        if any(not values for values in by_fact.values()):
-            raise MetricEventContractError("metric catalog fact fields are empty")
-        if SHA256.fullmatch(canonical_digest) is None:
-            raise MetricEventContractError("metric catalog digest is invalid")
-        self.document = document
-        self.canonical_digest = canonical_digest
-        self.fields_by_fact = by_fact
+            if document.get("schema_id") != schema_id:
+                raise MetricEventContractError(
+                    "metric catalog schema_id is invalid"
+                )
+            if int(document.get("schema_version", 0)) != METRIC_SCHEMA_VERSION:
+                raise MetricEventContractError(
+                    "metric catalog schema_version is invalid"
+                )
+            fields = document.get("fields")
+            if not isinstance(fields, list) or not fields:
+                raise MetricEventContractError("metric catalog fields are missing")
+            expected_fact = self.FACT_NAMES[schema_id]
+            identities: list[tuple[str, str]] = []
+            field_ids: set[str] = set()
+            for field in fields:
+                if not isinstance(field, dict):
+                    raise MetricEventContractError(
+                        "metric catalog field is invalid"
+                    )
+                fact = str(field.get("fact", ""))
+                field_id = str(field.get("field_id", ""))
+                if fact != expected_fact or not field_id:
+                    raise MetricEventContractError(
+                        "metric catalog identity is invalid"
+                    )
+                if field.get("aggregation") != "raw_sum_count":
+                    raise MetricEventContractError(
+                        "metric catalog aggregation must be raw_sum_count"
+                    )
+                identities.append((fact, field_id))
+                field_ids.add(field_id)
+            if identities != sorted(identities) or len(identities) != len(
+                set(identities)
+            ):
+                raise MetricEventContractError(
+                    "metric catalog identities must be unique and sorted"
+                )
+            if SHA256.fullmatch(canonical_digest) is None:
+                raise MetricEventContractError("metric catalog digest is invalid")
+            self._documents[schema_id] = document
+            self._digests[schema_id] = canonical_digest
+            self._fields[schema_id] = field_ids
 
     @classmethod
     def load(cls, directory: Path) -> "MetricSchemaCatalog":
-        catalog_path = directory / "maze.metrics.json"
-        digest_path = directory / "maze.metrics.sha256"
-        catalog_bytes = catalog_path.read_bytes()
-        actual_digest = hashlib.sha256(catalog_bytes).hexdigest()
-        declared_digest = digest_path.read_text(encoding="utf-8").strip()
-        if declared_digest != actual_digest:
-            raise MetricEventContractError("metric catalog digest mismatch")
-        try:
-            document = json.loads(catalog_bytes)
-        except json.JSONDecodeError as error:
-            raise MetricEventContractError(
-                f"metric catalog JSON is invalid: {error}"
-            ) from error
-        if not isinstance(document, dict):
-            raise MetricEventContractError("metric catalog must be an object")
-        return cls(document, actual_digest)
+        entries: dict[str, tuple[dict, str]] = {}
+        for schema_id, filename in cls.FILES.items():
+            catalog_bytes = (directory / filename).read_bytes()
+            try:
+                document = json.loads(catalog_bytes)
+            except json.JSONDecodeError as error:
+                raise MetricEventContractError(
+                    f"metric catalog JSON is invalid: {error}"
+                ) from error
+            if not isinstance(document, dict):
+                raise MetricEventContractError(
+                    "metric catalog must be an object"
+                )
+            entries[schema_id] = (
+                document,
+                hashlib.sha256(catalog_bytes).hexdigest(),
+            )
+        return cls(entries)
 
-    def schema_identity(self) -> common_pb2.SchemaIdentity:
+    def schema_identity(self, schema_id: str) -> common_pb2.SchemaIdentity:
+        if schema_id not in self._digests:
+            raise MetricEventContractError("metric schema is unsupported")
         return common_pb2.SchemaIdentity(
-            schema_id=METRIC_SCHEMA_ID,
+            schema_id=schema_id,
             schema_version=METRIC_SCHEMA_VERSION,
-            canonical_digest=_content_digest(self.canonical_digest),
+            canonical_digest=_content_digest(self._digests[schema_id]),
         )
+
+    def validate_identity(
+        self, identity: common_pb2.SchemaIdentity
+    ) -> str:
+        schema_id = str(identity.schema_id)
+        if schema_id not in self._digests or not _same_message(
+            identity, self.schema_identity(schema_id)
+        ):
+            raise MetricEventContractError(
+                "metric batch schema identity mismatch"
+            )
+        return schema_id
+
+    def fields_for(self, schema_id: str) -> set[str]:
+        try:
+            return self._fields[schema_id]
+        except KeyError as error:
+            raise MetricEventContractError(
+                "metric schema is unsupported"
+            ) from error
+
+    def schema_id_for_role(self, role: str) -> str:
+        try:
+            return self.ROLE_SCHEMAS[role]
+        except KeyError as error:
+            raise MetricEventContractError(
+                "metric source role is invalid"
+            ) from error
+
+    def decode(self, identity: common_pb2.SchemaIdentity, payload: bytes):
+        schema_id = self.validate_identity(identity)
+        if not payload:
+            raise MetricEventContractError("metric fact payload is missing")
+        message = self.MESSAGE_TYPES[schema_id]()
+        try:
+            message.ParseFromString(payload)
+        except Exception as error:
+            raise MetricEventContractError(
+                "metric fact payload does not match its schema"
+            ) from error
+        return schema_id, message
+
+    def identities_document(self) -> dict[str, dict]:
+        return {
+            schema_id: {
+                "schema_id": schema_id,
+                "schema_version": METRIC_SCHEMA_VERSION,
+                "canonical_digest": self._digests[schema_id],
+            }
+            for schema_id in sorted(self._digests)
+        }
 
 
 def default_metric_schema_directory() -> Path:
@@ -156,7 +255,7 @@ def default_metric_schema_directory() -> Path:
         return Path(configured).resolve()
     repository = Path(__file__).resolve().parents[2]
     local = repository / "schemas"
-    if (local / "maze.metrics.json").is_file():
+    if all((local / filename).is_file() for filename in MetricSchemaCatalog.FILES.values()):
         return local
     sibling_contracts = repository.parent / "rl-contracts" / "schemas"
     return sibling_contracts
@@ -173,7 +272,7 @@ def _validate_sum_counts(
     for item in values:
         if item.field_id not in allowed_fields:
             raise MetricEventContractError(
-                f"{owner} field_id is outside maze.metrics: {item.field_id}"
+                f"{owner} field_id is outside its metric schema: {item.field_id}"
             )
         if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
             raise MetricEventContractError(
@@ -183,15 +282,16 @@ def _validate_sum_counts(
 
 def _validate_event(
     event: training_pb2.MetricEvent,
+    schema_identity: common_pb2.SchemaIdentity,
     catalog: MetricSchemaCatalog,
 ) -> None:
     if int(event.event_sequence) <= 0 or not _has_field(
         event, "observed_at_unix_ms"
     ):
         raise MetricEventContractError("metric event identity is invalid")
-    fact = event.WhichOneof("fact")
-    if fact == "episode":
-        episode = event.episode
+    schema_id, fact = catalog.decode(schema_identity, event.fact_payload)
+    if schema_id == MAZE_METRIC_SCHEMA_ID:
+        episode = fact
         if not (
             episode.environment_instance_id
             and episode.episode_id
@@ -205,15 +305,6 @@ def _validate_event(
             if not agent.termination_reason:
                 raise MetricEventContractError(
                     "agent episode termination_reason is missing"
-                )
-            goal_reached = agent.termination_reason.endswith(
-                "GOAL_REACHED"
-            )
-            if bool(agent.success) != goal_reached or goal_reached != _has_field(
-                agent, "goal_rank_group"
-            ):
-                raise MetricEventContractError(
-                    "agent episode outcome and goal rank disagree"
                 )
             if not agent.behavior_model_lineage_id:
                 raise MetricEventContractError(
@@ -236,7 +327,7 @@ def _validate_event(
                 )
             _validate_sum_counts(
                 agent.reward_components,
-                catalog.fields_by_fact["agent_episode"],
+                catalog.fields_for(MAZE_METRIC_SCHEMA_ID),
                 "episode reward component",
             )
             if any(
@@ -256,8 +347,8 @@ def _validate_event(
                 raise MetricEventContractError(
                     "reward components do not conserve agent episode return"
                 )
-    elif fact == "train_update":
-        update = event.train_update
+    elif schema_id == TRAINING_METRIC_SCHEMA_ID:
+        update = fact
         if not (
             update.train_update_id
             and int(update.train_update_sequence) > 0
@@ -281,11 +372,11 @@ def _validate_event(
             )
         _validate_sum_counts(
             update.ppo_statistics,
-            catalog.fields_by_fact["train_update"],
+            catalog.fields_for(TRAINING_METRIC_SCHEMA_ID),
             "PPO statistic",
         )
     else:
-        raise MetricEventContractError("metric event fact is missing")
+        raise MetricEventContractError("metric event schema is unsupported")
 
 
 def validate_metric_batch(
@@ -296,11 +387,9 @@ def validate_metric_batch(
     source: common_pb2.ServiceInstanceIdentity,
     previous_cursor: training_pb2.MetricBatchCursor,
 ) -> None:
-    schema = catalog.schema_identity()
-    if not _same_message(batch.contract, contract):
+    catalog.validate_identity(batch.schema_identity)
+    if not _same_contract(batch.contract, contract):
         raise MetricEventContractError("metric batch contract identity mismatch")
-    if not _same_message(batch.schema_identity, schema):
-        raise MetricEventContractError("metric batch schema identity mismatch")
     if not _same_message(batch.source, source):
         raise MetricEventContractError("metric batch source identity mismatch")
     if not _same_message(previous_cursor.source, source):
@@ -331,7 +420,7 @@ def validate_metric_batch(
         ):
             raise MetricEventContractError("metric event batch bounds are invalid")
         for event in batch.events:
-            _validate_event(event, catalog)
+            _validate_event(event, batch.schema_identity, catalog)
         next_event = sequences[-1]
     elif batch.HasField("gap"):
         gap = batch.gap
@@ -607,6 +696,13 @@ class RawMetricBatchStore:
         role: str,
         batch: training_pb2.MetricBatch,
     ) -> training_pb2.MetricBatchCursor:
+        if (
+            batch.schema_identity.schema_id
+            != self.catalog.schema_id_for_role(role)
+        ):
+            raise MetricEventContractError(
+                "metric schema owner differs from durable source role"
+            )
         self.activate_source(role, batch.source)
         key = _source_key(batch.source)
         now_ms = int(time.time() * 1000)
@@ -1104,7 +1200,7 @@ class LearnerMetricEventService(
         response = training_pb2.GetMetricBatchRsp()
         self._fill_availability(response)
         if (
-            not _same_message(request.contract, self.contract)
+            not _same_contract(request.contract, self.contract)
             or not self._valid_consumer(request.consumer)
             or not _same_message(request.cursor.source, self.source)
         ):
@@ -1173,7 +1269,7 @@ class LearnerMetricEventService(
         response = training_pb2.AckMetricBatchRsp()
         self._fill_availability(response)
         if (
-            not _same_message(request.contract, self.contract)
+            not _same_contract(request.contract, self.contract)
             or not self._valid_consumer(request.consumer)
             or not _same_message(request.cursor.source, self.source)
             or not self.store.bind_export_consumer(
@@ -1371,7 +1467,7 @@ def _merge_train_statistics(target: dict, source: dict) -> None:
 
 
 def _episode_event_statistics(
-    fact: training_pb2.EpisodeMetricFact,
+    fact: maze_metrics_pb2.EpisodeMetricFact,
 ) -> dict:
     result = _empty_episode_statistics()
     result["environment_episode_count"] = 1
@@ -1447,7 +1543,9 @@ def _episode_event_statistics(
     return result
 
 
-def _train_event_statistics(fact: training_pb2.TrainUpdateMetricFact) -> dict:
+def _train_event_statistics(
+    fact: training_metrics_pb2.TrainUpdateMetricFact,
+) -> dict:
     result = _empty_train_statistics()
     result["train_update_count"] = 1
     result["actual_batch_size_sum"] = int(fact.actual_batch_size)
@@ -1625,9 +1723,12 @@ class LocalMetricProjector:
         )
 
     def _accept_episode(
-        self, source_key: str, event: training_pb2.MetricEvent
+        self,
+        source_key: str,
+        event: training_pb2.MetricEvent,
+        fact: maze_metrics_pb2.EpisodeMetricFact,
     ) -> None:
-        statistics = _episode_event_statistics(event.episode)
+        statistics = _episode_event_statistics(fact)
         self._episode_source_keys.add(source_key)
         self._episode_recent.append(statistics)
         self._episode_latest = statistics
@@ -1651,9 +1752,12 @@ class LocalMetricProjector:
         _merge_episode_statistics(bucket, statistics)
 
     def _accept_train(
-        self, source_key: str, event: training_pb2.MetricEvent
+        self,
+        source_key: str,
+        event: training_pb2.MetricEvent,
+        fact: training_metrics_pb2.TrainUpdateMetricFact,
     ) -> None:
-        statistics = _train_event_statistics(event.train_update)
+        statistics = _train_event_statistics(fact)
         self._train_source_keys.add(source_key)
         self._train_latest = statistics
         _merge_train_statistics(self._train_all, statistics)
@@ -1693,11 +1797,16 @@ class LocalMetricProjector:
         batches = self.store.committed_batches_after(self._last_row_id)
         for row_id, role, source_key, batch in batches:
             for event in batch.events:
-                fact = event.WhichOneof("fact")
-                if role == "aiserver" and fact == "episode":
-                    self._accept_episode(source_key, event)
-                elif role == "learner" and fact == "train_update":
-                    self._accept_train(source_key, event)
+                schema_id, fact = self.store.catalog.decode(
+                    batch.schema_identity, event.fact_payload
+                )
+                if role == "aiserver" and schema_id == MAZE_METRIC_SCHEMA_ID:
+                    self._accept_episode(source_key, event, fact)
+                elif (
+                    role == "learner"
+                    and schema_id == TRAINING_METRIC_SCHEMA_ID
+                ):
+                    self._accept_train(source_key, event, fact)
                 else:
                     raise MetricEventContractError(
                         "metric fact owner differs from durable source role"
@@ -1813,11 +1922,7 @@ class LocalMetricProjector:
                 window_kind="latest_train_update",
             )
             return {
-                "schema_identity": {
-                    "schema_id": METRIC_SCHEMA_ID,
-                    "schema_version": METRIC_SCHEMA_VERSION,
-                    "canonical_digest": self.store.catalog.canonical_digest,
-                },
+                "schema_identities": self.store.catalog.identities_document(),
                 "view_revision": self._view_revision,
                 "status": status,
                 "multi_server_aggregation_performed": False,
@@ -1891,7 +1996,9 @@ class LocalTrainUpdateMetricWriter:
             )
         batch = training_pb2.MetricBatch(
             contract=self.store.contract,
-            schema_identity=self.store.catalog.schema_identity(),
+            schema_identity=self.store.catalog.schema_identity(
+                TRAINING_METRIC_SCHEMA_ID
+            ),
             source=self.source,
             batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
             created_at_unix_ms=created_at_unix_ms,
@@ -1910,7 +2017,7 @@ class LocalTrainUpdateMetricWriter:
 
     def append(
         self,
-        fact: training_pb2.TrainUpdateMetricFact,
+        fact: training_metrics_pb2.TrainUpdateMetricFact,
         observed_at_unix_ms: int,
     ) -> None:
         with self._lock:
@@ -1949,11 +2056,13 @@ class LocalTrainUpdateMetricWriter:
             event = training_pb2.MetricEvent(
                 event_sequence=event_sequence,
                 observed_at_unix_ms=observed_at,
-                train_update=fact,
+                fact_payload=fact.SerializeToString(deterministic=True),
             )
             batch = training_pb2.MetricBatch(
                 contract=self.store.contract,
-                schema_identity=self.store.catalog.schema_identity(),
+                schema_identity=self.store.catalog.schema_identity(
+                    TRAINING_METRIC_SCHEMA_ID
+                ),
                 source=self.source,
                 batch_sequence=batch_sequence,
                 created_at_unix_ms=int(time.time() * 1000),
@@ -1974,7 +2083,9 @@ class LocalTrainUpdateMetricWriter:
             finalized_at_unix_ms = int(time.time() * 1000)
             batch = training_pb2.MetricBatch(
                 contract=self.store.contract,
-                schema_identity=self.store.catalog.schema_identity(),
+                schema_identity=self.store.catalog.schema_identity(
+                    TRAINING_METRIC_SCHEMA_ID
+                ),
                 source=self.source,
                 batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
                 created_at_unix_ms=finalized_at_unix_ms,
@@ -2119,7 +2230,7 @@ class AIServerMetricRelay:
         status = self.status_stub.GetAIServerStatus(
             training_pb2.AIServerStatusReq(), timeout=1.5
         )
-        if not _same_message(status.contract, self.contract):
+        if not _same_contract(status.contract, self.contract):
             raise MetricEventContractError(
                 "AIServer metric source contract identity mismatch"
             )

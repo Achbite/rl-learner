@@ -1,19 +1,19 @@
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from main.training_runtime import train_processed_delivery
 from proto import training_pb2
+from src.config.effective_config import load_effective_config
+from src.contracts.identity import validate_config
 from src.training.ppo_trainer import PPOTrainer
 
 
-def _trainer_config() -> dict:
+def _trainer_config(contract_path: Path) -> dict:
     return {
         "contract": {
-            "training_contract_path": str(
-                Path(__file__).resolve().parents[1]
-                / "schemas"
-                / "training-contract.json"
-            )
+            "training_contract_path": str(contract_path)
         },
         "training": {
             "device": "cpu",
@@ -34,10 +34,16 @@ def _trainer_config() -> dict:
 
 class LearnerDevelopmentTest(unittest.TestCase):
     @staticmethod
-    def _transition(index: int) -> training_pb2.ProcessedTransition:
+    def _transition(
+        index: int,
+        observation_dimension: int,
+        action_count: int,
+    ) -> training_pb2.ProcessedTransition:
+        action_mask = [False] * action_count
+        action_mask[index] = True
         return training_pb2.ProcessedTransition(
             item_id=f"item-{index}",
-            observation=[float(index)] * 17,
+            observation=[float(index)] * observation_dimension,
             action=index,
             behavior_log_probability=-0.5 - index,
             behavior_value=0.2 + 0.1 * index,
@@ -45,23 +51,43 @@ class LearnerDevelopmentTest(unittest.TestCase):
             value_target=0.01485 if index == 0 else 0.0,
             behavior_model_step=0,
             created_at_unix_ms=1700000000000 + index,
+            action_mask=action_mask,
         )
 
     def test_processed_transitions_reach_real_trainer(self):
+        repository = Path(__file__).resolve().parents[1]
+        contract = json.loads(
+            (repository / "schemas" / "training-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        contract["observation_dimension"] = 5
+        contract["action_count"] = 4
+        contract["hidden_dimension"] = 8
+        contract["policy"]["action_mask_mode"] = "required"
         response = training_pb2.GetBatchRsp(
             result=training_pb2.GET_BATCH_RESULT_LEASED,
             delivery_id="delivery-test",
         )
         for index in range(2):
             response.items.add(
-                transition=self._transition(index),
+                transition=self._transition(
+                    index,
+                    contract["observation_dimension"],
+                    contract["action_count"],
+                ),
                 insert_sequence=index + 1,
                 inserted_at_unix_ms=1700000000100 + index,
                 draw_count=1,
             )
 
-        trainer = PPOTrainer(_trainer_config())
-        batch, stats = train_processed_delivery(response.items, trainer)
+        with tempfile.TemporaryDirectory() as directory:
+            contract_path = Path(directory) / "training-contract.json"
+            contract_path.write_text(
+                json.dumps(contract, sort_keys=True), encoding="utf-8"
+            )
+            trainer = PPOTrainer(_trainer_config(contract_path))
+            batch, stats = train_processed_delivery(response.items, trainer)
 
         self.assertEqual(len(batch), 2)
         self.assertEqual(stats["sample_evaluation_count"], 2)
@@ -83,7 +109,29 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 sample["old_value_prediction"],
                 float(transition.behavior_value),
             )
+            self.assertEqual(
+                sample["action_mask"], list(transition.action_mask)
+            )
             self.assertEqual(sample["advantage"], float(transition.advantage))
             self.assertEqual(
                 sample["value_target"], float(transition.value_target)
             )
+
+    def test_local_effective_config_reaches_runtime_validation(self):
+        repository = Path(__file__).resolve().parents[1]
+        config = load_effective_config(
+            str(repository / "configs" / "learner_config.yaml"),
+            environment={
+                "RL_MODEL_LINEAGE_ID": "maze-model-local-config-test",
+                "RL_PPO_TRAIN_BATCH_SIZE": "32",
+                "RL_PPO_MINI_BATCH_SIZE": "16",
+                "RL_PPO_N_EPOCHS": "1",
+                "RL_PPO_TMAX": "16",
+            },
+        )
+
+        validate_config(config)
+        self.assertEqual(config["training"]["train_batch_size"], 32)
+        self.assertEqual(config["training"]["mini_batch_size"], 16)
+        self.assertEqual(config["training"]["n_epochs"], 1)
+        self.assertEqual(config["training"]["tmax"], 16)

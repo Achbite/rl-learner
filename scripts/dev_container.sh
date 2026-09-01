@@ -7,7 +7,6 @@ if [ "$#" -gt 0 ]; then
     shift
 fi
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workspace_root="${RL_TRAINING_WORKSPACE:-$(cd "${repo_dir}/.." && pwd)}"
 container_name="learner-dev"
 network_name="rl-training-dev"
 monitor_host_port=9005
@@ -15,9 +14,8 @@ monitor_tunnel_socket="${TMPDIR:-/tmp}/rl-training-learner-dev-9005.sock"
 colima_ssh_config="${RL_COLIMA_SSH_CONFIG:-${HOME}/.colima/_lima/colima/ssh.config}"
 tag="${LEARNER_DEV_IMAGE_TAG:-test-001}"
 dev_image="rl-training/learner-dev:${tag}"
-python_dev_base_image="${LEARNER_DEV_BASE_IMAGE:-python@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6}"
+python_dev_base_image="${LEARNER_DEV_BASE_IMAGE:-python:3.11-slim}"
 torch_version="${LEARNER_DEV_TORCH_VERSION:-2.12.1+cpu}"
-source "${repo_dir}/artifact_versions.env"
 if [ -f "/.dockerenv" ]; then
     echo "make shell is a host-side Docker entrypoint; leave the component container first" >&2
     exit 1
@@ -31,35 +29,6 @@ if ! platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/de
     echo "make shell cannot reach the host Docker daemon" >&2
     exit 1
 fi
-dev_image_input_digest() {
-    python3 - \
-        "${repo_dir}/Dockerfile.dev" \
-        "${repo_dir}/requirements.txt" \
-        "${repo_dir}/artifact_versions.env" \
-        "${repo_dir}/scripts/dev_container.sh" \
-        "${platform}" \
-        "${python_dev_base_image}" \
-        "${torch_version}" <<'PY'
-import hashlib
-import sys
-from pathlib import Path
-
-digest = hashlib.sha256()
-for raw in sys.argv[1:5]:
-    path = Path(raw)
-    digest.update(path.name.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(path.read_bytes())
-    digest.update(b"\0")
-for value in sys.argv[5:]:
-    digest.update(value.encode("utf-8"))
-    digest.update(b"\0")
-print(digest.hexdigest())
-PY
-}
-
-dev_input_digest="$(dev_image_input_digest)"
-
 tcp_ready() {
     nc -z 127.0.0.1 "${monitor_host_port}" >/dev/null 2>&1
 }
@@ -276,41 +245,55 @@ build_image() {
         --build-arg "PYTHON_DEV_BASE_IMAGE=${python_dev_base_image}" \
         --build-arg "TORCH_VERSION=${torch_version}" \
         --label "org.rl-training.component=learner-dev" \
-        --label "org.rl-training.dev-input-digest=${dev_input_digest}" \
         --label "org.rl-training.dev-platform=${platform}" \
         --tag "${dev_image}" \
         "${repo_dir}"
 }
 
 ensure_dev_image() {
-    local actual_digest=""
-    if docker image inspect "${dev_image}" >/dev/null 2>&1; then
-        actual_digest="$(
-            docker image inspect \
-                --format '{{index .Config.Labels "org.rl-training.dev-input-digest"}}' \
-                "${dev_image}"
-        )"
-    fi
-    if [ "${actual_digest}" != "${dev_input_digest}" ]; then
-        echo "Building Learner development image for input ${dev_input_digest:0:12}" >&2
-        build_image
-    fi
+    echo "Building Learner development image" >&2
+    build_image
 }
 
-prepare_development_artifacts() {
-    local artifact_set
-    artifact_set="$(
-        RL_TRAINING_WORKSPACE="${workspace_root}" \
-            bash "${repo_dir}/scripts/prepare_dev_artifacts.sh"
-    )"
-    IFS=$'\t' read -r \
-        contract_dir sample_pool_dir model_distributor_dir \
-        <<< "${artifact_set}"
-    if [ -z "${contract_dir:-}" ] ||
-       [ -z "${sample_pool_dir:-}" ] ||
-       [ -z "${model_distributor_dir:-}" ]; then
-        echo "development artifact preparation returned an invalid artifact set" >&2
-        return 1
+container_exists() {
+    docker container inspect "${container_name}" >/dev/null 2>&1
+}
+
+container_running() {
+    [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" = "true" ]
+}
+
+container_uses_current_image() {
+    docker image inspect "${dev_image}" >/dev/null 2>&1 || return 1
+    [ "$(docker inspect --format '{{.Image}}' "${container_name}")" = \
+      "$(docker image inspect --format '{{.Id}}' "${dev_image}")" ]
+}
+
+container_has_legacy_artifact_mounts() {
+    local destinations
+    destinations="$(docker inspect \
+        --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
+        "${container_name}")"
+    case "${destinations}" in
+        *"/workspace/rl-learner/proto/common_pb2.py"*|\
+        *"/workspace/rl-learner/proto/training_pb2.py"*|\
+        *"/workspace/rl-learner/proto/training_pb2_grpc.py"*|\
+        *"/workspace/rl-learner/schemas"*|\
+        *"/workspace/rl-learner/sample-pool"*|\
+        *"/workspace/rl-learner/model-distributor"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+warn_container_drift() {
+    if docker image inspect "${dev_image}" >/dev/null 2>&1 &&
+       ! container_uses_current_image; then
+        echo "learner-dev uses an older local image; run make dev-refresh when ready" >&2
+    fi
+    if container_has_legacy_artifact_mounts; then
+        echo "learner-dev still has retired external artifact mounts; run make dev-refresh to use repository-owned inputs" >&2
     fi
 }
 
@@ -322,53 +305,12 @@ create_container() {
         --network-alias "maze-learner" \
         --publish "127.0.0.1::9005" \
         --volume "${repo_dir}:/workspace/rl-learner" \
-        --volume "${contract_dir}/python/common_pb2.py:/workspace/rl-learner/proto/common_pb2.py:ro" \
-        --volume "${contract_dir}/python/training_pb2.py:/workspace/rl-learner/proto/training_pb2.py:ro" \
-        --volume "${contract_dir}/python/training_pb2_grpc.py:/workspace/rl-learner/proto/training_pb2_grpc.py:ro" \
-        --volume "${contract_dir}/schemas:/workspace/rl-learner/schemas:ro" \
-        --volume "${sample_pool_dir}:/workspace/rl-learner/sample-pool:ro" \
-        --volume "${model_distributor_dir}:/workspace/rl-learner/model-distributor:ro" \
         "${dev_image}" >/dev/null
-}
-
-container_mount_source() {
-    local destination="$1"
-    docker inspect \
-        --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}" \
-        "${container_name}"
-}
-
-container_uses_development_artifacts() {
-    local relative
-    for relative in common_pb2.py training_pb2.py training_pb2_grpc.py; do
-        if [ "$(container_mount_source "/workspace/rl-learner/proto/${relative}")" != \
-             "${contract_dir}/python/${relative}" ]; then
-            return 1
-        fi
-    done
-    if [ "$(container_mount_source "/workspace/rl-learner/schemas")" != \
-         "${contract_dir}/schemas" ]; then
-        return 1
-    fi
-    if [ "$(container_mount_source "/workspace/rl-learner/sample-pool")" != \
-         "${sample_pool_dir}" ]; then
-        return 1
-    fi
-    if [ "$(container_mount_source "/workspace/rl-learner/model-distributor")" != \
-         "${model_distributor_dir}" ]; then
-        return 1
-    fi
-}
-
-container_uses_current_image() {
-    [ "$(docker inspect --format '{{.Image}}' "${container_name}")" = \
-      "$(docker image inspect --format '{{.Id}}' "${dev_image}")" ]
 }
 
 container_has_training_processes() {
     local process_status
-    [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" = "true" ] ||
-        return 1
+    container_running || return 1
     set +e
     docker exec "${container_name}" sh -lc \
         "pgrep -f '[m]ain.training_runtime|[/]run.sh|[m]etrics_server.py|[m]aze_sample_pool|[m]aze_model_distributor' >/dev/null"
@@ -384,103 +326,60 @@ container_has_training_processes() {
     return 2
 }
 
-verify_development_artifact_permissions() {
-    python3 - \
-        "${contract_dir}/python/common_pb2.py" \
-        "${contract_dir}/python/training_pb2.py" \
-        "${contract_dir}/python/training_pb2_grpc.py" \
-        "${contract_dir}/schemas/maze.metrics.json" \
-        "${contract_dir}/schemas/maze.metrics.sha256" \
-        "${sample_pool_dir}/bin/maze_sample_pool" \
-        "${model_distributor_dir}/bin/maze_model_distributor" <<'PY'
-import os
-import stat
-import sys
-
-for raw in sys.argv[1:]:
-    if os.path.islink(raw):
-        raise SystemExit(f"Development artifact must not contain a symlink: {raw}")
-    mode = os.stat(raw).st_mode
-    if not stat.S_ISREG(mode) or not mode & stat.S_IROTH:
-        raise SystemExit(f"Development artifact is not container-readable: {raw}")
-PY
-}
-
-development_source_digest() {
-    python3 - "$1/manifest.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-value = manifest.get("development_source_digest", {})
-if value.get("algorithm") != "sha256" or not isinstance(
-    value.get("hex"), str
-):
-    raise SystemExit("development artifact source digest is missing")
-print(value["hex"])
-PY
-}
-
-verify_development_artifacts() {
-    local tool="${workspace_root}/rl-contracts/scripts/dev_artifact.py"
-    python3 "${tool}" verify \
-        --root "${contract_dir}" \
-        --package rl-contracts \
-        --version "${RL_CONTRACTS_VERSION}" \
-        --platform "${platform}" \
-        --source-digest "$(basename "${contract_dir}")"
-    python3 "${tool}" verify \
-        --root "${sample_pool_dir}" \
-        --package rl-sample-pool \
-        --version "${RL_SAMPLE_POOL_VERSION}" \
-        --platform "${platform}" \
-        --source-digest "$(development_source_digest "${sample_pool_dir}")" \
-        --contract-manifest "${contract_dir}/manifest.json"
-    python3 "${tool}" verify \
-        --root "${model_distributor_dir}" \
-        --package rl-model-distributor \
-        --version "${RL_MODEL_DISTRIBUTOR_VERSION}" \
-        --platform "${platform}" \
-        --source-digest "$(development_source_digest "${model_distributor_dir}")" \
-        --contract-manifest "${contract_dir}/manifest.json"
-}
-
-ensure_container() {
-    local process_state
-    ensure_dev_image
-    prepare_development_artifacts
-    verify_development_artifacts
-    verify_development_artifact_permissions
+ensure_container_resources() {
     if ! docker network inspect "${network_name}" >/dev/null 2>&1; then
         docker network create "${network_name}" >/dev/null
     fi
-    if ! docker container inspect "${container_name}" >/dev/null 2>&1; then
-        stop_monitor_transport
-        create_container
-    elif ! container_uses_development_artifacts ||
-         ! container_uses_current_image; then
+}
+
+ensure_container() {
+    if container_exists; then
+        if ! container_running; then
+            docker start "${container_name}" >/dev/null
+        fi
+        warn_container_drift
+        return
+    fi
+
+    ensure_dev_image
+    ensure_container_resources
+    stop_monitor_transport
+    create_container
+}
+
+refresh_container() {
+    local process_state
+    if container_exists && container_running; then
         process_state=0
         container_has_training_processes || process_state=$?
         if [ "${process_state}" -eq 0 ]; then
-            echo "learner-dev inputs changed while Learner business processes are active" >&2
-            echo "Stop the active training chain before recreating learner-dev" >&2
+            echo "learner-dev has active Learner, Sample Pool, Model Distributor, or Monitor processes" >&2
+            echo "Stop the active training chain before refreshing learner-dev" >&2
             exit 1
         elif [ "${process_state}" -ne 1 ]; then
             exit 1
         fi
-        echo "Recreating idle learner-dev for current development inputs" >&2
-        stop_monitor_transport
-        docker rm --force "${container_name}" >/dev/null
-        create_container
-    elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
-        docker start "${container_name}" >/dev/null
     fi
+
+    ensure_dev_image
+    ensure_container_resources
+    stop_monitor_transport
+    if container_exists; then
+        if container_running; then
+            docker stop --time 5 "${container_name}" >/dev/null
+        fi
+        docker rm "${container_name}" >/dev/null
+    fi
+    create_container
+    echo "Learner development container refreshed: ${container_name}"
 }
 
 case "${action}" in
     image)
         build_image
+        ;;
+    refresh)
+        refresh_container
         ;;
     shell)
         ensure_container
@@ -519,8 +418,8 @@ case "${action}" in
         ;;
     clean)
         stop_monitor_transport
-        if docker container inspect "${container_name}" >/dev/null 2>&1; then
-            if [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" = "true" ]; then
+        if container_exists; then
+            if container_running; then
                 process_state=0
                 container_has_training_processes || process_state=$?
                 if [ "${process_state}" -eq 0 ]; then

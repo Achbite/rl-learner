@@ -23,14 +23,8 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /opt/rl/learner
 COPY . /opt/rl/learner
-RUN cp -a _deps/contracts/python/. proto/ && \
-    cp -a _deps/contracts/schemas/. schemas/ && \
-    cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
+RUN cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
     cp -a _deps/model-distributor /opt/rl/learner/model-distributor && \
-    mkdir -p /opt/rl/component-contract && \
-    cp component-contract/manifest.json \
-        component-contract/config.schema.json \
-        /opt/rl/component-contract/ && \
     rm -rf _deps && \
     chmod +x run.sh scripts/entrypoint.sh && \
     chmod +x /opt/rl/learner/sample-pool/bin/maze_sample_pool && \

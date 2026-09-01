@@ -7,9 +7,11 @@ optional monitor. For local training, start Learner first, followed by AIServer
 and Client.
 
 Local training runs only three containers: Learner, AIServer, and Client.
-`make shell` is a host command that prepares development artifacts from sibling
-source repositories; it does not download those repositories. A fresh workspace
-therefore needs at least these sibling directories:
+`make shell` is a host command. When `learner-dev` is absent it builds the
+development image and creates and starts the container. When the container
+exists, it starts it only if needed and enters it directly. It does not build or
+synchronize dependencies. A complete three-container workspace has these sibling
+directories:
 
 ```text
 workspace/
@@ -21,27 +23,38 @@ workspace/
   maze-client/
 ```
 
-The first three repositories supply development artifacts only and do not add
-runtime containers. See [rl-framework](https://github.com/Achbite/rl-framework)
-for the complete three-container startup order.
+The first three repositories add no runtime container. Sample Pool and Model
+Distributor are required Learner binaries and are built and synchronized by the
+explicit `make deps` command. That command never replaces Learner-local Proto or
+schemas. See [rl-framework](https://github.com/Achbite/rl-framework) for the
+startup order.
 
 ## 1. Component development environment
 
 ```bash
-# Host: prepare dirty-capable dependencies, build or reuse the dev image, and enter it
+# Host: explicitly build and stage the two service artifacts initially or after changes
+make deps
+
+# Host: build/create when absent; otherwise reuse and enter directly
 make shell
 
-# Host: reuse the same development image and dependency identity for builds
+# Host: reuse the same container for Python compilation checks
 make build
+
+# Explicitly refresh after Dockerfile.dev, toolchain, port, environment, or mount changes
+make dev-refresh
 
 # Container: unified test entrypoint
 bash ./test.sh
 ```
 
-The development path does not depend on an old runtime image, prebuilt formal
-artifacts, or clean source. Development dependencies remain under
-`.workspace/dev-artifacts` and cannot feed a formal image. Run `make shell` only
-on the host.
+`make deps` builds task-neutral Training Contracts plus the Sample Pool and Model
+Distributor development artifacts, but stages only the latter two
+`bin/config/manifest` trees into Learner. Learner Proto and schemas remain owned
+by this repository. Development artifacts stay under `.workspace/dev-artifacts`
+and cannot feed a formal image. `make shell` does not invoke `make deps`, does not
+require clean source, and runs only on the host. Only `make dev-refresh` replaces
+the resident container, and it refuses while a training chain is active.
 
 ## 2. Start Learner-side services
 
@@ -110,29 +123,34 @@ asks SamplePool to draw `training.train_batch_size` READY processed transitions
 uniformly without replacement, normalizes advantages once over the full batch,
 then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
 batch may contain multiple behavior-model steps; each transition retains exact
-lineage, step, and digest provenance for lag observation.
+lineage, step, and digest provenance for lag observation. The Training Contract
+`policy.action_mask_mode` controls action masks: `disabled` requires no mask,
+while `required` validates the contract action dimension and applies it to PPO
+logits. Masks are not mandatory for every task.
 
 ## 3. Start fresh training from an existing model
 
-Select an explicit `SaveModel.onnx` file:
+Select an explicit ONNX model file. Its filename is not part of the training
+contract:
 
 ```text
-models/save/0002355/
-  SaveModel.onnx
+models/save/
+  seed-policy.onnx
 ```
 
 Start the Run:
 
 ```bash
 ./run.sh --config configs/learner_config.yaml \
-  --initial-model /workspace/rl-learner/models/save/0002355/SaveModel.onnx
+  --initial-model /workspace/rl-learner/models/save/seed-policy.onnx
 ```
 
 This reads only the selected file's weights. It is still an independent fresh training invocation, and the launcher generates a new internal model lineage; `model_step`, optimizer, RNG, update count, and sample count start at zero.
 `model.initial_model_path` defaults to `null`. Setting it in config or overriding
 it with `--initial-model` enables the same weight-only warm start. The value
-must name a regular, non-symlink `SaveModel.onnx` outside the fresh training
-workspace.
+must name a non-empty, regular, non-symlink ONNX model outside the fresh training
+workspace. The Training Contract-driven Learner load boundary validates its
+tensor ABI.
 
 ## 4. Training model package
 
@@ -155,25 +173,31 @@ parallel JSON manifest or metadata projections.
 A normal stop preserves public model packages until the next `run.sh` clears the
 same `model.local_train_dir`. A private checkpoint is not part of a model package
 and cannot start later training. To preserve or inherit a model, first place its
-`SaveModel.onnx` outside the training directory, then select it explicitly in
+model file outside the training directory, then select it explicitly in
 config or with `--initial-model`. Later training never restores the previous
 update counter automatically.
 
 ## 5. Build the runtime image
 
-The runtime image packages the current Learner source and the synchronized
-Contracts, Sample Pool, and Model Distributor runtime artifacts. Synchronize the
-runtime dependencies and build it with an explicit project tag from the host:
+The runtime image packages the current Learner source, repository-owned
+Proto/schemas, and synchronized Sample Pool and Model Distributor runtime
+artifacts. The formal synchronization script updates only those two local
+services' `bin/config/manifest`; it never replaces Learner source from Contracts.
+Synchronize initially or after dependency changes, then build with an explicit
+project tag from the host:
 
 ```bash
 bash scripts/sync_runtime_artifacts.sh
 RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
-The scripts never consume `.workspace/dev-artifacts` or a mutable development
-container build directory. The build does not derive a cross-repository stack
-source identity. Without an override it uses `maze-tag-001`; a later tuning build
-may overwrite the same tag.
+The formal scripts never consume `.workspace/dev-artifacts` or a mutable
+development-container build directory. The binary artifacts still validate
+version, target platform, configuration, manifest, and their task-neutral
+Training Contracts dependency; those checks do not lock the Client-AIServer task
+protocol into Learner. The build derives no cross-repository stack identity.
+Without an override it uses `maze-tag-001`; a later tuning build may overwrite the
+same tag.
 
 ## 6. Ports
 
@@ -185,13 +209,17 @@ may overwrite the same tag.
 
 Monitor endpoints: `/monitor`, `/api/status`, `/api/metrics/catalog`, `/api/metrics/latest`, and `/api/metrics`.
 
-## 7. Remove the development container
+## 7. Refresh or remove the development container
 
 ```bash
+make dev-refresh
 make dev-clean
 ```
 
-This removes `learner-dev` and launcher-owned forwarding only. It never terminates unknown host processes.
+`dev-refresh` rebuilds the image and container only when no training chain is
+active. `dev-clean` removes `learner-dev` and launcher-owned forwarding only. It
+never terminates unknown host processes. Neither command synchronizes dependencies
+or protocols.
 
 ## License
 

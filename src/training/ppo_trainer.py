@@ -31,7 +31,7 @@ class ActorCritic(nn.Module):
     两个分支使用完全独立的编码器，不共享权重。
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -72,13 +72,19 @@ class ActorCritic(nn.Module):
 
         return action_logits, value
 
-    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        action_masks: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         评估给定动作（用于 PPO 训练）
 
         Args:
             obs: 观测向量 [batch, obs_dim]
             actions: 动作 ID [batch]
+            action_masks: 可选动作可用性 [batch, action_dim]
         Returns:
             log_probs: 动作 log 概率 [batch]
             values: 状态价值 [batch]
@@ -87,6 +93,12 @@ class ActorCritic(nn.Module):
         # Policy 分支
         p = self.policy_encoder(obs)
         logits = self.policy_head(p)
+        if action_masks is not None:
+            if action_masks.dtype != torch.bool or action_masks.shape != logits.shape:
+                raise ValueError("action mask shape or dtype is invalid")
+            if not torch.all(action_masks.any(dim=1)):
+                raise ValueError("action mask contains no available action")
+            logits = logits.masked_fill(~action_masks, -torch.inf)
         dist = Categorical(logits=logits)
 
         log_probs = dist.log_prob(actions)
@@ -134,6 +146,7 @@ class PPOTrainer:
         self._obs_dim = int(contract["observation_dimension"])
         self._action_dim = int(contract["action_count"])
         self._hidden_dim = int(contract["hidden_dimension"])
+        self._action_mask_mode = str(contract["policy"]["action_mask_mode"])
 
         # ---- 读取训练超参 ----
         train_cfg = config["training"]
@@ -247,6 +260,30 @@ class PPOTrainer:
             )
 
         # ---- 1. 转换为 Tensor ----
+        if any(len(sample["observation"]) != self._obs_dim for sample in samples):
+            raise ValueError("PPO observation dimension differs from the contract")
+        sample_masks = [list(sample.get("action_mask", [])) for sample in samples]
+        if self._action_mask_mode == "required":
+            if any(
+                len(mask) != self._action_dim
+                or not any(mask)
+                or not mask[int(sample["action"])]
+                for sample, mask in zip(samples, sample_masks)
+                if 0 <= int(sample["action"]) < self._action_dim
+            ) or any(
+                int(sample["action"]) < 0
+                or int(sample["action"]) >= self._action_dim
+                for sample in samples
+            ):
+                raise ValueError("PPO action mask differs from the contract")
+            action_masks = torch.tensor(
+                sample_masks, dtype=torch.bool, device=self._device
+            )
+        else:
+            if any(sample_masks):
+                raise ValueError("PPO action mask is disabled by the contract")
+            action_masks = None
+
         obs = torch.tensor([s["observation"] for s in samples], dtype=torch.float32, device=self._device)
         actions = torch.tensor([s["action"] for s in samples], dtype=torch.long, device=self._device)
         old_log_probs = torch.tensor([s["old_log_probability"] for s in samples], dtype=torch.float32, device=self._device)
@@ -316,9 +353,16 @@ class PPOTrainer:
                     mb_old_values = old_values[mb_indices]
                     mb_advantages = advantages[mb_indices]
                     mb_td_returns = td_returns[mb_indices]
+                    mb_action_masks = (
+                        None
+                        if action_masks is None
+                        else action_masks[mb_indices]
+                    )
 
                     # 前向传播：获取新策略下的 log_prob、value、entropy
-                    new_log_probs, new_values, entropy = self._model.evaluate_actions(mb_obs, mb_actions)
+                    new_log_probs, new_values, entropy = self._model.evaluate_actions(
+                        mb_obs, mb_actions, mb_action_masks
+                    )
 
                     # ---- Policy Loss（PPO-Clip）----
                     policy_loss, ratio = self._clipped_policy_loss(
@@ -642,7 +686,7 @@ class PPOTrainer:
         return True
 
     def load_onnx_weights(self, path: str) -> bool:
-        """Load canonical SaveModel.onnx weights into a fresh training execution."""
+        """Load explicit ONNX weights into a fresh training execution."""
         if (
             self._model_step != 0
             or self._optimizer.state
@@ -721,6 +765,10 @@ class PPOTrainer:
     @property
     def action_dim(self) -> int:
         return self._action_dim
+
+    @property
+    def action_mask_mode(self) -> str:
+        return self._action_mask_mode
 
     def raw_metric_sum_counts(self) -> dict[str, dict[str, float | int]]:
         """Return raw mergeable statistics from the last committed update."""
