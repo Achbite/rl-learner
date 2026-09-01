@@ -197,6 +197,91 @@ def _reject_platform_config_keys(value: object, path: tuple[str, ...] = ()) -> N
             _reject_platform_config_keys(child, (*path, str(index)))
 
 
+def _apply_platform_environment(
+    config: dict,
+    environment: Mapping[str, str],
+) -> list[dict[str, object]]:
+    managed = environment.get("RL_INFRA_MANAGED")
+    if managed is None:
+        return []
+    if managed != "true":
+        raise ValueError("RL_INFRA_MANAGED must be exactly true")
+
+    required = (
+        "RL_INFRA_DATA_ROOT",
+        "RL_INFRA_RUNTIME_ROOT",
+        "RL_INFRA_ENDPOINT_SAMPLE_POOL_HOST",
+        "RL_INFRA_ENDPOINT_SAMPLE_POOL_PORT",
+        "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_HOST",
+        "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT",
+        "RL_INFRA_ENDPOINT_AISERVER_TASK_HOST",
+        "RL_INFRA_ENDPOINT_AISERVER_TASK_PORT",
+        "RL_INFRA_ENDPOINT_LEARNER_METRICS_PORT",
+    )
+    missing = [name for name in required if not environment.get(name)]
+    if missing:
+        raise ValueError(
+            "managed Learner platform facts are missing: "
+            + ", ".join(missing)
+        )
+
+    data_root = Path(_nonempty(
+        "RL_INFRA_DATA_ROOT", environment["RL_INFRA_DATA_ROOT"]
+    ))
+    runtime_root = Path(_nonempty(
+        "RL_INFRA_RUNTIME_ROOT", environment["RL_INFRA_RUNTIME_ROOT"]
+    ))
+    if not data_root.is_absolute() or not runtime_root.is_absolute():
+        raise ValueError("managed Learner platform roots must be absolute")
+
+    assignments: tuple[tuple[tuple[str, ...], object], ...] = (
+        (("model", "local_train_dir"), str(data_root / "train")),
+        (("log", "log_dir"), str(data_root / "logs")),
+        (("sample_pool", "host"), _nonempty(
+            "RL_INFRA_ENDPOINT_SAMPLE_POOL_HOST",
+            environment["RL_INFRA_ENDPOINT_SAMPLE_POOL_HOST"],
+        )),
+        (("sample_pool", "port"), _integer(
+            "RL_INFRA_ENDPOINT_SAMPLE_POOL_PORT",
+            environment["RL_INFRA_ENDPOINT_SAMPLE_POOL_PORT"],
+        )),
+        (("sample_pool", "finalize_request_path"), str(
+            runtime_root / "finalize-request"
+        )),
+        (("sample_pool", "finalize_complete_path"), str(
+            runtime_root / "finalize-complete"
+        )),
+        (("model_distributor", "host"), _nonempty(
+            "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_HOST",
+            environment["RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_HOST"],
+        )),
+        (("model_distributor", "port"), _integer(
+            "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT",
+            environment["RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT"],
+        )),
+        (("aiserver_status", "host"), _nonempty(
+            "RL_INFRA_ENDPOINT_AISERVER_TASK_HOST",
+            environment["RL_INFRA_ENDPOINT_AISERVER_TASK_HOST"],
+        )),
+        (("aiserver_status", "port"), _integer(
+            "RL_INFRA_ENDPOINT_AISERVER_TASK_PORT",
+            environment["RL_INFRA_ENDPOINT_AISERVER_TASK_PORT"],
+        )),
+        (("metric_events", "server_enabled"), True),
+        (("metric_events", "server_port"), _integer(
+            "RL_INFRA_ENDPOINT_LEARNER_METRICS_PORT",
+            environment["RL_INFRA_ENDPOINT_LEARNER_METRICS_PORT"],
+        )),
+        (("metric_events", "aiserver_relay_enabled"), False),
+        (("dashboard", "enabled"), False),
+    )
+    applied: list[dict[str, object]] = []
+    for target, value in assignments:
+        _assign(config, target, value)
+        applied.append({"field": ".".join(target), "value": value})
+    return applied
+
+
 def load_effective_config(
     path: str,
     environment: Mapping[str, str] | None = None,
@@ -251,6 +336,10 @@ def load_effective_config(
             }
         )
 
+    platform_applied = _apply_platform_environment(
+        config, selected_environment
+    )
+
     cli_applied: list[dict[str, object]] = []
     for target, raw_value in (cli_overrides or {}).items():
         normalized_target = tuple(target)
@@ -283,14 +372,10 @@ def load_effective_config(
     initial_model = config["model"]["initial_model_path"]
     if initial_model is not None:
         initial_path = Path(initial_model)
-        if (
-            initial_path.name != "SaveModel.onnx"
-            or initial_path.is_symlink()
-            or not initial_path.is_file()
-        ):
+        if initial_path.is_symlink() or not initial_path.is_file():
             raise ValueError(
                 "model.initial_model_path must be an explicit regular, "
-                "non-symlink SaveModel.onnx"
+                "non-symlink model file"
             )
         train_root = Path(config["model"]["local_train_dir"]).resolve()
         if initial_path.resolve().is_relative_to(train_root):
@@ -302,13 +387,16 @@ def load_effective_config(
     config = bind_runtime_lineage(config, selected_environment)
     validate_config(config)
     digest = training_config_digest(config).hex
-    config["_effective_config"] = {
+    effective_fact = {
         "config_path": str(config_path),
         "environment_overrides": applied,
         "internal_environment_overrides": internal_applied,
         "cli_overrides": cli_applied,
         "training_config_digest": digest,
     }
+    if platform_applied:
+        effective_fact["platform_environment"] = platform_applied
+    config["_effective_config"] = effective_fact
     return config
 
 

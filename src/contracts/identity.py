@@ -33,17 +33,10 @@ def _require_exact_keys(value: dict, expected: set[str], name: str) -> None:
 @lru_cache(maxsize=8)
 def _load_training_contract(path_text: str) -> dict:
     path = Path(path_text)
-    digest_path = path.with_suffix(".sha256")
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"training contract must be a regular file: {path}")
-    if digest_path.is_symlink() or not digest_path.is_file():
-        raise ValueError(
-            f"training contract digest must be a regular file: {digest_path}"
-        )
     payload = path.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
-    if digest_path.read_text(encoding="utf-8").strip() != digest:
-        raise ValueError("training contract digest does not match its bytes")
     try:
         document = json.loads(payload)
     except json.JSONDecodeError as error:
@@ -79,7 +72,6 @@ def _load_training_contract(path_text: str) -> dict:
         if (
             not isinstance(schema["schema_id"], str)
             or not schema["schema_id"]
-            or re.search(r"\.v[0-9]+$", schema["schema_id"])
             or isinstance(schema["schema_version"], bool)
             or not isinstance(schema["schema_version"], int)
             or schema["schema_version"] <= 0
@@ -91,7 +83,12 @@ def _load_training_contract(path_text: str) -> dict:
         raise ValueError("training contract policy must be an object")
     _require_exact_keys(
         policy,
-        {"distribution_schema_id", "sampling", "temperature"},
+        {
+            "action_mask_mode",
+            "distribution_schema_id",
+            "sampling",
+            "temperature",
+        },
         "training contract policy",
     )
     rollout = document["rollout"]
@@ -119,22 +116,31 @@ def _load_training_contract(path_text: str) -> dict:
     if any(
         not isinstance(value, str)
         or not value
-        or re.search(r"\.v[0-9]+$", value)
         for value in identifiers
     ):
-        raise ValueError("training contract contains a versioned or empty ID")
+        raise ValueError("training contract contains an empty ID")
+    dimensions = (
+        document["observation_dimension"],
+        document["action_count"],
+        document["hidden_dimension"],
+    )
     if (
-        document["training_contract_id"] != "maze.training"
-        or document["model_architecture_id"] != "maze.mlp-17x64x64"
+        document["model_architecture_id"]
+        != "actor-critic.independent-mlp"
         or document["tensor_dtype"] != "float32"
-        or document["observation_dimension"] != 17
-        or document["action_count"] != 9
-        or document["hidden_dimension"] != 64
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in dimensions
+        )
         or policy != {
+            "action_mask_mode": policy.get("action_mask_mode"),
             "distribution_schema_id": "categorical.logits",
             "sampling": "stochastic",
             "temperature": 1.0,
         }
+        or policy["action_mask_mode"] not in {"disabled", "required"}
         or rollout["numeric_dtype"] != "float32"
     ):
         raise ValueError("training contract is unsupported by this Learner")
@@ -179,17 +185,12 @@ def contract_identity(config: dict) -> common_pb2.ContractIdentity:
         contract.get("package_name") != "rl-contracts"
         or contract.get("package_version") != CONTRACT_VERSION
         or not contract.get("platform")
-        or SHA256.fullmatch(str(contract.get("generator_identity", "")))
-        is None
     ):
-        raise ValueError("contract identity is not the selected 0.15.0 artifact")
+        raise ValueError("contract identity does not select rl-contracts 0.15.0")
     return common_pb2.ContractIdentity(
         package_name=contract["package_name"],
         package_version=contract["package_version"],
-        source_digest=_digest(contract["source_digest"]),
-        artifact_digest=_digest(contract["artifact_digest"]),
         platform=contract["platform"],
-        generator_identity=contract["generator_identity"],
     )
 
 
@@ -329,10 +330,7 @@ def contract_document(message: common_pb2.ContractIdentity) -> dict:
     return {
         "package_name": message.package_name,
         "package_version": message.package_version,
-        "source_digest": message.source_digest.hex,
-        "artifact_digest": message.artifact_digest.hex,
         "platform": message.platform,
-        "generator_identity": message.generator_identity,
     }
 
 
@@ -431,8 +429,7 @@ def validate_config(config: dict) -> None:
         )
     expected_keys = {
         "contract": {
-            "package_name", "package_version", "source_digest",
-            "artifact_digest", "platform", "generator_identity",
+            "package_name", "package_version", "platform",
             "training_contract_path",
         },
         "identity": {"model_lineage_id"},

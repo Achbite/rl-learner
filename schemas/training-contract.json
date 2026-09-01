@@ -6,7 +6,7 @@
     "schema_version": 1
   },
   "hidden_dimension": 64,
-  "model_architecture_id": "maze.mlp-17x64x64",
+  "model_architecture_id": "actor-critic.independent-mlp",
   "observation_dimension": 17,
   "observation_schema": {
     "canonical_digest": "7cee41136020f3ffc8c6ae799f630d55d0588c6a99ab7f717eac3b3d08aa18b4",
@@ -14,6 +14,7 @@
     "schema_version": 1
   },
   "policy": {
+    "action_mask_mode": "disabled",
     "distribution_schema_id": "categorical.logits",
     "sampling": "stochastic",
     "temperature": 1.0

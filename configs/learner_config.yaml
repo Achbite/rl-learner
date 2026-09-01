@@ -4,10 +4,7 @@
 contract:
   package_name: rl-contracts
   package_version: 0.15.0
-  source_digest: ebcad0a4c652243ca16fc2c8c14d3f7b4b3b95f1bbd925c7063d22907374c026
-  artifact_digest: 0c278cfcf85ab4dbff72177eeeea165ebb113bb36867ae71975bf8c14da2be33
   platform: linux/arm64
-  generator_identity: 0eb73fc2cb675bdb34bf3db9c99dae62a82f93a5e3a72db84dcf3936464729c8
   training_contract_path: ../schemas/training-contract.json
 
 identity:

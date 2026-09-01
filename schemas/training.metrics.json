@@ -3,46 +3,6 @@
   "fields": [
     {
       "aggregation": "raw_sum_count",
-      "count_unit": "transition",
-      "dimension": "reward",
-      "fact": "agent_episode",
-      "field_id": "first_visit_bonus",
-      "unit": "reward"
-    },
-    {
-      "aggregation": "raw_sum_count",
-      "count_unit": "transition",
-      "dimension": "reward",
-      "fact": "agent_episode",
-      "field_id": "geodesic_progress",
-      "unit": "reward"
-    },
-    {
-      "aggregation": "raw_sum_count",
-      "count_unit": "transition",
-      "dimension": "reward",
-      "fact": "agent_episode",
-      "field_id": "goal_reward",
-      "unit": "reward"
-    },
-    {
-      "aggregation": "raw_sum_count",
-      "count_unit": "transition",
-      "dimension": "reward",
-      "fact": "agent_episode",
-      "field_id": "timeout_penalty",
-      "unit": "reward"
-    },
-    {
-      "aggregation": "raw_sum_count",
-      "count_unit": "transition",
-      "dimension": "reward",
-      "fact": "agent_episode",
-      "field_id": "wasted_action_penalty",
-      "unit": "reward"
-    },
-    {
-      "aggregation": "raw_sum_count",
       "count_unit": "sample_evaluation",
       "dimension": "divergence",
       "fact": "train_update",
@@ -122,6 +82,6 @@
       "unit": "reward"
     }
   ],
-  "schema_id": "maze.metrics",
+  "schema_id": "rl.training.metrics",
   "schema_version": 1
 }

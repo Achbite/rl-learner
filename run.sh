@@ -5,8 +5,11 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 config="${repo_dir}/configs/learner_config.yaml"
 managed=0
-if [ -n "${RL_CONFIG_PATH:-}" ]; then
+if [ "${RL_INFRA_MANAGED:-}" = "true" ]; then
     managed=1
+elif [ -n "${RL_INFRA_MANAGED:-}" ]; then
+    echo "RL_INFRA_MANAGED must be exactly true when supplied" >&2
+    exit 2
 fi
 repository_sample_pool_dir="${repo_dir}/sample-pool"
 runtime_sample_pool_dir="/opt/rl/learner/sample-pool"
@@ -35,15 +38,6 @@ sample_pool_config="${SAMPLE_POOL_CONFIG:-${default_sample_pool_dir}/config/pool
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"
 model_distributor_config="${MODEL_DISTRIBUTOR_CONFIG:-${default_distributor_dir}/config/model_distributor_config.yaml}"
 if [ "${managed}" -eq 1 ]; then
-    if [[ "${RL_CONFIG_PATH}" != /* ]]; then
-        echo "RL_CONFIG_PATH must be absolute" >&2
-        exit 2
-    fi
-    managed_config_dir="$(dirname "${RL_CONFIG_PATH}")"
-    sample_pool_bin="${default_sample_pool_dir}/bin/maze_sample_pool"
-    sample_pool_config="${managed_config_dir}/sample-pool.yaml"
-    model_distributor_bin="${default_distributor_dir}/bin/maze_model_distributor"
-    model_distributor_config="${managed_config_dir}/model-distributor.yaml"
     rm -f /run/rl/readiness.json /run/rl/learner-metric-ready.json
 fi
 
@@ -60,9 +54,14 @@ if [ "${managed}" -eq 0 ]; then
     export RL_TRAINING_FINALIZE_REQUEST_PATH="/tmp/rl-training-${execution_token}-finalize"
     export RL_TRAINING_FINALIZE_COMPLETE_PATH="/tmp/rl-training-${execution_token}-finalized"
 else
-    unset RL_MODEL_LINEAGE_ID
-    unset RL_TRAINING_FINALIZE_REQUEST_PATH
-    unset RL_TRAINING_FINALIZE_COMPLETE_PATH
+    if [ -z "${RL_INFRA_TASK_ID:-}" ] || [ -z "${RL_INFRA_RUNTIME_ROOT:-}" ]; then
+        echo "Learner managed runtime facts are incomplete" >&2
+        exit 2
+    fi
+    export RL_MODEL_LINEAGE_ID="infra-${RL_INFRA_TASK_ID}"
+    export RL_TRAINING_FINALIZE_REQUEST_PATH="${RL_INFRA_RUNTIME_ROOT}/finalize-request"
+    export RL_TRAINING_FINALIZE_COMPLETE_PATH="${RL_INFRA_RUNTIME_ROOT}/finalize-complete"
+    export RL_LEARNER_LOCAL_MONITOR_ENABLED=false
 fi
 metrics_source_id="${RL_METRICS_SOURCE_ID:-}"
 if [ -z "${metrics_source_id}" ]; then
@@ -75,7 +74,7 @@ startup_output="$(
     python3 -m main.resolve_startup --format lines -- "$@"
 )"
 mapfile -t startup_values <<< "${startup_output}"
-if [ "${#startup_values[@]}" -ne 12 ]; then
+if [ "${#startup_values[@]}" -ne 15 ]; then
     echo "Learner effective startup handoff is invalid" >&2
     exit 1
 fi
@@ -91,6 +90,9 @@ aiserver_port="${startup_values[8]}"
 metrics_port="${startup_values[9]}"
 metrics_enabled="${startup_values[10]}"
 metric_event_port="${startup_values[11]}"
+contract_package="${startup_values[12]}"
+contract_version="${startup_values[13]}"
+contract_platform="${startup_values[14]}"
 if [ "${metrics_enabled}" = "1" ]; then
     local_monitor_state="enabled"
 else
@@ -282,12 +284,8 @@ trap shutdown EXIT
 trap on_signal TERM INT
 
 cd "${repo_dir}"
-if [ "${managed}" -eq 1 ]; then
+RL_SAMPLE_POOL_PORT="${sample_pool_port}" \
     "${sample_pool_bin}" "${sample_pool_config}" &
-else
-    RL_SAMPLE_POOL_PORT="${sample_pool_port}" \
-        "${sample_pool_bin}" "${sample_pool_config}" &
-fi
 sample_pool_pid=$!
 
 ready=0
@@ -310,13 +308,9 @@ if [ "${ready}" -ne 1 ]; then
     exit 1
 fi
 
-if [ "${managed}" -eq 1 ]; then
+RL_MODEL_DISTRIBUTOR_PORT="${model_distributor_port}" \
+RL_MODEL_ARTIFACT_ROOT="${local_train_root}" \
     "${model_distributor_bin}" "${model_distributor_config}" &
-else
-    RL_MODEL_DISTRIBUTOR_PORT="${model_distributor_port}" \
-    RL_MODEL_ARTIFACT_ROOT="${local_train_root}" \
-        "${model_distributor_bin}" "${model_distributor_config}" &
-fi
 model_distributor_pid=$!
 
 ready=0
@@ -402,7 +396,6 @@ if [ "${managed}" -eq 1 ]; then
     fi
     python3 scripts/publish_readiness.py \
         --component learner \
-        --config "${config}" \
         --fact process=running \
         --fact sample_pool=serving \
         --fact model_distributor=serving \
@@ -413,7 +406,10 @@ if [ "${managed}" -eq 1 ]; then
         --fact metric_container_port="${metric_values[3]}" \
         --fact metric_schema_id="${metric_values[4]}" \
         --fact metric_schema_version="${metric_values[5]}" \
-        --fact metric_schema_digest="${metric_values[6]}"
+        --fact metric_schema_digest="${metric_values[6]}" \
+        --fact contract_package="${contract_package}" \
+        --fact contract_version="${contract_version}" \
+        --fact contract_platform="${contract_platform}"
 fi
 
 while [ "${stopping}" -eq 0 ]; do

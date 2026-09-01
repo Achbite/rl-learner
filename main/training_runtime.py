@@ -21,7 +21,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proto import common_pb2, training_pb2, training_pb2_grpc
+from proto import (
+    common_pb2,
+    training_metrics_pb2,
+    training_pb2,
+    training_pb2_grpc,
+)
 from src.contracts.identity import (
     bind_runtime_lineage,
     content_digest,
@@ -48,6 +53,7 @@ from src.metrics.metric_events import (
     MetricEventContractError,
     MetricSchemaCatalog,
     RawMetricBatchStore,
+    TRAINING_METRIC_SCHEMA_ID,
     create_learner_metric_event_server,
     default_metric_schema_directory,
 )
@@ -88,6 +94,7 @@ def train_processed_delivery(items, trainer) -> tuple[list[dict], dict]:
             "old_value_prediction": float(item.transition.behavior_value),
             "advantage": float(item.transition.advantage),
             "value_target": float(item.transition.value_target),
+            "action_mask": list(item.transition.action_mask),
             "behavior_model_step": int(
                 item.transition.behavior_model_step
             ),
@@ -105,6 +112,14 @@ def _handle_signal(_signal, _frame) -> None:
 def _same_message(left, right) -> bool:
     return left.SerializeToString(deterministic=True) == right.SerializeToString(
         deterministic=True
+    )
+
+
+def _same_contract(left, right) -> bool:
+    return (
+        bool(left.package_name)
+        and left.package_name == right.package_name
+        and left.package_version == right.package_version
     )
 
 
@@ -462,10 +477,8 @@ class ModelPublisher:
             raise RuntimeError(
                 f"initial model does not exist: {requested}"
             ) from error
-        if not model_path.is_file() or model_path.name != self.MODEL_FILE:
-            raise RuntimeError(
-                f"initial model must be an explicit {self.MODEL_FILE} file"
-            )
+        if not model_path.is_file():
+            raise RuntimeError("initial model must be an explicit regular file")
         if model_path.parent == self.local_train_root or (
             self.local_train_root in model_path.parents
         ):
@@ -1234,12 +1247,12 @@ class TrainingRuntime:
         self.metric_event_server = event_server
 
     def _publish_metric_ready(self) -> None:
-        if os.environ.get("RL_CONFIG_PATH") is None:
+        if os.environ.get("RL_INFRA_MANAGED") != "true":
             return
         store = self.metric_event_store
         if store is None:
             raise RuntimeError("Learner metric store is unavailable")
-        schema = store.catalog.schema_identity()
+        schema = store.catalog.schema_identity(TRAINING_METRIC_SCHEMA_ID)
         document = {
             "component": self.learner_service.component,
             "instance_id": self.learner_service.instance_id,
@@ -1460,7 +1473,7 @@ class TrainingRuntime:
             raise RuntimeError(
                 f"model distributor authority could not be pinned: {error}"
             ) from error
-        if not status.ready or not _same_message(status.contract, self.contract):
+        if not status.ready or not _same_contract(status.contract, self.contract):
             raise RuntimeError(
                 "model distributor authority could not be pinned: "
                 "distributor is not ready for the exact contract"
@@ -1892,7 +1905,7 @@ class TrainingRuntime:
                     status_authority_valid = False
                 if (
                     status.ready
-                    and _same_message(status.contract, self.contract)
+                    and _same_contract(status.contract, self.contract)
                     and status_authority_valid
                     and status.latest_ack_status
                     == training_pb2.MODEL_LOAD_STATUS_LOADED
@@ -2072,7 +2085,7 @@ class TrainingRuntime:
     def _ready_sample_pool_authority(
         self, status
     ) -> common_pb2.ServiceInstanceIdentity:
-        if not _same_message(status.contract, self.contract):
+        if not _same_contract(status.contract, self.contract):
             raise RuntimeError(
                 "sample pool status has another contract identity"
             )
@@ -2168,7 +2181,7 @@ class TrainingRuntime:
         self, expected: common_pb2.ServiceInstanceIdentity
     ):
         status = self._sample_pool_status()
-        if not _same_message(status.contract, self.contract):
+        if not _same_contract(status.contract, self.contract):
             raise RuntimeError(
                 "sample pool contract changed while GetBatch outcome "
                 "was unknown"
@@ -2441,6 +2454,20 @@ class TrainingRuntime:
             or int(transition.created_at_unix_ms) <= 0
         ):
             raise ValueError("processed transition identity or shape is invalid")
+        action_mask = list(transition.action_mask)
+        if self.trainer.action_mask_mode == "required":
+            if (
+                len(action_mask) != self.publisher.action_dim
+                or not any(action_mask)
+                or not action_mask[int(transition.action)]
+            ):
+                raise ValueError(
+                    "processed transition action mask differs from the contract"
+                )
+        elif action_mask:
+            raise ValueError(
+                "processed transition action mask is disabled by the contract"
+            )
 
     def _validate_delivery(self, response) -> dict:
         if (
@@ -3058,7 +3085,7 @@ class TrainingRuntime:
             status = self.actor_stub.GetAIServerStatus(
                 training_pb2.AIServerStatusReq(), timeout=1.5
             )
-            if not _same_message(status.contract, self.contract):
+            if not _same_contract(status.contract, self.contract):
                 raise RuntimeError("AIServer contract identity mismatch")
             inference_count = int(status.inference_count)
             push_rpc_count = int(status.push_rpc_count)
@@ -3163,7 +3190,7 @@ class TrainingRuntime:
     def _sample_pool_snapshot(self) -> dict:
         try:
             status = self._sample_pool_status()
-            if not _same_message(status.contract, self.contract):
+            if not _same_contract(status.contract, self.contract):
                 raise RuntimeError(
                     "sample pool contract identity mismatch"
                 )
@@ -3275,7 +3302,7 @@ class TrainingRuntime:
             status = self.model_stub.GetModelDistributorStatus(
                 training_pb2.ModelDistributorStatusReq(), timeout=1.5
             )
-            if not _same_message(status.contract, self.contract):
+            if not _same_contract(status.contract, self.contract):
                 raise RuntimeError("model distributor contract identity mismatch")
             available_range = self._validate_model_status_available_range(
                 status
@@ -3542,7 +3569,7 @@ class TrainingRuntime:
                 "committed train update has no raw PPO statistics"
             )
         writer.append(
-            training_pb2.TrainUpdateMetricFact(
+            training_metrics_pb2.TrainUpdateMetricFact(
                 train_update_id=update_id,
                 train_update_sequence=int(train_updates),
                 published_model=manifest["manifest"].identity,
@@ -3706,7 +3733,7 @@ class TrainingRuntime:
         finalization_id: str,
         response,
     ) -> None:
-        if not _same_message(status.contract, self.contract):
+        if not _same_contract(status.contract, self.contract):
             raise RuntimeError(
                 "sample pool contract changed after finalization"
             )
@@ -3901,7 +3928,7 @@ class TrainingRuntime:
             attempt += 1
             try:
                 status = self._sample_pool_status()
-                if not _same_message(status.contract, self.contract):
+                if not _same_contract(status.contract, self.contract):
                     raise RuntimeError(
                         "sample pool contract changed during shutdown"
                     )
@@ -3953,7 +3980,7 @@ class TrainingRuntime:
 
     def _finalize_training(self) -> None:
         status = self._sample_pool_status()
-        if not _same_message(status.contract, self.contract):
+        if not _same_contract(status.contract, self.contract):
             raise RuntimeError(
                 "sample pool contract changed during explicit finalization"
             )

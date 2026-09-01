@@ -20,17 +20,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "package_name", "package_version", "source_digest",
-        "artifact_digest", "platform", "generator_identity",
+        "package_name", "package_version", "platform",
         "training_contract_path"
       ],
       "properties": {
         "package_name": {"type": "string", "minLength": 1},
         "package_version": {"type": "string", "minLength": 1},
-        "source_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-        "artifact_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "platform": {"type": "string", "minLength": 1},
-        "generator_identity": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "training_contract_path": {"type": "string", "minLength": 1}
       }
     },
