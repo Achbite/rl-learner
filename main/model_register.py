@@ -6,11 +6,8 @@ import time
 from pathlib import Path
 
 import grpc
-import yaml
-
 from proto import training_pb2, training_pb2_grpc
 from src.contracts.identity import (
-    contract_identity,
     model_identity_document,
     read_manifest_file,
 )
@@ -18,15 +15,11 @@ from src.contracts.identity import (
 
 def register(
     manifest_path: str,
-    config_path: str,
     address: str,
     timeout: float,
 ) -> dict:
     selected_manifest = Path(manifest_path).resolve()
     manifest = read_manifest_file(selected_manifest)
-    with Path(config_path).open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream) or {}
-    contract = contract_identity(config)
     deadline = time.monotonic() + timeout
     last_error = ""
     with grpc.insecure_channel(address) as channel:
@@ -36,7 +29,6 @@ def register(
                 response = stub.RegisterModel(
                     training_pb2.RegisterModelReq(
                         manifest=manifest,
-                        contract=contract,
                         local_artifact_path=str(
                             selected_manifest.parent / "SaveModel.onnx"
                         ),
@@ -72,7 +64,6 @@ def register(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--config", default="configs/learner_config.yaml")
     parser.add_argument("--address", default="127.0.0.1:9200")
     parser.add_argument("--timeout", type=float, default=30.0)
     arguments = parser.parse_args()
@@ -80,7 +71,6 @@ def main() -> int:
         json.dumps(
             register(
                 arguments.manifest,
-                arguments.config,
                 arguments.address,
                 arguments.timeout,
             ),

@@ -1,12 +1,6 @@
 # Learner owns only task-neutral training, model, transport and monitor settings.
 # Maze environment, map, curriculum and Reward values are intentionally absent.
 
-contract:
-  package_name: rl-contracts
-  package_version: 0.15.0
-  platform: linux/arm64
-  training_contract_path: ../schemas/training-contract.json
-
 identity:
   model_lineage_id: __FRESH_INTERNAL_LINEAGE_REQUIRED__
 
@@ -28,6 +22,9 @@ training:
   normalize_advantage: true
 
 model:
+  observation_dimension: 17
+  action_count: 9
+  hidden_dimension: 64
   # null means a fresh random bootstrap. A path or --initial-model selects
   # weight-only warm-start while retaining a new lineage and model_step 0.
   initial_model_path: null
@@ -35,6 +32,9 @@ model:
   archive_interval_updates: 200
   publication_retention_steps: 101
   bootstrap_seed: 0
+
+policy:
+  action_mask_mode: disabled      # disabled | required; mask is opt-in
 
 sample_pool:
   host: 127.0.0.1

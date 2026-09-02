@@ -11,15 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main.training_runtime import sha256_file
 from proto import training_pb2
 from src.config.effective_config import load_effective_config
 from src.contracts.identity import (
-    content_digest,
-    finalize_manifest,
-    rollout_estimator_profile,
-    training_config_digest,
-    training_contract_digest,
     validate_config,
     write_manifest_file,
 )
@@ -51,22 +45,16 @@ def export_initial_model(
         identity=training_pb2.ModelIdentity(
             model_lineage_id=config["identity"]["model_lineage_id"],
             model_step=0,
-            artifact_digest=content_digest(sha256_file(model_path)),
         ),
         size_bytes=model_path.stat().st_size,
         trained_samples=0,
-        training_config_digest=training_config_digest(config),
-        training_contract_digest=training_contract_digest(config),
         published_at_unix_ms=int(time.time() * 1000),
-        rollout_estimator_profile=rollout_estimator_profile(config),
     )
-    manifest = finalize_manifest(manifest)
     write_manifest_file(root / "manifest.pb", manifest)
     logger.info(
-        "initial model exported: lineage=%s step=0 artifact=%s manifest=%s",
+        "initial model exported: lineage=%s step=0 size_bytes=%d",
         manifest.identity.model_lineage_id,
-        manifest.identity.artifact_digest.hex,
-        manifest.identity.manifest_digest.hex,
+        manifest.size_bytes,
     )
     return manifest
 

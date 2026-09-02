@@ -1,5 +1,3 @@
-import json
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,11 +8,8 @@ from src.contracts.identity import validate_config
 from src.training.ppo_trainer import PPOTrainer
 
 
-def _trainer_config(contract_path: Path) -> dict:
+def _trainer_config() -> dict:
     return {
-        "contract": {
-            "training_contract_path": str(contract_path)
-        },
         "training": {
             "device": "cpu",
             "seed": 0,
@@ -29,6 +24,12 @@ def _trainer_config(contract_path: Path) -> dict:
             "mini_batch_size": 2,
             "normalize_advantage": True,
         },
+        "model": {
+            "observation_dimension": 5,
+            "action_count": 4,
+            "hidden_dimension": 8,
+        },
+        "policy": {"action_mask_mode": "required"},
     }
 
 
@@ -54,17 +55,8 @@ class LearnerDevelopmentTest(unittest.TestCase):
             action_mask=action_mask,
         )
 
-    def test_processed_transitions_reach_real_trainer(self):
-        repository = Path(__file__).resolve().parents[1]
-        contract = json.loads(
-            (repository / "schemas" / "training-contract.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        contract["observation_dimension"] = 5
-        contract["action_count"] = 4
-        contract["hidden_dimension"] = 8
-        contract["policy"]["action_mask_mode"] = "required"
+    def test_processed_transition_data_reaches_real_trainer(self):
+        config = _trainer_config()
         response = training_pb2.GetBatchRsp(
             result=training_pb2.GET_BATCH_RESULT_LEASED,
             delivery_id="delivery-test",
@@ -73,21 +65,16 @@ class LearnerDevelopmentTest(unittest.TestCase):
             response.items.add(
                 transition=self._transition(
                     index,
-                    contract["observation_dimension"],
-                    contract["action_count"],
+                    config["model"]["observation_dimension"],
+                    config["model"]["action_count"],
                 ),
                 insert_sequence=index + 1,
                 inserted_at_unix_ms=1700000000100 + index,
                 draw_count=1,
             )
 
-        with tempfile.TemporaryDirectory() as directory:
-            contract_path = Path(directory) / "training-contract.json"
-            contract_path.write_text(
-                json.dumps(contract, sort_keys=True), encoding="utf-8"
-            )
-            trainer = PPOTrainer(_trainer_config(contract_path))
-            batch, stats = train_processed_delivery(response.items, trainer)
+        trainer = PPOTrainer(config)
+        batch, stats = train_processed_delivery(response.items, trainer)
 
         self.assertEqual(len(batch), 2)
         self.assertEqual(stats["sample_evaluation_count"], 2)

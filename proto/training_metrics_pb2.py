@@ -22,11 +22,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-from . import common_pb2 as common__pb2
 from . import training_pb2 as training__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16training_metrics.proto\x12\x16rl.training.metrics.v1\x1a\x0c\x63ommon.proto\x1a\x0etraining.proto\"\xca\x06\n\x15TrainUpdateMetricFact\x12\x17\n\x0ftrain_update_id\x18\x01 \x01(\t\x12\x1d\n\x15train_update_sequence\x18\x02 \x01(\x04\x12\x36\n\x0fpublished_model\x18\x03 \x01(\x0b\x32\x1d.rl.training.v1.ModelIdentity\x12\x13\n\x0b\x64\x65livery_id\x18\x04 \x01(\t\x12=\n\x18training_contract_digest\x18\x05 \x01(\x0b\x32\x1b.rl.common.v1.ContentDigest\x12\"\n\x1a\x63umulative_trained_samples\x18\x06 \x01(\x03\x12\x19\n\x11\x61\x63tual_batch_size\x18\x07 \x01(\x03\x12(\n\x1bminimum_behavior_model_step\x18\x08 \x01(\x04H\x00\x88\x01\x01\x12(\n\x1bmaximum_behavior_model_step\x18\t \x01(\x04H\x01\x88\x01\x01\x12\x39\n\x0eppo_statistics\x18\n \x03(\x0b\x32!.rl.training.v1.RawMetricSumCount\x12!\n\x19\x62\x65havior_model_lineage_id\x18\x0b \x01(\t\x12\"\n\x1arequested_train_batch_size\x18\x0c \x01(\x03\x12\x1c\n\x14pool_draw_slot_count\x18\r \x01(\x03\x12\x19\n\x11unique_item_count\x18\x0e \x01(\x03\x12!\n\x19\x64uplicate_item_slot_count\x18\x0f \x01(\x03\x12\x1f\n\x17sample_evaluation_count\x18\x10 \x01(\x03\x12\x1c\n\x14optimizer_step_count\x18\x11 \x01(\x03\x12\x45\n rollout_estimator_profile_digest\x18\x12 \x01(\x0b\x32\x1b.rl.common.v1.ContentDigestB\x1e\n\x1c_minimum_behavior_model_stepB\x1e\n\x1c_maximum_behavior_model_stepR\x1a\x62\x65havior_model_version_minR\x1a\x62\x65havior_model_version_maxB\x03\x80\x01\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x16training_metrics.proto\x12\x16rl.training.metrics.v1\x1a\x0etraining.proto\"\x8c\x06\n\x15TrainUpdateMetricFact\x12\x17\n\x0ftrain_update_id\x18\x01 \x01(\t\x12\x1d\n\x15train_update_sequence\x18\x02 \x01(\x04\x12\x36\n\x0fpublished_model\x18\x03 \x01(\x0b\x32\x1d.rl.training.v1.ModelIdentity\x12\x13\n\x0b\x64\x65livery_id\x18\x04 \x01(\t\x12\"\n\x1a\x63umulative_trained_samples\x18\x06 \x01(\x03\x12\x19\n\x11\x61\x63tual_batch_size\x18\x07 \x01(\x03\x12(\n\x1bminimum_behavior_model_step\x18\x08 \x01(\x04H\x00\x88\x01\x01\x12(\n\x1bmaximum_behavior_model_step\x18\t \x01(\x04H\x01\x88\x01\x01\x12\x39\n\x0eppo_statistics\x18\n \x03(\x0b\x32!.rl.training.v1.RawMetricSumCount\x12!\n\x19\x62\x65havior_model_lineage_id\x18\x0b \x01(\t\x12\"\n\x1arequested_train_batch_size\x18\x0c \x01(\x03\x12\x1c\n\x14pool_draw_slot_count\x18\r \x01(\x03\x12\x19\n\x11unique_item_count\x18\x0e \x01(\x03\x12!\n\x19\x64uplicate_item_slot_count\x18\x0f \x01(\x03\x12\x1f\n\x17sample_evaluation_count\x18\x10 \x01(\x03\x12\x1c\n\x14optimizer_step_count\x18\x11 \x01(\x03\x42\x1e\n\x1c_minimum_behavior_model_stepB\x1e\n\x1c_maximum_behavior_model_stepJ\x04\x08\x05\x10\x06J\x04\x08\x12\x10\x13R\x1a\x62\x65havior_model_version_minR\x1a\x62\x65havior_model_version_maxR\x18training_contract_digestR rollout_estimator_profile_digestB\x03\x80\x01\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,6 +33,6 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'training_metrics_pb2', _glo
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'\200\001\000'
-  _globals['_TRAINUPDATEMETRICFACT']._serialized_start=81
-  _globals['_TRAINUPDATEMETRICFACT']._serialized_end=923
+  _globals['_TRAINUPDATEMETRICFACT']._serialized_start=67
+  _globals['_TRAINUPDATEMETRICFACT']._serialized_end=847
 # @@protoc_insertion_point(module_scope)

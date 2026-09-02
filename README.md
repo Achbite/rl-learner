@@ -42,8 +42,9 @@ make dev-refresh
 bash ./test.sh
 ```
 
-`make deps` 构建 task-neutral Training Contracts 以及 Sample Pool/Model Distributor 开发制品，
-但只把后两者的 `bin/config/manifest` 装配到 Learner；Learner 的 Proto 与 schema 始终由本仓维护。
+`make deps` 使用工作区已显式生成的 Training Proto 编译输入构建 Sample Pool/Model Distributor
+开发制品，并只把两个二进制与配置装配到 Learner；二进制始终更新，已存在的目标配置不会被覆盖。
+Learner 的 Proto 始终由本仓维护。
 开发制品只写入 `.workspace/dev-artifacts`，不得用于正式镜像。`make shell` 不调用 `make deps`，
 也不要求源码 clean；它只能在宿主机执行。`make dev-refresh` 才会替换常驻容器，活动训练链存在时
 会明确失败。
@@ -87,7 +88,7 @@ Sample Pool、Model Distributor 和监控存活；等待只会因 exact ACK、�
 或 config 中显式设置的正数 `aiserver_status.initial_model_ack_timeout_sec` 结束。Client 可以在
 AIServer ready 后再启动。
 
-`dashboard.enabled: true` 是本地默认值。Infra 可注入严格布尔环境变量
+`dashboard.enabled: true` 是本地默认值。严格布尔环境变量
 `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` 关闭预览，CLI `--monitor/--no-monitor` 优先于环境变量。
 关闭预览只跳过 HTTP/HTML MetricsServer，不关闭 JSONL、MetricEvent、SQLite、AIServer relay、
 projector 或训练线程。
@@ -103,9 +104,9 @@ SSH tunnel 保持 `http://127.0.0.1:9005/monitor`。MetricsServer 使用独立�
 Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 从 READY 集合随机无放回
 抽取 `training.train_batch_size` 条 processed transition，对整批 advantage 做一次归一化，再按
 `mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。一个 batch 可以包含多个 behavior model step；
-每条 transition 的 lineage/step/digest 仍作为真实 provenance 和 lag 指标保留。Action mask 由
-Training Contract 的 `policy.action_mask_mode` 控制：`disabled` 时样本必须不带 mask，`required` 时
-Learner 按合同动作维度校验并在 PPO logits 上应用；它不是所有任务的必选项。
+每条 transition 的 lineage/step 仍作为真实 provenance 和 lag 指标保留。Action mask 由
+`policy.action_mask_mode` 控制：`disabled` 时样本必须不带 mask，`required` 时 Learner 按
+`model.action_count` 校验并在 PPO logits 上应用；它不是所有任务的必选项。
 
 ## 3. 从已有模型开始全新训练
 
@@ -126,8 +127,8 @@ models/save/
 该入口只读取显式文件的权重；它仍是全新独立训练，launcher 自动生成新的内部模型 lineage，`model_step`、优化器、RNG、更新数和样本计数从 0 开始。
 config 的 `model.initial_model_path` 默认为 `null`；在 config 中显式设置路径，或使用
 `--initial-model` 覆盖，都会触发同一种权重继承。两种方式都必须直接指向常规、非符号链接的
-非空 ONNX 模型文件，且不能位于本次新的 `model.local_train_dir` 中。实际 tensor ABI 由
-Training Contract 驱动的 Learner 模型加载边界判断。
+非空 ONNX 模型文件，且不能位于本次新的 `model.local_train_dir` 中。实际 tensor 名称、dtype 与
+shape 由 Learner 按 `model.observation_dimension`、`model.action_count` 和当前模型实现检查。
 
 ## 4. 训练模型包
 
@@ -152,8 +153,9 @@ models/train/runtime/checkpoints/
 
 ## 5. 构建运行镜像
 
-运行镜像封装当前 Learner 源码、本仓维护的 Proto/schema，以及已同步的 Sample Pool 与
-Model Distributor 运行产物。正式同步脚本只更新两个本地服务的 `bin/config/manifest`，不会从
+运行镜像封装当前 Learner 源码、本仓维护的 Proto，以及已同步的 Sample Pool 与
+Model Distributor 运行产物。正式同步脚本更新两个本地服务的二进制，只在目标配置不存在时复制
+默认配置，不会从
 Contracts 覆盖 Learner 源码。首次构建或依赖版本变化后，在宿主机显式同步并使用项目 tag 构建：
 
 ```bash
@@ -161,9 +163,9 @@ bash scripts/sync_runtime_artifacts.sh
 RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
-正式脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录。两个二进制制品仍校验
-版本、目标平台、配置与 manifest，并声明其 task-neutral Training Contracts 依赖；这些校验不把
-Client↔AIServer 的任务协议锁进 Learner。构建不计算跨仓 stack source identity。未指定时使用
+正式脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录。装配检查只确认两个必需
+二进制和配置存在、二进制可执行，不读取包版本、平台、manifest、仓库身份或哈希。构建不计算
+跨仓 stack source identity。未指定时使用
 `maze-tag-001`；同名 tag 允许由后续微调构建直接覆盖。
 
 ## 6. 端口

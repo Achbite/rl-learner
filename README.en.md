@@ -25,8 +25,8 @@ workspace/
 
 The first three repositories add no runtime container. Sample Pool and Model
 Distributor are required Learner binaries and are built and synchronized by the
-explicit `make deps` command. That command never replaces Learner-local Proto or
-schemas. See [rl-framework](https://github.com/Achbite/rl-framework) for the
+explicit `make deps` command. That command never replaces Learner-local Proto.
+See [rl-framework](https://github.com/Achbite/rl-framework) for the
 startup order.
 
 ## 1. Component development environment
@@ -48,10 +48,11 @@ make dev-refresh
 bash ./test.sh
 ```
 
-`make deps` builds task-neutral Training Contracts plus the Sample Pool and Model
-Distributor development artifacts, but stages only the latter two
-`bin/config/manifest` trees into Learner. Learner Proto and schemas remain owned
-by this repository. Development artifacts stay under `.workspace/dev-artifacts`
+`make deps` uses the explicitly generated Training Proto build inputs already in
+the workspace to build Sample Pool and Model Distributor development artifacts,
+then stages only their binaries and configs into Learner. Binaries are always
+updated; existing target configs are preserved. Learner Proto remains owned by
+this repository. Development artifacts stay under `.workspace/dev-artifacts`
 and cannot feed a formal image. `make shell` does not invoke `make deps`, does not
 require clean source, and runs only on the host. Only `make dev-refresh` replaces
 the resident container, and it refuses while a training chain is active.
@@ -100,8 +101,8 @@ wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
 `aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
 diagnostic. Client can start after AIServer is ready.
 
-`dashboard.enabled: true` is the local default. Infra can inject the strict
-boolean environment variable `RL_LEARNER_LOCAL_MONITOR_ENABLED=false`; CLI
+`dashboard.enabled: true` is the local default. The strict boolean environment
+variable `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` can disable it; CLI
 `--monitor/--no-monitor` takes precedence. Disabling the preview skips only the
 HTTP/HTML MetricsServer and does not disable JSONL, MetricEvent, SQLite,
 AIServer relay, the projector, or training.
@@ -123,9 +124,9 @@ asks SamplePool to draw `training.train_batch_size` READY processed transitions
 uniformly without replacement, normalizes advantages once over the full batch,
 then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
 batch may contain multiple behavior-model steps; each transition retains exact
-lineage, step, and digest provenance for lag observation. The Training Contract
-`policy.action_mask_mode` controls action masks: `disabled` requires no mask,
-while `required` validates the contract action dimension and applies it to PPO
+lineage and step provenance for lag observation. `policy.action_mask_mode`
+controls action masks: `disabled` requires no mask, while `required` validates
+`model.action_count` and applies the mask to PPO
 logits. Masks are not mandatory for every task.
 
 ## 3. Start fresh training from an existing model
@@ -149,8 +150,9 @@ This reads only the selected file's weights. It is still an independent fresh tr
 `model.initial_model_path` defaults to `null`. Setting it in config or overriding
 it with `--initial-model` enables the same weight-only warm start. The value
 must name a non-empty, regular, non-symlink ONNX model outside the fresh training
-workspace. The Training Contract-driven Learner load boundary validates its
-tensor ABI.
+workspace. Learner validates tensor names, dtype, and shape against
+`model.observation_dimension`, `model.action_count`, and the current model
+implementation.
 
 ## 4. Training model package
 
@@ -179,10 +181,10 @@ update counter automatically.
 
 ## 5. Build the runtime image
 
-The runtime image packages the current Learner source, repository-owned
-Proto/schemas, and synchronized Sample Pool and Model Distributor runtime
-artifacts. The formal synchronization script updates only those two local
-services' `bin/config/manifest`; it never replaces Learner source from Contracts.
+The runtime image packages the current Learner source, repository-owned Proto,
+and synchronized Sample Pool and Model Distributor runtime artifacts. The formal
+synchronization script updates both binaries and copies a default config only when
+the target config is absent; it never replaces Learner source from Contracts.
 Synchronize initially or after dependency changes, then build with an explicit
 project tag from the host:
 
@@ -192,10 +194,10 @@ RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
 The formal scripts never consume `.workspace/dev-artifacts` or a mutable
-development-container build directory. The binary artifacts still validate
-version, target platform, configuration, manifest, and their task-neutral
-Training Contracts dependency; those checks do not lock the Client-AIServer task
-protocol into Learner. The build derives no cross-repository stack identity.
+development-container build directory. Assembly checks only that the two required
+binaries and configs exist and that the binaries are executable; they read no
+package version, platform, manifest, repository identity, or hash. The build derives
+no cross-repository stack identity.
 Without an override it uses `maze-tag-001`; a later tuning build may overwrite the
 same tag.
 
