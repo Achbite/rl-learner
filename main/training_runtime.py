@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import math
 import os
@@ -28,18 +27,9 @@ from proto import (
     training_pb2_grpc,
 )
 from src.contracts.identity import (
-    bind_runtime_lineage,
-    content_digest,
-    contract_document,
-    contract_identity,
-    finalize_manifest,
     model_identity_document,
     read_manifest_file,
-    rollout_estimator_profile,
     service_identity,
-    training_config_digest,
-    training_contract,
-    training_contract_digest,
     validate_config,
     write_manifest_file,
 )
@@ -51,11 +41,8 @@ from src.metrics.metric_events import (
     LocalMetricProjector,
     LocalTrainUpdateMetricWriter,
     MetricEventContractError,
-    MetricSchemaCatalog,
     RawMetricBatchStore,
-    TRAINING_METRIC_SCHEMA_ID,
     create_learner_metric_event_server,
-    default_metric_schema_directory,
 )
 from src.metrics.metrics_backend import DisabledMetricsBackend, create_backend
 from src.training.ppo_trainer import PPOTrainer
@@ -115,24 +102,8 @@ def _same_message(left, right) -> bool:
     )
 
 
-def _same_contract(left, right) -> bool:
-    return (
-        bool(left.package_name)
-        and left.package_name == right.package_name
-        and left.package_version == right.package_version
-    )
-
-
 def load_config(path: str) -> dict:
     return load_effective_config(path)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def atomic_write_json(path: Path, document: dict) -> None:
@@ -161,8 +132,6 @@ def _identity_dict(document: dict | None) -> dict:
     return {
         "model_lineage_id": str(identity.get("model_lineage_id", "")),
         "model_step": int(identity.get("model_step", -1)),
-        "artifact_digest": str(identity.get("artifact_digest", "")),
-        "manifest_digest": str(identity.get("manifest_digest", "")),
     }
 
 
@@ -285,18 +254,13 @@ class ModelPublisher:
     MAX_MODEL_STEP = (1 << 64) - 1
     PROVENANCE_KEYS = (
         "initial_model_path",
-        "initial_model_artifact_digest",
     )
     def __init__(self, config: dict):
         validate_config(config)
         model = config["model"]
-        training_contract_document = training_contract(config)
         self.config = config
-        self.obs_dim = int(training_contract_document["observation_dimension"])
-        self.action_dim = int(training_contract_document["action_count"])
-        self.training_contract_digest = training_contract_digest(config)
-        self.rollout_profile = rollout_estimator_profile(config)
-        self.training_digest = training_config_digest(config)
+        self.obs_dim = int(model["observation_dimension"])
+        self.action_dim = int(model["action_count"])
         self.lineage_id = str(config["identity"]["model_lineage_id"])
         self.local_train_root = Path(str(model["local_train_dir"])).resolve()
         self.runtime_dir = self.local_train_root / "runtime"
@@ -489,7 +453,6 @@ class ModelPublisher:
             raise RuntimeError("initial model weights could not be loaded")
         self.initial_model_provenance = {
             "initial_model_path": str(model_path),
-            "initial_model_artifact_digest": sha256_file(model_path),
         }
         return dict(self.initial_model_provenance)
 
@@ -513,10 +476,6 @@ class ModelPublisher:
             "train_updates": int(train_updates),
             "trained_samples": int(trained_samples),
             "model_lineage_id": self.lineage_id,
-            "training_config_digest": self.training_digest.hex,
-            "rollout_estimator_profile_digest": (
-                self.rollout_profile.profile_digest.hex
-            ),
             **self.initial_model_provenance,
         }
 
@@ -663,21 +622,15 @@ class ModelPublisher:
             for path in (temporary_model, private_checkpoint):
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
-            artifact_digest = sha256_file(temporary_model)
             manifest = training_pb2.ModelArtifactManifest(
                 identity=training_pb2.ModelIdentity(
                     model_lineage_id=self.lineage_id,
                     model_step=step,
-                    artifact_digest=content_digest(artifact_digest),
                 ),
                 size_bytes=temporary_model.stat().st_size,
                 trained_samples=int(trained_samples),
-                training_config_digest=self.training_digest,
-                training_contract_digest=self.training_contract_digest,
                 published_at_unix_ms=int(time.time() * 1000),
-                rollout_estimator_profile=self.rollout_profile,
             )
-            manifest = finalize_manifest(manifest)
             identity = model_identity_document(manifest.identity)
             retention = self.retention_for_updates(int(train_updates))
             runtime_document = {
@@ -762,7 +715,6 @@ class ModelPublisher:
             if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
                 return None
             checkpoint = self._load_checkpoint(checkpoint_path)
-            artifact_digest = sha256_file(model_path)
             model_size = model_path.stat().st_size
         except (OSError, ValueError, KeyError, RuntimeError, TypeError):
             return None
@@ -778,8 +730,6 @@ class ModelPublisher:
             "train_updates",
             "trained_samples",
             "model_lineage_id",
-            "training_config_digest",
-            "rollout_estimator_profile_digest",
         }
         if set(metadata) not in (
             metadata_keys,
@@ -787,20 +737,9 @@ class ModelPublisher:
         ):
             return None
         if (
-            not _same_message(
-                manifest.training_contract_digest,
-                self.training_contract_digest,
-            )
-            or not _same_message(
-                manifest.training_config_digest, self.training_digest
-            )
-            or not _same_message(
-                manifest.rollout_estimator_profile, self.rollout_profile
-            )
-            or manifest.identity.model_lineage_id != self.lineage_id
+            manifest.identity.model_lineage_id != self.lineage_id
             or not manifest.identity.HasField("model_step")
             or int(manifest.identity.model_step) != model_step
-            or manifest.identity.artifact_digest.hex != artifact_digest
             or int(manifest.size_bytes) != model_size
             or int(manifest.published_at_unix_ms) <= 0
             or checkpoint.get("model_step") != model_step
@@ -817,10 +756,6 @@ class ModelPublisher:
             or int(metadata.get("trained_samples", -1))
             != int(manifest.trained_samples)
             or metadata.get("model_lineage_id") != self.lineage_id
-            or metadata.get("training_config_digest")
-            != self.training_digest.hex
-            or metadata.get("rollout_estimator_profile_digest")
-            != self.rollout_profile.profile_digest.hex
             or (
                 train_update_id is not None
                 and metadata.get("train_update_id") != train_update_id
@@ -1047,9 +982,6 @@ class TrainingRuntime:
             "effective learner config: %s",
             json.dumps(effective_config_log(config), sort_keys=True),
         )
-        self.contract = contract_identity(config)
-        self.training_contract_digest = training_contract_digest(config)
-        self.rollout_profile = rollout_estimator_profile(config)
         self.trainer = PPOTrainer(config)
         self.publisher = ModelPublisher(config)
 
@@ -1090,9 +1022,6 @@ class TrainingRuntime:
             "train_updates": self.train_updates,
             "run_train_updates": self.train_updates,
             "run_trained_samples": self.trained_samples,
-            "rollout_estimator_profile_digest": (
-                self.rollout_profile.profile_digest.hex
-            ),
         }
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
@@ -1181,7 +1110,6 @@ class TrainingRuntime:
         self.metric_event_relay_enabled = bool(
             config["metric_events"]["aiserver_relay_enabled"]
         )
-        self._metric_event_disabled_reason = ""
         self._initialize_metric_events()
 
     def _create_metrics_backend(self, backend_type: str, metrics_dir: str):
@@ -1198,13 +1126,8 @@ class TrainingRuntime:
     def _initialize_metric_events(self) -> None:
         store: RawMetricBatchStore | None = None
         try:
-            catalog = MetricSchemaCatalog.load(
-                default_metric_schema_directory()
-            )
             store = RawMetricBatchStore(
                 self.publisher.metrics_dir / "metric-events.sqlite3",
-                self.contract,
-                catalog,
             )
             writer = LocalTrainUpdateMetricWriter(
                 store,
@@ -1215,7 +1138,6 @@ class TrainingRuntime:
             if self.metric_event_relay_enabled:
                 relay = AIServerMetricRelay(
                     store=store,
-                    contract=self.contract,
                     consumer=self.learner_service,
                     status_stub=self.actor_stub,
                     event_stub=self.metric_event_stub,
@@ -1225,7 +1147,6 @@ class TrainingRuntime:
             if self.metric_event_server_enabled:
                 event_server = create_learner_metric_event_server(
                     store=store,
-                    contract=self.contract,
                     source=self.learner_service,
                     port=self.metric_event_server_port,
                 )
@@ -1252,7 +1173,6 @@ class TrainingRuntime:
         store = self.metric_event_store
         if store is None:
             raise RuntimeError("Learner metric store is unavailable")
-        schema = store.catalog.schema_identity(TRAINING_METRIC_SCHEMA_ID)
         document = {
             "component": self.learner_service.component,
             "instance_id": self.learner_service.instance_id,
@@ -1260,9 +1180,6 @@ class TrainingRuntime:
                 self.learner_service.lifecycle_epoch
             ),
             "container_port": self.metric_event_server_port,
-            "schema_id": schema.schema_id,
-            "schema_version": int(schema.schema_version),
-            "schema_digest": schema.canonical_digest.hex,
         }
         destination = self.MANAGED_METRIC_READY_PATH
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1281,8 +1198,7 @@ class TrainingRuntime:
         if self.metric_event_server_enabled:
             if server is None:
                 raise RuntimeError(
-                    "Learner raw MetricEvent service is required but unavailable: "
-                    + self._metric_event_disabled_reason
+                    "Learner raw MetricEvent service is required but unavailable"
                 )
             server.start()
             self.metric_event_server_started = True
@@ -1358,9 +1274,7 @@ class TrainingRuntime:
             return {
                 "enabled": False,
                 "incomplete": True,
-                "reason": getattr(
-                    self, "_metric_event_disabled_reason", "uninitialized"
-                ),
+                "reason": "uninitialized",
             }
         try:
             snapshot = store.snapshot()
@@ -1385,9 +1299,7 @@ class TrainingRuntime:
         if projector is None:
             return {
                 "status": "unavailable",
-                "reason": getattr(
-                    self, "_metric_event_disabled_reason", "uninitialized"
-                ),
+                "reason": "uninitialized",
             }
         try:
             return projector.snapshot()
@@ -1401,7 +1313,7 @@ class TrainingRuntime:
     ) -> common_pb2.ServiceInstanceIdentity:
         try:
             valid = (
-                authority.component == "model-distributor"
+                bool(authority.component)
                 and bool(authority.instance_id)
                 and int(authority.lifecycle_epoch) > 0
             )
@@ -1424,7 +1336,7 @@ class TrainingRuntime:
     ) -> common_pb2.ServiceInstanceIdentity:
         try:
             valid = (
-                authority.component == "sample-pool"
+                bool(authority.component)
                 and bool(authority.instance_id)
                 and int(authority.lifecycle_epoch) > 0
             )
@@ -1438,6 +1350,29 @@ class TrainingRuntime:
         except TypeError as error:
             raise RuntimeError(
                 "sample pool authority has an invalid wire type"
+            ) from error
+        return result
+
+    @staticmethod
+    def _aiserver_authority(
+        authority: common_pb2.ServiceInstanceIdentity,
+    ) -> common_pb2.ServiceInstanceIdentity:
+        try:
+            valid = (
+                bool(authority.component)
+                and bool(authority.instance_id)
+                and int(authority.lifecycle_epoch) > 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise RuntimeError("AIServer authority is invalid")
+        result = common_pb2.ServiceInstanceIdentity()
+        try:
+            result.CopyFrom(authority)
+        except TypeError as error:
+            raise RuntimeError(
+                "AIServer authority has an invalid wire type"
             ) from error
         return result
 
@@ -1473,10 +1408,10 @@ class TrainingRuntime:
             raise RuntimeError(
                 f"model distributor authority could not be pinned: {error}"
             ) from error
-        if not status.ready or not _same_contract(status.contract, self.contract):
+        if not status.ready:
             raise RuntimeError(
                 "model distributor authority could not be pinned: "
-                "distributor is not ready for the exact contract"
+                "distributor is not ready"
             )
         self._validate_model_status_available_range(status)
         try:
@@ -1624,26 +1559,12 @@ class TrainingRuntime:
             latest_selector=latest,
         )
         if (
-            not _same_message(
-                manifest.training_contract_digest,
-                self.training_contract_digest,
-            )
-            or not _same_message(
-                manifest.training_config_digest,
-                self.publisher.training_digest,
-            )
-            or not _same_message(
-                manifest.rollout_estimator_profile,
-                self.publisher.rollout_profile,
-            )
-            or identity.model_lineage_id != self.publisher.lineage_id
+            identity.model_lineage_id != self.publisher.lineage_id
             or not self._has_field(identity, "model_step")
             or (
                 model_step is not None
                 and int(identity.model_step) != model_step
             )
-            or not identity.artifact_digest.hex
-            or not identity.manifest_digest.hex
             or int(manifest.size_bytes) <= 0
             or int(manifest.published_at_unix_ms) <= 0
         ):
@@ -1726,7 +1647,6 @@ class TrainingRuntime:
         response = self.model_stub.RegisterModel(
             training_pb2.RegisterModelReq(
                 manifest=expected,
-                contract=self.contract,
                 local_artifact_path=str(
                     self.publisher.model_path(int(expected.identity.model_step))
                 ),
@@ -1879,10 +1799,10 @@ class TrainingRuntime:
             else time.monotonic() + self.initial_model_ack_timeout
         )
         self.logger.info(
-            "Waiting for AIServer exact bootstrap ACK: model_step=%d "
-            "artifact=%s timeout=%s",
+            "Waiting for AIServer bootstrap ACK: lineage=%s model_step=%d "
+            "timeout=%s",
+            expected.model_lineage_id,
             int(expected.model_step),
-            expected.artifact_digest.hex,
             (
                 "unbounded"
                 if self.initial_model_ack_timeout is None
@@ -1905,17 +1825,16 @@ class TrainingRuntime:
                     status_authority_valid = False
                 if (
                     status.ready
-                    and _same_contract(status.contract, self.contract)
                     and status_authority_valid
                     and status.latest_ack_status
                     == training_pb2.MODEL_LOAD_STATUS_LOADED
                     and _same_message(status.latest_ack_model, expected)
                 ):
                     self.logger.info(
-                        "AIServer exact bootstrap ACK received: "
-                        "model_step=%d artifact=%s",
+                        "AIServer bootstrap ACK received: "
+                        "lineage=%s model_step=%d",
+                        expected.model_lineage_id,
                         int(expected.model_step),
-                        expected.artifact_digest.hex,
                     )
                     return True
                 last = (
@@ -1932,7 +1851,7 @@ class TrainingRuntime:
             )
             return False
         raise RuntimeError(
-            "AIServer did not ACK exact bootstrap model identity before the "
+            "AIServer did not ACK the bootstrap model identity before the "
             f"configured timeout: {last}"
         )
 
@@ -1971,9 +1890,9 @@ class TrainingRuntime:
         if not self._wait_initial_model_loaded(document):
             self.logger.info(
                 "Learner bootstrap published and registered; stopping before "
-                "AIServer activation: model_step=%d artifact=%s",
+                "AIServer activation: lineage=%s model_step=%d",
+                document["identity"]["model_lineage_id"],
                 model_step,
-                document["identity"]["artifact_digest"],
             )
             return False
         self._commit_learner_metrics(
@@ -1987,9 +1906,9 @@ class TrainingRuntime:
             stats={},
         )
         self.logger.info(
-            "Learner training ready: model_step=%d artifact=%s startup=%s",
+            "Learner training ready: lineage=%s model_step=%d startup=%s",
+            document["identity"]["model_lineage_id"],
             model_step,
-            document["identity"]["artifact_digest"],
             self._startup_mode,
         )
         return True
@@ -2085,14 +2004,10 @@ class TrainingRuntime:
     def _ready_sample_pool_authority(
         self, status
     ) -> common_pb2.ServiceInstanceIdentity:
-        if not _same_contract(status.contract, self.contract):
-            raise RuntimeError(
-                "sample pool status has another contract identity"
-            )
         authority = self._sample_pool_authority(status.sample_pool)
         if not status.ready or not status.ingress_ready or status.finalized:
             raise _SamplePoolUnavailable(
-                "sample pool service is not accepting the exact contract"
+                "sample pool service is not accepting samples"
             )
         return authority
 
@@ -2125,15 +2040,7 @@ class TrainingRuntime:
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
         if (
-            not _same_message(
-                manifest.training_contract_digest,
-                self.training_contract_digest,
-            )
-            or not _same_message(
-                manifest.training_config_digest,
-                self.publisher.training_digest,
-            )
-            or manifest.identity.model_lineage_id
+            manifest.identity.model_lineage_id
             != self.publisher.lineage_id
             or not self._has_field(manifest.identity, "model_step")
             or int(manifest.identity.model_step) != int(step)
@@ -2181,11 +2088,6 @@ class TrainingRuntime:
         self, expected: common_pb2.ServiceInstanceIdentity
     ):
         status = self._sample_pool_status()
-        if not _same_contract(status.contract, self.contract):
-            raise RuntimeError(
-                "sample pool contract changed while GetBatch outcome "
-                "was unknown"
-            )
         actual = self._sample_pool_authority(status.sample_pool)
         if not self._same_authority(actual, expected):
             raise RuntimeError(
@@ -2313,9 +2215,6 @@ class TrainingRuntime:
                 timeout_ms=self.get_timeout_ms,
                 consumer=self.learner_service,
                 lease_timeout_ms=self.lease_timeout_ms,
-                required_training_contract_digest=(
-                    self.training_contract_digest
-                ),
             ),
             timeout=max(2.0, self.get_timeout_ms / 1000.0 + 1.0),
         )
@@ -3085,8 +2984,7 @@ class TrainingRuntime:
             status = self.actor_stub.GetAIServerStatus(
                 training_pb2.AIServerStatusReq(), timeout=1.5
             )
-            if not _same_contract(status.contract, self.contract):
-                raise RuntimeError("AIServer contract identity mismatch")
+            self._aiserver_authority(status.aiserver)
             inference_count = int(status.inference_count)
             push_rpc_count = int(status.push_rpc_count)
             segment_close_counts = {
@@ -3107,9 +3005,6 @@ class TrainingRuntime:
                 "model_identity": model_identity_document(status.loaded_model),
                 "staged_model_identity": model_identity_document(
                     status.staged_model
-                ),
-                "rollout_estimator_profile_digest": (
-                    status.rollout_estimator_profile_digest.hex or None
                 ),
                 "produced": int(status.produced_unique_transitions),
                 "produced_envelopes": int(
@@ -3190,18 +3085,14 @@ class TrainingRuntime:
     def _sample_pool_snapshot(self) -> dict:
         try:
             status = self._sample_pool_status()
-            if not _same_contract(status.contract, self.contract):
-                raise RuntimeError(
-                    "sample pool contract identity mismatch"
-                )
-            if status.sample_pool.component != "sample-pool":
-                raise RuntimeError("sample pool component mismatch")
+            authority = self._sample_pool_authority(status.sample_pool)
             return {
                 "ready": bool(status.ready),
                 "ingress_ready": bool(status.ingress_ready),
                 "pool_ready": bool(status.pool_ready),
-                "instance_id": status.sample_pool.instance_id,
-                "lifecycle_epoch": int(status.sample_pool.lifecycle_epoch),
+                "component": authority.component,
+                "instance_id": authority.instance_id,
+                "lifecycle_epoch": int(authority.lifecycle_epoch),
                 "backend_type": training_pb2.SampleBackendType.Name(
                     status.backend_type
                 ),
@@ -3302,15 +3193,17 @@ class TrainingRuntime:
             status = self.model_stub.GetModelDistributorStatus(
                 training_pb2.ModelDistributorStatusReq(), timeout=1.5
             )
-            if not _same_contract(status.contract, self.contract):
-                raise RuntimeError("model distributor contract identity mismatch")
+            authority = self._model_distributor_authority(
+                status.distributor
+            )
             available_range = self._validate_model_status_available_range(
                 status
             )
             return {
                 "ready": bool(status.ready),
-                "instance_id": status.distributor.instance_id,
-                "lifecycle_epoch": int(status.distributor.lifecycle_epoch),
+                "component": authority.component,
+                "instance_id": authority.instance_id,
+                "lifecycle_epoch": int(authority.lifecycle_epoch),
                 "registered_model_count": int(status.registered_model_count),
                 "latest_model_identity": model_identity_document(
                     status.latest_model
@@ -3487,9 +3380,6 @@ class TrainingRuntime:
             "run_trained_samples": int(
                 trained_samples - self._run_start_trained_samples
             ),
-            "rollout_estimator_profile_digest": (
-                self.rollout_profile.profile_digest.hex
-            ),
             **dict(stats),
         }
         with self._metrics_lock:
@@ -3574,7 +3464,6 @@ class TrainingRuntime:
                 train_update_sequence=int(train_updates),
                 published_model=manifest["manifest"].identity,
                 delivery_id=delivery_id,
-                training_contract_digest=self.training_contract_digest,
                 cumulative_trained_samples=int(trained_samples),
                 actual_batch_size=int(actual_batch_size),
                 minimum_behavior_model_step=int(
@@ -3593,9 +3482,6 @@ class TrainingRuntime:
                 duplicate_item_slot_count=int(duplicate_item_slot_count),
                 sample_evaluation_count=int(sample_evaluation_count),
                 optimizer_step_count=int(optimizer_step_count),
-                rollout_estimator_profile_digest=(
-                    self.rollout_profile.profile_digest
-                ),
             ),
             observed_at_unix_ms=int(time.time() * 1000),
         )
@@ -3661,10 +3547,6 @@ class TrainingRuntime:
                     else float(rates["window_seconds"]) * 1000.0
                 ),
                 "configured_poll_interval_ms": 1000,
-                "contract": contract_document(self.contract),
-                "training_contract_digest": (
-                    self.training_contract_digest.hex
-                ),
                 "learner": learner,
                 "actor": actor,
                 "sample_pool": sample_pool,
@@ -3718,13 +3600,12 @@ class TrainingRuntime:
         return self._sample_pool_authority(ready_authority)
 
     def _sample_pool_finalization_id(self) -> str:
-        identity = self.learner_service.SerializeToString(
-            deterministic=True
+        identity = (
+            f"{self.learner_service.component}:"
+            f"{self.learner_service.instance_id}:"
+            f"{int(self.learner_service.lifecycle_epoch)}"
         )
-        digest = hashlib.sha256(
-            identity + b"\0sample-pool-shutdown"
-        ).hexdigest()
-        return f"learner-shutdown-{digest}"
+        return f"learner-shutdown-{identity.encode('utf-8').hex()}"
 
     def _validate_finalized_sample_pool_status(
         self,
@@ -3733,10 +3614,6 @@ class TrainingRuntime:
         finalization_id: str,
         response,
     ) -> None:
-        if not _same_contract(status.contract, self.contract):
-            raise RuntimeError(
-                "sample pool contract changed after finalization"
-            )
         actual = self._sample_pool_authority(status.sample_pool)
         if not self._same_authority(actual, expected_authority):
             raise RuntimeError(
@@ -3928,10 +3805,6 @@ class TrainingRuntime:
             attempt += 1
             try:
                 status = self._sample_pool_status()
-                if not _same_contract(status.contract, self.contract):
-                    raise RuntimeError(
-                        "sample pool contract changed during shutdown"
-                    )
                 authority = self._sample_pool_authority(
                     status.sample_pool
                 )
@@ -3980,10 +3853,6 @@ class TrainingRuntime:
 
     def _finalize_training(self) -> None:
         status = self._sample_pool_status()
-        if not _same_contract(status.contract, self.contract):
-            raise RuntimeError(
-                "sample pool contract changed during explicit finalization"
-            )
         authority = self._sample_pool_authority(status.sample_pool)
         with self._metrics_lock:
             self._metrics_context["disposition"] = "FINALIZING_UNTRAINED_TAIL"

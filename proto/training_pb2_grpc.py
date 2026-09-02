@@ -99,7 +99,7 @@ class AIServerTrainingStatusService:
 
 class MetricEventServiceStub:
     """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity and digest until
+    A retry with the same cursor returns the same batch identity until
     it is acknowledged or an explicit gap proves the requested event unavailable.
     """
 
@@ -123,7 +123,7 @@ class MetricEventServiceStub:
 
 class MetricEventServiceServicer:
     """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity and digest until
+    A retry with the same cursor returns the same batch identity until
     it is acknowledged or an explicit gap proves the requested event unavailable.
     """
 
@@ -162,7 +162,7 @@ def add_MetricEventServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class MetricEventService:
     """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity and digest until
+    A retry with the same cursor returns the same batch identity until
     it is acknowledged or an explicit gap proves the requested event unavailable.
     """
 

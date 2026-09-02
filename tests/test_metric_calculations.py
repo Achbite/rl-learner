@@ -1,4 +1,3 @@
-import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,8 +6,6 @@ from proto import common_pb2, maze_metrics_pb2, training_metrics_pb2, training_p
 from src.metrics.metric_events import (
     LocalMetricProjector,
     LocalTrainUpdateMetricWriter,
-    MAZE_METRIC_SCHEMA_ID,
-    MetricSchemaCatalog,
     RawMetricBatchStore,
     _episode_event_statistics,
     _render_episode_statistics,
@@ -18,13 +15,6 @@ from src.metrics.metric_events import (
 
 
 class LearnerMetricCalculationTest(unittest.TestCase):
-    @staticmethod
-    def _digest(value: str) -> common_pb2.ContentDigest:
-        return common_pb2.ContentDigest(
-            algorithm=common_pb2.DIGEST_ALGORITHM_SHA256,
-            hex=value,
-        )
-
     def test_episode_metrics_are_derived_from_raw_agent_facts(self):
         fact = maze_metrics_pb2.EpisodeMetricFact(
             environment_instance_id="environment-fixed",
@@ -132,14 +122,7 @@ class LearnerMetricCalculationTest(unittest.TestCase):
             rendered["values"]["ppo"]["value_loss"]["mean"], 0.64
         )
 
-    def test_metric_payloads_follow_schema_owned_transport(self):
-        schema_directory = Path(__file__).resolve().parents[1] / "schemas"
-        catalog = MetricSchemaCatalog.load(schema_directory)
-        contract = common_pb2.ContractIdentity(
-            package_name="rl-contracts",
-            package_version="0.15.0",
-            platform="producer-platform",
-        )
+    def test_metric_payloads_follow_typed_transport(self):
         learner = common_pb2.ServiceInstanceIdentity(
             component="learner",
             instance_id="learner-metric-test",
@@ -152,15 +135,12 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         )
         train_fact = training_metrics_pb2.TrainUpdateMetricFact(
             train_update_id="train-update-1",
-            train_update_sequence=1,
+            train_update_sequence=2,
             published_model=training_pb2.ModelIdentity(
                 model_lineage_id="lineage-test",
                 model_step=1,
-                artifact_digest=self._digest("a" * 64),
-                manifest_digest=self._digest("b" * 64),
             ),
             delivery_id="delivery-test",
-            training_contract_digest=self._digest("c" * 64),
             cumulative_trained_samples=2,
             actual_batch_size=2,
             minimum_behavior_model_step=0,
@@ -173,7 +153,6 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         episode_fact = maze_metrics_pb2.EpisodeMetricFact(
             environment_instance_id="environment-test",
             episode_id="episode-test",
-            training_contract_digest=self._digest("c" * 64),
         )
         agent = episode_fact.agents.add(
             agent_id=0,
@@ -194,22 +173,19 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            store = RawMetricBatchStore(
-                Path(directory) / "metrics.sqlite3", contract, catalog
-            )
+            store = RawMetricBatchStore(Path(directory) / "metrics.sqlite3")
             try:
                 writer = LocalTrainUpdateMetricWriter(store, learner)
                 train_bytes = train_fact.SerializeToString(deterministic=True)
                 writer.append(train_fact, observed_at_unix_ms=1700000000000)
+                learner_cursor = store.committed_cursor(learner)
+                self.assertEqual(learner_cursor.acknowledged_batch_sequence, 2)
+                self.assertEqual(learner_cursor.acknowledged_event_sequence, 2)
 
                 episode_bytes = episode_fact.SerializeToString(
                     deterministic=True
                 )
                 episode_batch = training_pb2.MetricBatch(
-                    contract=contract,
-                    schema_identity=catalog.schema_identity(
-                        MAZE_METRIC_SCHEMA_ID
-                    ),
                     source=aiserver,
                     batch_sequence=1,
                     created_at_unix_ms=1700000000001,
@@ -220,35 +196,53 @@ class LearnerMetricCalculationTest(unittest.TestCase):
                             event_sequence=1,
                             observed_at_unix_ms=1700000000001,
                             fact_payload=episode_bytes,
+                            fact_kind=(
+                                training_pb2.METRIC_FACT_KIND_MAZE_EPISODE
+                            ),
                         )
                     ],
                 )
-                canonical = training_pb2.MetricBatch()
-                canonical.CopyFrom(episode_batch)
-                canonical.ClearField("batch_digest")
-                episode_batch.batch_digest.CopyFrom(
-                    self._digest(
-                        hashlib.sha256(
-                            canonical.SerializeToString(deterministic=True)
-                        ).hexdigest()
-                    )
-                )
                 cursor = store.persist_batch("aiserver", episode_batch)
+                self.assertEqual(cursor.acknowledged_batch_sequence, 1)
+                self.assertEqual(cursor.acknowledged_event_sequence, 1)
                 store.mark_acknowledged(episode_batch, cursor)
+                writer.finalize()
 
                 batches = store.committed_batches_after(0)
                 payloads = {
-                    batch.schema_identity.schema_id:
-                    batch.events[0].fact_payload
+                    int(batch.events[0].fact_kind): batch.events[0].fact_payload
                     for _, _, _, batch in batches
                     if batch.events
                 }
                 self.assertEqual(
-                    payloads["rl.training.metrics"], train_bytes
+                    payloads[training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE],
+                    train_bytes,
                 )
                 self.assertEqual(
-                    payloads["maze.episode.metrics"], episode_bytes
+                    payloads[training_pb2.METRIC_FACT_KIND_MAZE_EPISODE],
+                    episode_bytes,
                 )
+                learner_batches = [
+                    batch
+                    for _, role, _, batch in batches
+                    if role == "learner"
+                ]
+                self.assertEqual(len(learner_batches), 3)
+                self.assertTrue(learner_batches[0].HasField("gap"))
+                self.assertEqual(
+                    learner_batches[0].gap.first_unavailable_event_sequence,
+                    1,
+                )
+                self.assertEqual(
+                    learner_batches[0].gap.last_unavailable_event_sequence,
+                    1,
+                )
+                self.assertTrue(learner_batches[-1].source_final)
+                self.assertTrue(learner_batches[-1].heartbeat)
+                self.assertEqual(learner_batches[-1].final_event_sequence, 2)
+                final_cursor = store.committed_cursor(learner)
+                self.assertEqual(final_cursor.acknowledged_batch_sequence, 3)
+                self.assertEqual(final_cursor.acknowledged_event_sequence, 2)
                 snapshot = LocalMetricProjector(store).snapshot()
                 self.assertEqual(
                     snapshot["train_updates"]["windows"]["all"]

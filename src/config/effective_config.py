@@ -13,7 +13,6 @@ import yaml
 
 from src.contracts.identity import (
     bind_runtime_lineage,
-    training_config_digest,
     validate_config,
 )
 
@@ -298,12 +297,6 @@ def load_effective_config(
     _reject_platform_config_keys(loaded)
     config = copy.deepcopy(loaded)
 
-    config["contract"]["training_contract_path"] = _resolve_path(
-        config_path,
-        "contract.training_contract_path",
-        config["contract"].get("training_contract_path"),
-    )
-
     applied: list[dict[str, object]] = []
     for name, (target, parser) in ENVIRONMENT_OVERRIDES.items():
         if name not in selected_environment:
@@ -386,13 +379,11 @@ def load_effective_config(
 
     config = bind_runtime_lineage(config, selected_environment)
     validate_config(config)
-    digest = training_config_digest(config).hex
     effective_fact = {
         "config_path": str(config_path),
         "environment_overrides": applied,
         "internal_environment_overrides": internal_applied,
         "cli_overrides": cli_applied,
-        "training_config_digest": digest,
     }
     if platform_applied:
         effective_fact["platform_environment"] = platform_applied

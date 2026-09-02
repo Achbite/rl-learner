@@ -1,22 +1,17 @@
-"""Build identities from the canonical rl-contracts training descriptor."""
+"""Validate Learner-owned runtime, service and model identities."""
 
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
 import os
 import re
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
 from proto import common_pb2, training_pb2
 
 
-SHA256 = re.compile(r"[a-f0-9]{64}")
-CONTRACT_VERSION = "0.15.0"
 RUNTIME_LINEAGE_PLACEHOLDER = "__FRESH_INTERNAL_LINEAGE_REQUIRED__"
 RUNTIME_LINEAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -30,143 +25,6 @@ def _require_exact_keys(value: dict, expected: set[str], name: str) -> None:
         )
 
 
-@lru_cache(maxsize=8)
-def _load_training_contract(path_text: str) -> dict:
-    path = Path(path_text)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"training contract must be a regular file: {path}")
-    payload = path.read_bytes()
-    digest = hashlib.sha256(payload).hexdigest()
-    try:
-        document = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise ValueError("training contract is not valid JSON") from error
-    if not isinstance(document, dict):
-        raise ValueError("training contract root must be an object")
-    _require_exact_keys(
-        document,
-        {
-            "action_count",
-            "action_schema",
-            "hidden_dimension",
-            "model_architecture_id",
-            "observation_dimension",
-            "observation_schema",
-            "policy",
-            "reward_schema",
-            "rollout",
-            "tensor_dtype",
-            "training_contract_id",
-        },
-        "training contract",
-    )
-    for name in ("observation_schema", "action_schema", "reward_schema"):
-        schema = document[name]
-        if not isinstance(schema, dict):
-            raise ValueError(f"training contract {name} must be an object")
-        _require_exact_keys(
-            schema,
-            {"canonical_digest", "schema_id", "schema_version"},
-            f"training contract {name}",
-        )
-        if (
-            not isinstance(schema["schema_id"], str)
-            or not schema["schema_id"]
-            or isinstance(schema["schema_version"], bool)
-            or not isinstance(schema["schema_version"], int)
-            or schema["schema_version"] <= 0
-            or SHA256.fullmatch(str(schema["canonical_digest"])) is None
-        ):
-            raise ValueError(f"training contract {name} is invalid")
-    policy = document["policy"]
-    if not isinstance(policy, dict):
-        raise ValueError("training contract policy must be an object")
-    _require_exact_keys(
-        policy,
-        {
-            "action_mask_mode",
-            "distribution_schema_id",
-            "sampling",
-            "temperature",
-        },
-        "training contract policy",
-    )
-    rollout = document["rollout"]
-    if not isinstance(rollout, dict):
-        raise ValueError("training contract rollout must be an object")
-    _require_exact_keys(
-        rollout,
-        {
-            "finite_rule_id",
-            "gae_formula_id",
-            "model_pin_semantics_id",
-            "numeric_dtype",
-            "terminal_bootstrap_semantics_id",
-            "value_head_abi_id",
-            "value_target_formula_id",
-        },
-        "training contract rollout",
-    )
-    identifiers = [
-        document["training_contract_id"],
-        document["model_architecture_id"],
-        policy["distribution_schema_id"],
-        *rollout.values(),
-    ]
-    if any(
-        not isinstance(value, str)
-        or not value
-        for value in identifiers
-    ):
-        raise ValueError("training contract contains an empty ID")
-    dimensions = (
-        document["observation_dimension"],
-        document["action_count"],
-        document["hidden_dimension"],
-    )
-    if (
-        document["model_architecture_id"]
-        != "actor-critic.independent-mlp"
-        or document["tensor_dtype"] != "float32"
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-            for value in dimensions
-        )
-        or policy != {
-            "action_mask_mode": policy.get("action_mask_mode"),
-            "distribution_schema_id": "categorical.logits",
-            "sampling": "stochastic",
-            "temperature": 1.0,
-        }
-        or policy["action_mask_mode"] not in {"disabled", "required"}
-        or rollout["numeric_dtype"] != "float32"
-    ):
-        raise ValueError("training contract is unsupported by this Learner")
-    result = copy.deepcopy(document)
-    result["canonical_digest"] = digest
-    return result
-
-
-def training_contract(config: dict) -> dict:
-    path = str(config["contract"]["training_contract_path"])
-    return copy.deepcopy(_load_training_contract(path))
-
-
-def _digest(value: str) -> common_pb2.ContentDigest:
-    if SHA256.fullmatch(str(value)) is None:
-        raise ValueError("digest must be lower-case SHA-256")
-    return common_pb2.ContentDigest(
-        algorithm=common_pb2.DIGEST_ALGORITHM_SHA256,
-        hex=str(value),
-    )
-
-
-def content_digest(value: str) -> common_pb2.ContentDigest:
-    return _digest(value)
-
-
 def service_identity(
     component: str, instance_id: str, lifecycle_epoch: int = 1
 ) -> common_pb2.ServiceInstanceIdentity:
@@ -177,61 +35,6 @@ def service_identity(
         instance_id=instance_id,
         lifecycle_epoch=lifecycle_epoch,
     )
-
-
-def contract_identity(config: dict) -> common_pb2.ContractIdentity:
-    contract = config["contract"]
-    if (
-        contract.get("package_name") != "rl-contracts"
-        or contract.get("package_version") != CONTRACT_VERSION
-        or not contract.get("platform")
-    ):
-        raise ValueError("contract identity does not select rl-contracts 0.15.0")
-    return common_pb2.ContractIdentity(
-        package_name=contract["package_name"],
-        package_version=contract["package_version"],
-        platform=contract["platform"],
-    )
-
-
-def schema_identity(document: dict) -> common_pb2.SchemaIdentity:
-    if (
-        not document.get("schema_id")
-        or int(document.get("schema_version", 0)) <= 0
-    ):
-        raise ValueError("schema identity is incomplete")
-    return common_pb2.SchemaIdentity(
-        schema_id=str(document["schema_id"]),
-        schema_version=int(document["schema_version"]),
-        canonical_digest=_digest(document["canonical_digest"]),
-    )
-
-
-def training_contract_digest(config: dict) -> common_pb2.ContentDigest:
-    """Return the sole wire identity for the canonical training descriptor."""
-    return _digest(training_contract(config)["canonical_digest"])
-
-
-def rollout_estimator_profile(
-    config: dict,
-) -> training_pb2.RolloutEstimatorProfile:
-    training = config["training"]
-    profile = training_pb2.RolloutEstimatorProfile(
-        gamma=float(training["gamma"]),
-        gae_lambda=float(training["gae_lambda"]),
-        tmax=int(training["tmax"]),
-    )
-    digest = hashlib.sha256(
-        profile.SerializeToString(deterministic=True)
-    ).hexdigest()
-    profile.profile_digest.CopyFrom(_digest(digest))
-    return profile
-
-
-def canonical_config_digest(document: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
 
 
 def bind_runtime_lineage(
@@ -255,109 +58,31 @@ def bind_runtime_lineage(
     return result
 
 
-def training_config_document(config: dict) -> dict:
-    """Return the exact task-neutral configuration bound to model identity."""
-    contract = training_contract(config)
-    training = config["training"]
-    model = config["model"]
-    return {
-        "training_contract_digest": contract["canonical_digest"],
-        "training": {
-            key: training[key]
-            for key in (
-                "device",
-                "seed",
-                "learning_rate",
-                "gamma",
-                "gae_lambda",
-                "tmax",
-                "clip_epsilon",
-                "value_clip_epsilon",
-                "entropy_coef",
-                "value_coef",
-                "max_grad_norm",
-                "n_epochs",
-                "train_batch_size",
-                "mini_batch_size",
-                "normalize_advantage",
-            )
-        },
-        "model": {
-            "bootstrap_seed": model["bootstrap_seed"],
-        },
-    }
-
-
-def training_config_digest(config: dict) -> common_pb2.ContentDigest:
-    actual = canonical_config_digest(training_config_document(config))
-    return _digest(actual)
-
-
 def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
     has_step = message.HasField("model_step")
-    has_any_identity = bool(
-        message.model_lineage_id
-        or has_step
-        or message.artifact_digest.hex
-        or message.manifest_digest.hex
-    )
+    has_any_identity = bool(message.model_lineage_id or has_step)
     if not has_any_identity:
         return {}
     if not (
-        message.model_lineage_id
-        and has_step
-        and message.artifact_digest.hex
-        and message.manifest_digest.hex
+        message.model_lineage_id and has_step
     ):
         raise ValueError("model identity is partially populated")
     return {
         "model_lineage_id": message.model_lineage_id,
         "model_step": int(message.model_step),
-        "artifact_digest": message.artifact_digest.hex,
-        "manifest_digest": message.manifest_digest.hex,
     }
 
 
-def schema_document(message: common_pb2.SchemaIdentity) -> dict:
-    return {
-        "schema_id": message.schema_id,
-        "schema_version": int(message.schema_version),
-        "canonical_digest": message.canonical_digest.hex,
-    }
-
-
-def contract_document(message: common_pb2.ContractIdentity) -> dict:
-    return {
-        "package_name": message.package_name,
-        "package_version": message.package_version,
-        "platform": message.platform,
-    }
-
-
-def finalize_manifest(
-    message: training_pb2.ModelArtifactManifest,
-) -> training_pb2.ModelArtifactManifest:
-    """Return a manifest whose identity digest covers canonical protobuf bytes."""
-    result = training_pb2.ModelArtifactManifest()
-    result.CopyFrom(message)
-    result.identity.ClearField("manifest_digest")
-    digest = hashlib.sha256(
-        result.SerializeToString(deterministic=True)
-    ).hexdigest()
-    result.identity.manifest_digest.CopyFrom(_digest(digest))
-    return result
-
-
-def validate_manifest_digest(
+def validate_model_manifest(
     message: training_pb2.ModelArtifactManifest,
 ) -> None:
-    expected = finalize_manifest(message).identity.manifest_digest
     if (
-        message.identity.manifest_digest.algorithm
-        != common_pb2.DIGEST_ALGORITHM_SHA256
-        or message.identity.manifest_digest.hex != expected.hex
+        not message.identity.model_lineage_id
+        or not message.identity.HasField("model_step")
+        or int(message.size_bytes) <= 0
+        or int(message.published_at_unix_ms) <= 0
     ):
-        raise ValueError("model manifest digest is invalid")
+        raise ValueError("model manifest is incomplete")
 
 
 def write_manifest_file(
@@ -365,7 +90,7 @@ def write_manifest_file(
 ) -> None:
     if path.name != "manifest.pb":
         raise ValueError("model manifest must use the canonical protobuf name")
-    validate_manifest_digest(message)
+    validate_model_manifest(message)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise ValueError("model manifest must not be a symbolic link")
@@ -400,7 +125,7 @@ def read_manifest_file(path: Path) -> training_pb2.ModelArtifactManifest:
         raise ValueError("model manifest is not valid protobuf") from error
     if message.SerializeToString(deterministic=True) != payload:
         raise ValueError("model manifest bytes are not canonical")
-    validate_manifest_digest(message)
+    validate_model_manifest(message)
     return message
 
 
@@ -408,8 +133,8 @@ def validate_config(config: dict) -> None:
     required_sections = {
         "training",
         "model",
+        "policy",
         "identity",
-        "contract",
         "sample_pool",
         "model_distributor",
         "aiserver_status",
@@ -428,10 +153,6 @@ def validate_config(config: dict) -> None:
             f"unknown={sorted(root_keys - required_sections - {'_effective_config'})}"
         )
     expected_keys = {
-        "contract": {
-            "package_name", "package_version", "platform",
-            "training_contract_path",
-        },
         "identity": {"model_lineage_id"},
         "training": {
             "device", "seed", "learning_rate", "gamma", "gae_lambda",
@@ -440,10 +161,12 @@ def validate_config(config: dict) -> None:
             "train_batch_size", "mini_batch_size", "normalize_advantage",
         },
         "model": {
+            "observation_dimension", "action_count", "hidden_dimension",
             "initial_model_path", "local_train_dir",
             "archive_interval_updates", "publication_retention_steps",
             "bootstrap_seed",
         },
+        "policy": {"action_mask_mode"},
         "sample_pool": {
             "host", "port", "get_timeout_ms", "lease_timeout_ms",
             "finalize_request_path", "finalize_complete_path",
@@ -466,24 +189,22 @@ def validate_config(config: dict) -> None:
         effective = config["_effective_config"]
         if not isinstance(effective, dict):
             raise ValueError("_effective_config must be a mapping")
-        _require_exact_keys(
-            effective,
-            {
-                "config_path", "environment_overrides",
-                "internal_environment_overrides", "cli_overrides",
-                "training_config_digest",
-            },
-            "_effective_config",
-        )
-    contract_identity(config)
+        required_effective = {
+            "config_path", "environment_overrides",
+            "internal_environment_overrides", "cli_overrides",
+        }
+        optional_effective = {"platform_environment"}
+        actual_effective = set(effective)
+        if (
+            not required_effective.issubset(actual_effective)
+            or actual_effective - required_effective - optional_effective
+        ):
+            raise ValueError("_effective_config keys differ")
     lineage = str(config["identity"].get("model_lineage_id", ""))
     if lineage != RUNTIME_LINEAGE_PLACEHOLDER and (
         not lineage or RUNTIME_LINEAGE.fullmatch(lineage) is None
     ):
         raise ValueError("identity.model_lineage_id is invalid")
-    contract = training_contract(config)
-    training_contract_digest(config)
-    training_config_digest(config)
     model = config["model"]
     training = config["training"]
     if "initial_model_path" not in model:
@@ -498,12 +219,15 @@ def validate_config(config: dict) -> None:
     ]:
         raise ValueError("model.local_train_dir must be configured")
     if (
-        int(model["archive_interval_updates"]) <= 0
+        int(model["observation_dimension"]) <= 0
+        or int(model["action_count"]) <= 0
+        or int(model["hidden_dimension"]) <= 0
+        or int(model["archive_interval_updates"]) <= 0
         or int(model["publication_retention_steps"]) <= 0
     ):
         raise ValueError("model publication parameters are invalid")
-    if contract["policy"]["sampling"] != "stochastic":
-        raise ValueError("training contract policy sampling is unsupported")
+    if config["policy"]["action_mask_mode"] not in {"disabled", "required"}:
+        raise ValueError("policy.action_mask_mode is invalid")
     finite_training_values = (
         "learning_rate",
         "gamma",
@@ -529,7 +253,6 @@ def validate_config(config: dict) -> None:
         or float(training["max_grad_norm"]) <= 0.0
     ):
         raise ValueError("training parameters contradict PPO execution")
-    profile = rollout_estimator_profile(config)
     if (
         isinstance(training["normalize_advantage"], bool) is False
         or int(training["seed"]) < 0
@@ -538,7 +261,6 @@ def validate_config(config: dict) -> None:
         or int(training["train_batch_size"]) <= 0
         or int(training["mini_batch_size"]) <= 0
         or int(training["tmax"]) <= 0
-        or not profile.profile_digest.hex
         or int(config["sample_pool"]["get_timeout_ms"]) <= 0
         or int(config["sample_pool"]["lease_timeout_ms"]) <= 0
         or int(config["sample_pool"]["shutdown_drain_timeout_ms"])

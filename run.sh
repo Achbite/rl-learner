@@ -74,7 +74,7 @@ startup_output="$(
     python3 -m main.resolve_startup --format lines -- "$@"
 )"
 mapfile -t startup_values <<< "${startup_output}"
-if [ "${#startup_values[@]}" -ne 15 ]; then
+if [ "${#startup_values[@]}" -ne 12 ]; then
     echo "Learner effective startup handoff is invalid" >&2
     exit 1
 fi
@@ -90,9 +90,6 @@ aiserver_port="${startup_values[8]}"
 metrics_port="${startup_values[9]}"
 metrics_enabled="${startup_values[10]}"
 metric_event_port="${startup_values[11]}"
-contract_package="${startup_values[12]}"
-contract_version="${startup_values[13]}"
-contract_platform="${startup_values[14]}"
 if [ "${metrics_enabled}" = "1" ]; then
     local_monitor_state="enabled"
 else
@@ -386,10 +383,12 @@ if [ "${managed}" -eq 1 ]; then
         echo "Learner managed readiness timeout before raw MetricEvent service publication" >&2
         exit 1
     fi
-    metric_output="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); keys=("component","instance_id","lifecycle_epoch","container_port","schema_id","schema_version","schema_digest"); print("\n".join(str(d[k]) for k in keys))' "${metric_ready_path}")"
+    metric_output="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); keys=("component","instance_id","lifecycle_epoch","container_port"); print("\n".join(str(d[k]) for k in keys))' "${metric_ready_path}")"
     mapfile -t metric_values <<< "${metric_output}"
-    if [ "${#metric_values[@]}" -ne 7 ] ||
-	   [ "${metric_values[0]}" != "learner" ] ||
+    if [ "${#metric_values[@]}" -ne 4 ] ||
+	   [ -z "${metric_values[0]}" ] ||
+	   [ -z "${metric_values[1]}" ] ||
+	   [ "${metric_values[2]}" -le 0 ] ||
        [ "${metric_values[3]}" != "${metric_event_port}" ]; then
         echo "Learner managed metric source identity is invalid" >&2
         exit 1
@@ -403,13 +402,7 @@ if [ "${managed}" -eq 1 ]; then
         --fact metric_component="${metric_values[0]}" \
         --fact metric_instance_id="${metric_values[1]}" \
         --fact metric_lifecycle_epoch="${metric_values[2]}" \
-        --fact metric_container_port="${metric_values[3]}" \
-        --fact metric_schema_id="${metric_values[4]}" \
-        --fact metric_schema_version="${metric_values[5]}" \
-        --fact metric_schema_digest="${metric_values[6]}" \
-        --fact contract_package="${contract_package}" \
-        --fact contract_version="${contract_version}" \
-        --fact contract_platform="${contract_platform}"
+        --fact metric_container_port="${metric_values[3]}"
 fi
 
 while [ "${stopping}" -eq 0 ]; do

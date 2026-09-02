@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import os
-import re
 import sqlite3
 import threading
 import time
@@ -26,10 +23,16 @@ from proto import (
 )
 
 
-SHA256 = re.compile(r"[a-f0-9]{64}")
-METRIC_SCHEMA_VERSION = 1
-MAZE_METRIC_SCHEMA_ID = "maze.episode.metrics"
-TRAINING_METRIC_SCHEMA_ID = "rl.training.metrics"
+ROLE_FACT_KINDS = {
+    "aiserver": training_pb2.METRIC_FACT_KIND_MAZE_EPISODE,
+    "learner": training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE,
+}
+FACT_MESSAGE_TYPES = {
+    training_pb2.METRIC_FACT_KIND_MAZE_EPISODE:
+        maze_metrics_pb2.EpisodeMetricFact,
+    training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE:
+        training_metrics_pb2.TrainUpdateMetricFact,
+}
 
 
 class MetricEventContractError(ValueError):
@@ -39,14 +42,6 @@ class MetricEventContractError(ValueError):
 def _same_message(left, right) -> bool:
     return left.SerializeToString(deterministic=True) == right.SerializeToString(
         deterministic=True
-    )
-
-
-def _same_contract(left, right) -> bool:
-    return (
-        bool(left.package_name)
-        and left.package_name == right.package_name
-        and left.package_version == right.package_version
     )
 
 
@@ -75,204 +70,17 @@ def _source_key(source: common_pb2.ServiceInstanceIdentity) -> str:
     )
 
 
-def _digest_message(batch: training_pb2.MetricBatch) -> str:
-    canonical = training_pb2.MetricBatch()
-    canonical.CopyFrom(batch)
-    canonical.ClearField("batch_digest")
-    return hashlib.sha256(
-        canonical.SerializeToString(deterministic=True)
-    ).hexdigest()
-
-
-def _content_digest(hex_digest: str) -> common_pb2.ContentDigest:
-    if SHA256.fullmatch(hex_digest) is None:
-        raise MetricEventContractError("metric digest must be lower-case SHA-256")
-    return common_pb2.ContentDigest(
-        algorithm=common_pb2.DIGEST_ALGORITHM_SHA256,
-        hex=hex_digest,
-    )
-
-
-class MetricSchemaCatalog:
-    """Schema-owned fact codecs selected by MetricBatch.schema_identity."""
-
-    FILES = {
-        MAZE_METRIC_SCHEMA_ID: "maze.episode.metrics.json",
-        TRAINING_METRIC_SCHEMA_ID: "training.metrics.json",
-    }
-    FACT_NAMES = {
-        MAZE_METRIC_SCHEMA_ID: "agent_episode",
-        TRAINING_METRIC_SCHEMA_ID: "train_update",
-    }
-    MESSAGE_TYPES = {
-        MAZE_METRIC_SCHEMA_ID: maze_metrics_pb2.EpisodeMetricFact,
-        TRAINING_METRIC_SCHEMA_ID: training_metrics_pb2.TrainUpdateMetricFact,
-    }
-    ROLE_SCHEMAS = {
-        "aiserver": MAZE_METRIC_SCHEMA_ID,
-        "learner": TRAINING_METRIC_SCHEMA_ID,
-    }
-
-    def __init__(self, entries: dict[str, tuple[dict, str]]):
-        if set(entries) != set(self.FILES):
-            raise MetricEventContractError("metric schema set is incomplete")
-        self._documents: dict[str, dict] = {}
-        self._digests: dict[str, str] = {}
-        self._fields: dict[str, set[str]] = {}
-        for schema_id, (document, canonical_digest) in entries.items():
-            if document.get("catalog_schema") != "rl.metric-field-catalog.v1":
-                raise MetricEventContractError(
-                    "metric catalog format is unsupported"
-                )
-            if document.get("schema_id") != schema_id:
-                raise MetricEventContractError(
-                    "metric catalog schema_id is invalid"
-                )
-            if int(document.get("schema_version", 0)) != METRIC_SCHEMA_VERSION:
-                raise MetricEventContractError(
-                    "metric catalog schema_version is invalid"
-                )
-            fields = document.get("fields")
-            if not isinstance(fields, list) or not fields:
-                raise MetricEventContractError("metric catalog fields are missing")
-            expected_fact = self.FACT_NAMES[schema_id]
-            identities: list[tuple[str, str]] = []
-            field_ids: set[str] = set()
-            for field in fields:
-                if not isinstance(field, dict):
-                    raise MetricEventContractError(
-                        "metric catalog field is invalid"
-                    )
-                fact = str(field.get("fact", ""))
-                field_id = str(field.get("field_id", ""))
-                if fact != expected_fact or not field_id:
-                    raise MetricEventContractError(
-                        "metric catalog identity is invalid"
-                    )
-                if field.get("aggregation") != "raw_sum_count":
-                    raise MetricEventContractError(
-                        "metric catalog aggregation must be raw_sum_count"
-                    )
-                identities.append((fact, field_id))
-                field_ids.add(field_id)
-            if identities != sorted(identities) or len(identities) != len(
-                set(identities)
-            ):
-                raise MetricEventContractError(
-                    "metric catalog identities must be unique and sorted"
-                )
-            if SHA256.fullmatch(canonical_digest) is None:
-                raise MetricEventContractError("metric catalog digest is invalid")
-            self._documents[schema_id] = document
-            self._digests[schema_id] = canonical_digest
-            self._fields[schema_id] = field_ids
-
-    @classmethod
-    def load(cls, directory: Path) -> "MetricSchemaCatalog":
-        entries: dict[str, tuple[dict, str]] = {}
-        for schema_id, filename in cls.FILES.items():
-            catalog_bytes = (directory / filename).read_bytes()
-            try:
-                document = json.loads(catalog_bytes)
-            except json.JSONDecodeError as error:
-                raise MetricEventContractError(
-                    f"metric catalog JSON is invalid: {error}"
-                ) from error
-            if not isinstance(document, dict):
-                raise MetricEventContractError(
-                    "metric catalog must be an object"
-                )
-            entries[schema_id] = (
-                document,
-                hashlib.sha256(catalog_bytes).hexdigest(),
-            )
-        return cls(entries)
-
-    def schema_identity(self, schema_id: str) -> common_pb2.SchemaIdentity:
-        if schema_id not in self._digests:
-            raise MetricEventContractError("metric schema is unsupported")
-        return common_pb2.SchemaIdentity(
-            schema_id=schema_id,
-            schema_version=METRIC_SCHEMA_VERSION,
-            canonical_digest=_content_digest(self._digests[schema_id]),
-        )
-
-    def validate_identity(
-        self, identity: common_pb2.SchemaIdentity
-    ) -> str:
-        schema_id = str(identity.schema_id)
-        if schema_id not in self._digests or not _same_message(
-            identity, self.schema_identity(schema_id)
-        ):
-            raise MetricEventContractError(
-                "metric batch schema identity mismatch"
-            )
-        return schema_id
-
-    def fields_for(self, schema_id: str) -> set[str]:
-        try:
-            return self._fields[schema_id]
-        except KeyError as error:
-            raise MetricEventContractError(
-                "metric schema is unsupported"
-            ) from error
-
-    def schema_id_for_role(self, role: str) -> str:
-        try:
-            return self.ROLE_SCHEMAS[role]
-        except KeyError as error:
-            raise MetricEventContractError(
-                "metric source role is invalid"
-            ) from error
-
-    def decode(self, identity: common_pb2.SchemaIdentity, payload: bytes):
-        schema_id = self.validate_identity(identity)
-        if not payload:
-            raise MetricEventContractError("metric fact payload is missing")
-        message = self.MESSAGE_TYPES[schema_id]()
-        try:
-            message.ParseFromString(payload)
-        except Exception as error:
-            raise MetricEventContractError(
-                "metric fact payload does not match its schema"
-            ) from error
-        return schema_id, message
-
-    def identities_document(self) -> dict[str, dict]:
-        return {
-            schema_id: {
-                "schema_id": schema_id,
-                "schema_version": METRIC_SCHEMA_VERSION,
-                "canonical_digest": self._digests[schema_id],
-            }
-            for schema_id in sorted(self._digests)
-        }
-
-
-def default_metric_schema_directory() -> Path:
-    configured = os.environ.get("RL_METRIC_SCHEMA_DIR", "")
-    if configured:
-        return Path(configured).resolve()
-    repository = Path(__file__).resolve().parents[2]
-    local = repository / "schemas"
-    if all((local / filename).is_file() for filename in MetricSchemaCatalog.FILES.values()):
-        return local
-    sibling_contracts = repository.parent / "rl-contracts" / "schemas"
-    return sibling_contracts
-
-
 def _validate_sum_counts(
     values,
-    allowed_fields: set[str],
     owner: str,
 ) -> None:
     field_ids = [item.field_id for item in values]
     if len(field_ids) != len(set(field_ids)):
         raise MetricEventContractError(f"{owner} has duplicate field_id values")
     for item in values:
-        if item.field_id not in allowed_fields:
+        if not item.field_id:
             raise MetricEventContractError(
-                f"{owner} field_id is outside its metric schema: {item.field_id}"
+                f"{owner} field_id is missing"
             )
         if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
             raise MetricEventContractError(
@@ -280,17 +88,32 @@ def _validate_sum_counts(
             )
 
 
-def _validate_event(
-    event: training_pb2.MetricEvent,
-    schema_identity: common_pb2.SchemaIdentity,
-    catalog: MetricSchemaCatalog,
-) -> None:
+def _decode_event(event: training_pb2.MetricEvent):
+    try:
+        message_type = FACT_MESSAGE_TYPES[int(event.fact_kind)]
+    except KeyError as error:
+        raise MetricEventContractError(
+            "metric event fact kind is unsupported"
+        ) from error
+    if not event.fact_payload:
+        raise MetricEventContractError("metric fact payload is missing")
+    message = message_type()
+    try:
+        message.ParseFromString(event.fact_payload)
+    except Exception as error:
+        raise MetricEventContractError(
+            "metric fact payload does not match its fact kind"
+        ) from error
+    return int(event.fact_kind), message
+
+
+def _validate_event(event: training_pb2.MetricEvent) -> None:
     if int(event.event_sequence) <= 0 or not _has_field(
         event, "observed_at_unix_ms"
     ):
         raise MetricEventContractError("metric event identity is invalid")
-    schema_id, fact = catalog.decode(schema_identity, event.fact_payload)
-    if schema_id == MAZE_METRIC_SCHEMA_ID:
+    fact_kind, fact = _decode_event(event)
+    if fact_kind == training_pb2.METRIC_FACT_KIND_MAZE_EPISODE:
         episode = fact
         if not (
             episode.environment_instance_id
@@ -327,7 +150,6 @@ def _validate_event(
                 )
             _validate_sum_counts(
                 agent.reward_components,
-                catalog.fields_for(MAZE_METRIC_SCHEMA_ID),
                 "episode reward component",
             )
             if any(
@@ -347,7 +169,7 @@ def _validate_event(
                 raise MetricEventContractError(
                     "reward components do not conserve agent episode return"
                 )
-    elif schema_id == TRAINING_METRIC_SCHEMA_ID:
+    elif fact_kind == training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE:
         update = fact
         if not (
             update.train_update_id
@@ -364,15 +186,12 @@ def _validate_event(
             or not _has_field(update, "maximum_behavior_model_step")
             or int(update.minimum_behavior_model_step)
             > int(update.maximum_behavior_model_step)
-            or int(update.published_model.model_step)
-            != int(update.train_update_sequence)
         ):
             raise MetricEventContractError(
                 "train update model step contract is invalid"
             )
         _validate_sum_counts(
             update.ppo_statistics,
-            catalog.fields_for(TRAINING_METRIC_SCHEMA_ID),
             "PPO statistic",
         )
     else:
@@ -382,14 +201,14 @@ def _validate_event(
 def validate_metric_batch(
     batch: training_pb2.MetricBatch,
     *,
-    contract: common_pb2.ContractIdentity,
-    catalog: MetricSchemaCatalog,
+    role: str,
     source: common_pb2.ServiceInstanceIdentity,
     previous_cursor: training_pb2.MetricBatchCursor,
 ) -> None:
-    catalog.validate_identity(batch.schema_identity)
-    if not _same_contract(batch.contract, contract):
-        raise MetricEventContractError("metric batch contract identity mismatch")
+    try:
+        expected_fact_kind = ROLE_FACT_KINDS[role]
+    except KeyError as error:
+        raise MetricEventContractError("metric source role is invalid") from error
     if not _same_message(batch.source, source):
         raise MetricEventContractError("metric batch source identity mismatch")
     if not _same_message(previous_cursor.source, source):
@@ -398,13 +217,6 @@ def validate_metric_batch(
         previous_cursor.acknowledged_batch_sequence
     ) + 1:
         raise MetricEventContractError("metric batch sequence is not contiguous")
-    if (
-        batch.batch_digest.algorithm
-        != common_pb2.DIGEST_ALGORITHM_SHA256
-        or SHA256.fullmatch(batch.batch_digest.hex) is None
-        or _digest_message(batch) != batch.batch_digest.hex
-    ):
-        raise MetricEventContractError("metric batch digest is invalid")
     if int(batch.created_at_unix_ms) <= 0:
         raise MetricEventContractError("metric batch created_at is invalid")
     previous_event = int(previous_cursor.acknowledged_event_sequence)
@@ -420,7 +232,11 @@ def validate_metric_batch(
         ):
             raise MetricEventContractError("metric event batch bounds are invalid")
         for event in batch.events:
-            _validate_event(event, batch.schema_identity, catalog)
+            if int(event.fact_kind) != expected_fact_kind:
+                raise MetricEventContractError(
+                    "metric fact owner differs from durable source role"
+                )
+            _validate_event(event)
         next_event = sequences[-1]
     elif batch.HasField("gap"):
         gap = batch.gap
@@ -467,23 +283,17 @@ def cursor_for_batch(
         source=batch.source,
         acknowledged_batch_sequence=batch.batch_sequence,
         acknowledged_event_sequence=event_sequence,
-        acknowledged_batch_digest=batch.batch_digest,
     )
 
 
 class RawMetricBatchStore:
     """SQLite journal retaining exact batch bytes and durable ACK cursors."""
 
-    def __init__(
-        self,
-        path: Path,
-        contract: common_pb2.ContractIdentity,
-        catalog: MetricSchemaCatalog,
-    ):
+    FORMAT_VERSION = 2
+
+    def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self.contract = _copy_message(contract)
-        self.catalog = catalog
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._connection = sqlite3.connect(
@@ -491,15 +301,31 @@ class RawMetricBatchStore:
         )
         self._connection.row_factory = sqlite3.Row
         try:
+            self._initialize()
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute("PRAGMA foreign_keys=ON")
-            self._initialize()
         except Exception:
             self._connection.close()
             raise
 
     def _initialize(self) -> None:
+        version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if tables and version != self.FORMAT_VERSION:
+            raise MetricEventContractError(
+                "metric journal uses an unsupported legacy storage format"
+            )
+        if not tables and version not in {0, self.FORMAT_VERSION}:
+            raise MetricEventContractError(
+                "metric journal storage format is unsupported"
+            )
         with self._connection:
             self._connection.executescript(
                 """
@@ -511,24 +337,22 @@ class RawMetricBatchStore:
                     lifecycle_epoch TEXT NOT NULL,
                     committed_batch_sequence TEXT NOT NULL DEFAULT '0',
                     committed_event_sequence TEXT NOT NULL DEFAULT '0',
-                    committed_digest TEXT NOT NULL DEFAULT '',
                     pending_batch_sequence TEXT,
                     pending_event_sequence TEXT,
-                    pending_digest TEXT,
                     final_acknowledged INTEGER NOT NULL DEFAULT 0,
                     incomplete INTEGER NOT NULL DEFAULT 0,
                     incomplete_reason TEXT NOT NULL DEFAULT '',
                     updated_at_unix_ms INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS metric_batches (
+                    journal_id INTEGER PRIMARY KEY,
                     source_key TEXT NOT NULL,
                     batch_sequence TEXT NOT NULL,
-                    batch_digest TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('pending', 'committed')),
                     payload BLOB NOT NULL,
                     persisted_at_unix_ms INTEGER NOT NULL,
                     acknowledged_at_unix_ms INTEGER,
-                    PRIMARY KEY(source_key, batch_sequence),
+                    UNIQUE(source_key, batch_sequence),
                     FOREIGN KEY(source_key) REFERENCES metric_sources(source_key)
                 );
                 CREATE TABLE IF NOT EXISTS metric_store_metadata (
@@ -543,10 +367,10 @@ class RawMetricBatchStore:
                     consumer_lifecycle_epoch TEXT NOT NULL,
                     committed_batch_sequence TEXT NOT NULL DEFAULT '0',
                     committed_event_sequence TEXT NOT NULL DEFAULT '0',
-                    committed_digest TEXT NOT NULL DEFAULT '',
                     updated_at_unix_ms INTEGER NOT NULL,
                     FOREIGN KEY(source_key) REFERENCES metric_sources(source_key)
                 );
+                PRAGMA user_version = 2;
                 """
             )
 
@@ -567,15 +391,26 @@ class RawMetricBatchStore:
         prefix = "pending" if pending else "committed"
         batch_sequence = row[f"{prefix}_batch_sequence"]
         event_sequence = row[f"{prefix}_event_sequence"]
-        digest = row[f"{prefix}_digest"]
-        cursor = training_pb2.MetricBatchCursor(
+        return training_pb2.MetricBatchCursor(
             source=RawMetricBatchStore._row_source(row),
             acknowledged_batch_sequence=int(batch_sequence or 0),
             acknowledged_event_sequence=int(event_sequence or 0),
         )
-        if digest:
-            cursor.acknowledged_batch_digest.CopyFrom(_content_digest(digest))
-        return cursor
+
+    @staticmethod
+    def _decode_stored_batch(payload: bytes) -> training_pb2.MetricBatch:
+        batch = training_pb2.MetricBatch()
+        try:
+            batch.ParseFromString(payload)
+        except Exception as error:
+            raise MetricEventContractError(
+                "stored metric batch is not valid protobuf"
+            ) from error
+        if batch.SerializeToString(deterministic=True) != payload:
+            raise MetricEventContractError(
+                "stored metric batch bytes are not canonical"
+            )
+        return batch
 
     def activate_source(
         self,
@@ -674,7 +509,7 @@ class RawMetricBatchStore:
                 return None
             stored = self._connection.execute(
                 """
-                SELECT payload, batch_digest FROM metric_batches
+                SELECT payload FROM metric_batches
                 WHERE source_key = ? AND batch_sequence = ? AND status = 'pending'
                 """,
                 (_source_key(source), str(int(sequence))),
@@ -683,12 +518,14 @@ class RawMetricBatchStore:
                 raise MetricEventContractError(
                     "metric pending cursor has no raw batch"
                 )
-            batch = training_pb2.MetricBatch.FromString(stored["payload"])
+            batch = self._decode_stored_batch(stored["payload"])
             if (
-                batch.batch_digest.hex != stored["batch_digest"]
-                or _digest_message(batch) != stored["batch_digest"]
+                int(batch.batch_sequence) != int(sequence)
+                or _source_key(batch.source) != _source_key(source)
             ):
-                raise MetricEventContractError("stored metric batch is corrupted")
+                raise MetricEventContractError(
+                    "stored pending batch identity is inconsistent"
+                )
             return batch
 
     def persist_batch(
@@ -696,13 +533,6 @@ class RawMetricBatchStore:
         role: str,
         batch: training_pb2.MetricBatch,
     ) -> training_pb2.MetricBatchCursor:
-        if (
-            batch.schema_identity.schema_id
-            != self.catalog.schema_id_for_role(role)
-        ):
-            raise MetricEventContractError(
-                "metric schema owner differs from durable source role"
-            )
         self.activate_source(role, batch.source)
         key = _source_key(batch.source)
         now_ms = int(time.time() * 1000)
@@ -715,32 +545,34 @@ class RawMetricBatchStore:
                 else self._row_cursor(row, pending=True)
             )
             candidate_cursor = cursor_for_batch(batch, committed)
+            payload = batch.SerializeToString(deterministic=True)
             if pending is not None:
-                if _same_message(candidate_cursor, pending):
+                stored_pending = self.pending_batch(batch.source)
+                if (
+                    _same_message(candidate_cursor, pending)
+                    and stored_pending is not None
+                    and stored_pending.SerializeToString(deterministic=True)
+                    == payload
+                ):
                     return pending
                 raise MetricEventContractError(
                     "metric source already has an unacknowledged batch"
                 )
             validate_metric_batch(
                 batch,
-                contract=self.contract,
-                catalog=self.catalog,
+                role=role,
                 source=batch.source,
                 previous_cursor=committed,
             )
-            payload = batch.SerializeToString(deterministic=True)
             existing = self._connection.execute(
                 """
-                SELECT batch_digest, payload, status FROM metric_batches
+                SELECT payload, status FROM metric_batches
                 WHERE source_key = ? AND batch_sequence = ?
                 """,
                 (key, str(int(batch.batch_sequence))),
             ).fetchone()
             if existing is not None:
-                if (
-                    existing["batch_digest"] != batch.batch_digest.hex
-                    or existing["payload"] != payload
-                ):
+                if existing["payload"] != payload:
                     raise MetricEventContractError(
                         "metric batch replay conflicts with durable bytes"
                     )
@@ -752,14 +584,13 @@ class RawMetricBatchStore:
                 self._connection.execute(
                     """
                     INSERT INTO metric_batches(
-                        source_key, batch_sequence, batch_digest, status,
-                        payload, persisted_at_unix_ms
-                    ) VALUES (?, ?, ?, 'pending', ?, ?)
+                        source_key, batch_sequence, status, payload,
+                        persisted_at_unix_ms
+                    ) VALUES (?, ?, 'pending', ?, ?)
                     """,
                     (
                         key,
                         str(int(batch.batch_sequence)),
-                        batch.batch_digest.hex,
                         payload,
                         now_ms,
                     ),
@@ -768,13 +599,12 @@ class RawMetricBatchStore:
                 """
                 UPDATE metric_sources
                 SET pending_batch_sequence = ?, pending_event_sequence = ?,
-                    pending_digest = ?, updated_at_unix_ms = ?
+                    updated_at_unix_ms = ?
                 WHERE source_key = ?
                 """,
                 (
                     str(int(candidate_cursor.acknowledged_batch_sequence)),
                     str(int(candidate_cursor.acknowledged_event_sequence)),
-                    candidate_cursor.acknowledged_batch_digest.hex,
                     now_ms,
                     key,
                 ),
@@ -801,7 +631,7 @@ class RawMetricBatchStore:
                 raise MetricEventContractError("metric ACK cursor is not pending")
             stored = self._connection.execute(
                 """
-                SELECT batch_digest, payload FROM metric_batches
+                SELECT payload FROM metric_batches
                 WHERE source_key = ? AND batch_sequence = ? AND status = 'pending'
                 """,
                 (key, str(int(batch.batch_sequence))),
@@ -809,7 +639,6 @@ class RawMetricBatchStore:
             payload = batch.SerializeToString(deterministic=True)
             if (
                 stored is None
-                or stored["batch_digest"] != batch.batch_digest.hex
                 or stored["payload"] != payload
             ):
                 raise MetricEventContractError(
@@ -837,9 +666,8 @@ class RawMetricBatchStore:
                 """
                 UPDATE metric_sources
                 SET committed_batch_sequence = ?, committed_event_sequence = ?,
-                    committed_digest = ?,
                     pending_batch_sequence = NULL,
-                    pending_event_sequence = NULL, pending_digest = NULL,
+                    pending_event_sequence = NULL,
                     final_acknowledged = ?, incomplete = ?,
                     incomplete_reason = ?, updated_at_unix_ms = ?
                 WHERE source_key = ?
@@ -847,7 +675,6 @@ class RawMetricBatchStore:
                 (
                     str(int(cursor.acknowledged_batch_sequence)),
                     str(int(cursor.acknowledged_event_sequence)),
-                    cursor.acknowledged_batch_digest.hex,
                     1 if batch.source_final else int(row["final_acknowledged"]),
                     incomplete,
                     incomplete_reason,
@@ -945,28 +772,24 @@ class RawMetricBatchStore:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT b.rowid AS row_id, b.source_key, s.role, b.payload,
-                       b.batch_digest
+                SELECT b.journal_id, b.source_key, s.role, b.payload
                 FROM metric_batches AS b
                 JOIN metric_sources AS s ON s.source_key = b.source_key
-                WHERE b.status = 'committed' AND b.rowid > ?
-                ORDER BY b.rowid
+                WHERE b.status = 'committed' AND b.journal_id > ?
+                ORDER BY b.journal_id
                 """,
                 (row_id,),
             ).fetchall()
         result = []
         for row in rows:
-            batch = training_pb2.MetricBatch.FromString(row["payload"])
-            if (
-                batch.batch_digest.hex != row["batch_digest"]
-                or _digest_message(batch) != row["batch_digest"]
-            ):
+            batch = self._decode_stored_batch(row["payload"])
+            if _source_key(batch.source) != str(row["source_key"]):
                 raise MetricEventContractError(
-                    "committed metric batch is corrupted"
+                    "committed metric batch source is inconsistent"
                 )
             result.append(
                 (
-                    int(row["row_id"]),
+                    int(row["journal_id"]),
                     str(row["role"]),
                     str(row["source_key"]),
                     batch,
@@ -1026,15 +849,14 @@ class RawMetricBatchStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT committed_batch_sequence, committed_event_sequence,
-                       committed_digest
+                SELECT committed_batch_sequence, committed_event_sequence
                 FROM metric_export_consumers WHERE source_key = ?
                 """,
                 (_source_key(source),),
             ).fetchone()
             if row is None:
                 return training_pb2.MetricBatchCursor(source=source)
-            cursor = training_pb2.MetricBatchCursor(
+            return training_pb2.MetricBatchCursor(
                 source=source,
                 acknowledged_batch_sequence=int(
                     row["committed_batch_sequence"]
@@ -1043,11 +865,6 @@ class RawMetricBatchStore:
                     row["committed_event_sequence"]
                 ),
             )
-            if row["committed_digest"]:
-                cursor.acknowledged_batch_digest.CopyFrom(
-                    _content_digest(str(row["committed_digest"]))
-                )
-            return cursor
 
     def next_export_batch(
         self,
@@ -1062,7 +879,7 @@ class RawMetricBatchStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT payload, batch_digest FROM metric_batches
+                SELECT payload FROM metric_batches
                 WHERE source_key = ? AND batch_sequence = ?
                   AND status = 'committed'
                 """,
@@ -1070,11 +887,10 @@ class RawMetricBatchStore:
             ).fetchone()
         if row is None:
             return None
-        batch = training_pb2.MetricBatch.FromString(row["payload"])
+        batch = self._decode_stored_batch(row["payload"])
         if (
             int(batch.batch_sequence) != next_sequence
-            or batch.batch_digest.hex != row["batch_digest"]
-            or _digest_message(batch) != row["batch_digest"]
+            or _source_key(batch.source) != _source_key(source)
         ):
             raise MetricEventContractError(
                 "stored learner metric export batch is corrupted"
@@ -1114,14 +930,13 @@ class RawMetricBatchStore:
                 """
                 UPDATE metric_export_consumers
                 SET committed_batch_sequence = ?,
-                    committed_event_sequence = ?, committed_digest = ?,
+                    committed_event_sequence = ?,
                     updated_at_unix_ms = ?
                 WHERE source_key = ?
                 """,
                 (
                     str(int(cursor.acknowledged_batch_sequence)),
                     str(int(cursor.acknowledged_event_sequence)),
-                    cursor.acknowledged_batch_digest.hex,
                     int(time.time() * 1000),
                     source_key,
                 ),
@@ -1167,17 +982,15 @@ class RawMetricBatchStore:
 class LearnerMetricEventService(
     training_pb2_grpc.MetricEventServiceServicer
 ):
-    """Expose the Learner-owned raw journal to one exact Infra consumer."""
+    """Expose the Learner-owned raw journal to one exact consumer lifecycle."""
 
     def __init__(
         self,
         *,
         store: RawMetricBatchStore,
-        contract: common_pb2.ContractIdentity,
         source: common_pb2.ServiceInstanceIdentity,
     ):
         self.store = store
-        self.contract = _copy_message(contract)
         self.source = _copy_message(source)
 
     @staticmethod
@@ -1199,22 +1012,18 @@ class LearnerMetricEventService(
     def GetMetricBatch(self, request, context):
         response = training_pb2.GetMetricBatchRsp()
         self._fill_availability(response)
-        if (
-            not _same_contract(request.contract, self.contract)
-            or not self._valid_consumer(request.consumer)
-            or not _same_message(request.cursor.source, self.source)
-        ):
-            response.result = (
-                training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
-            )
-            response.message = "metric consumer contract or identity is invalid"
+        if not self._valid_consumer(request.consumer):
+            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+            response.message = "metric consumer lifecycle identity is invalid"
+            return response
+        if not _same_message(request.cursor.source, self.source):
+            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
+            response.message = "metric cursor source does not match producer"
             return response
         if not self.store.bind_export_consumer(
             self.source, request.consumer
         ):
-            response.result = (
-                training_pb2.METRIC_BATCH_RESULT_REJECTED_IDENTITY
-            )
+            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
             response.message = "learner metric journal is pinned to another consumer"
             return response
         committed = self.store.export_cursor(self.source)
@@ -1268,18 +1077,18 @@ class LearnerMetricEventService(
         del context
         response = training_pb2.AckMetricBatchRsp()
         self._fill_availability(response)
-        if (
-            not _same_contract(request.contract, self.contract)
-            or not self._valid_consumer(request.consumer)
-            or not _same_message(request.cursor.source, self.source)
-            or not self.store.bind_export_consumer(
-                self.source, request.consumer
-            )
+        if not self._valid_consumer(request.consumer) or not self.store.bind_export_consumer(
+            self.source, request.consumer
         ):
-            response.result = (
-                training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_IDENTITY
+            response.result = training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_INVALID
+            response.message = "metric ACK consumer lifecycle is invalid"
+            response.committed_cursor.CopyFrom(
+                self.store.export_cursor(self.source)
             )
-            response.message = "metric ACK contract or consumer is invalid"
+            return response
+        if not _same_message(request.cursor.source, self.source):
+            response.result = training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
+            response.message = "metric ACK cursor source does not match producer"
             response.committed_cursor.CopyFrom(
                 self.store.export_cursor(self.source)
             )
@@ -1312,7 +1121,6 @@ class LearnerMetricEventService(
 def create_learner_metric_event_server(
     *,
     store: RawMetricBatchStore,
-    contract: common_pb2.ContractIdentity,
     source: common_pb2.ServiceInstanceIdentity,
     port: int,
 ):
@@ -1324,7 +1132,6 @@ def create_learner_metric_event_server(
     training_pb2_grpc.add_MetricEventServiceServicer_to_server(
         LearnerMetricEventService(
             store=store,
-            contract=contract,
             source=source,
         ),
         server,
@@ -1797,14 +1604,17 @@ class LocalMetricProjector:
         batches = self.store.committed_batches_after(self._last_row_id)
         for row_id, role, source_key, batch in batches:
             for event in batch.events:
-                schema_id, fact = self.store.catalog.decode(
-                    batch.schema_identity, event.fact_payload
-                )
-                if role == "aiserver" and schema_id == MAZE_METRIC_SCHEMA_ID:
+                fact_kind, fact = _decode_event(event)
+                if (
+                    role == "aiserver"
+                    and fact_kind
+                    == training_pb2.METRIC_FACT_KIND_MAZE_EPISODE
+                ):
                     self._accept_episode(source_key, event, fact)
                 elif (
                     role == "learner"
-                    and schema_id == TRAINING_METRIC_SCHEMA_ID
+                    and fact_kind
+                    == training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE
                 ):
                     self._accept_train(source_key, event, fact)
                 else:
@@ -1922,7 +1732,6 @@ class LocalMetricProjector:
                 window_kind="latest_train_update",
             )
             return {
-                "schema_identities": self.store.catalog.identities_document(),
                 "view_revision": self._view_revision,
                 "status": status,
                 "multi_server_aggregation_performed": False,
@@ -1995,10 +1804,6 @@ class LocalTrainUpdateMetricWriter:
                 "learner metric gap created_at must be positive"
             )
         batch = training_pb2.MetricBatch(
-            contract=self.store.contract,
-            schema_identity=self.store.catalog.schema_identity(
-                TRAINING_METRIC_SCHEMA_ID
-            ),
             source=self.source,
             batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
             created_at_unix_ms=created_at_unix_ms,
@@ -2011,7 +1816,6 @@ class LocalTrainUpdateMetricWriter:
                 reason="learner_train_update_fact_unavailable",
             ),
         )
-        batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
         cursor = self.store.persist_batch("learner", batch)
         self.store.mark_acknowledged(batch, cursor)
 
@@ -2057,12 +1861,9 @@ class LocalTrainUpdateMetricWriter:
                 event_sequence=event_sequence,
                 observed_at_unix_ms=observed_at,
                 fact_payload=fact.SerializeToString(deterministic=True),
+                fact_kind=training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE,
             )
             batch = training_pb2.MetricBatch(
-                contract=self.store.contract,
-                schema_identity=self.store.catalog.schema_identity(
-                    TRAINING_METRIC_SCHEMA_ID
-                ),
                 source=self.source,
                 batch_sequence=batch_sequence,
                 created_at_unix_ms=int(time.time() * 1000),
@@ -2070,7 +1871,6 @@ class LocalTrainUpdateMetricWriter:
                 last_event_sequence=event_sequence,
                 events=[event],
             )
-            batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
             self.store.mark_acknowledged(batch, cursor)
 
@@ -2082,10 +1882,6 @@ class LocalTrainUpdateMetricWriter:
             committed = self.store.committed_cursor(self.source)
             finalized_at_unix_ms = int(time.time() * 1000)
             batch = training_pb2.MetricBatch(
-                contract=self.store.contract,
-                schema_identity=self.store.catalog.schema_identity(
-                    TRAINING_METRIC_SCHEMA_ID
-                ),
                 source=self.source,
                 batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
                 created_at_unix_ms=finalized_at_unix_ms,
@@ -2095,7 +1891,6 @@ class LocalTrainUpdateMetricWriter:
                     committed.acknowledged_event_sequence
                 ),
             )
-            batch.batch_digest.CopyFrom(_content_digest(_digest_message(batch)))
             cursor = self.store.persist_batch("learner", batch)
             self.store.mark_acknowledged(batch, cursor)
             self._finalized = True
@@ -2114,14 +1909,12 @@ class AIServerMetricRelay:
         self,
         *,
         store: RawMetricBatchStore,
-        contract: common_pb2.ContractIdentity,
         consumer: common_pb2.ServiceInstanceIdentity,
         status_stub: training_pb2_grpc.AIServerTrainingStatusServiceStub,
         event_stub: training_pb2_grpc.MetricEventServiceStub,
         logger,
     ):
         self.store = store
-        self.contract = _copy_message(contract)
         self.consumer = _copy_message(consumer)
         self.status_stub = status_stub
         self.event_stub = event_stub
@@ -2230,10 +2023,6 @@ class AIServerMetricRelay:
         status = self.status_stub.GetAIServerStatus(
             training_pb2.AIServerStatusReq(), timeout=1.5
         )
-        if not _same_contract(status.contract, self.contract):
-            raise MetricEventContractError(
-                "AIServer metric source contract identity mismatch"
-            )
         source = _copy_message(status.aiserver)
         _source_key(source)
         return source
@@ -2248,7 +2037,6 @@ class AIServerMetricRelay:
             return False
         response = self.event_stub.AckMetricBatch(
             training_pb2.AckMetricBatchReq(
-                contract=self.contract,
                 consumer=self.consumer,
                 cursor=cursor,
             ),
@@ -2280,7 +2068,6 @@ class AIServerMetricRelay:
         cursor = self.store.committed_cursor(source)
         response = self.event_stub.GetMetricBatch(
             training_pb2.GetMetricBatchReq(
-                contract=self.contract,
                 consumer=self.consumer,
                 cursor=cursor,
                 max_events=512,
@@ -2356,7 +2143,7 @@ class AIServerMetricRelay:
                     try:
                         self.store.mark_incomplete(
                             self._active_source,
-                            "metric_contract_rejected",
+                            "metric_history_rejected",
                         )
                     except Exception:
                         pass

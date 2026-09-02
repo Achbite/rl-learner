@@ -11,9 +11,6 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 RL_TRAINING_WORKSPACE="${workspace_root}" \
-    bash "${workspace_root}/rl-contracts/build_dev_artifact.sh" training \
-    >/dev/null
-RL_TRAINING_WORKSPACE="${workspace_root}" \
     bash "${workspace_root}/rl-sample-pool/build_dev_artifact.sh" \
     >/dev/null
 RL_TRAINING_WORKSPACE="${workspace_root}" \

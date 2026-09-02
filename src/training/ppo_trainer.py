@@ -17,7 +17,6 @@ import torch.nn as nn
 from onnx import numpy_helper
 from torch.distributions import Categorical
 
-from src.contracts.identity import training_contract
 from src.log.logger import setup_logger
 
 
@@ -142,11 +141,11 @@ class PPOTrainer:
         self._logger = setup_logger("PPOTrainer")
 
         # ---- 读取模型参数 ----
-        contract = training_contract(config)
-        self._obs_dim = int(contract["observation_dimension"])
-        self._action_dim = int(contract["action_count"])
-        self._hidden_dim = int(contract["hidden_dimension"])
-        self._action_mask_mode = str(contract["policy"]["action_mask_mode"])
+        model_config = config["model"]
+        self._obs_dim = int(model_config["observation_dimension"])
+        self._action_dim = int(model_config["action_count"])
+        self._hidden_dim = int(model_config["hidden_dimension"])
+        self._action_mask_mode = str(config["policy"]["action_mask_mode"])
 
         # ---- 读取训练超参 ----
         train_cfg = config["training"]
@@ -261,7 +260,7 @@ class PPOTrainer:
 
         # ---- 1. 转换为 Tensor ----
         if any(len(sample["observation"]) != self._obs_dim for sample in samples):
-            raise ValueError("PPO observation dimension differs from the contract")
+            raise ValueError("PPO observation dimension differs from model config")
         sample_masks = [list(sample.get("action_mask", [])) for sample in samples]
         if self._action_mask_mode == "required":
             if any(
@@ -275,13 +274,13 @@ class PPOTrainer:
                 or int(sample["action"]) >= self._action_dim
                 for sample in samples
             ):
-                raise ValueError("PPO action mask differs from the contract")
+                raise ValueError("PPO action mask differs from policy config")
             action_masks = torch.tensor(
                 sample_masks, dtype=torch.bool, device=self._device
             )
         else:
             if any(sample_masks):
-                raise ValueError("PPO action mask is disabled by the contract")
+                raise ValueError("PPO action mask is disabled by policy config")
             action_masks = None
 
         obs = torch.tensor([s["observation"] for s in samples], dtype=torch.float32, device=self._device)
@@ -706,12 +705,12 @@ class PPOTrainer:
         if any(initializer.external_data for initializer in document.graph.initializer):
             raise RuntimeError("inherited ONNX model must be self-contained")
         if [item.name for item in document.graph.input] != ["observation"]:
-            raise RuntimeError("inherited ONNX input contract does not match")
+            raise RuntimeError("inherited ONNX input name does not match")
         if [item.name for item in document.graph.output] != [
             "action_logits",
             "value",
         ]:
-            raise RuntimeError("inherited ONNX output contract does not match")
+            raise RuntimeError("inherited ONNX output names do not match")
 
         initializers = {
             initializer.name: initializer
