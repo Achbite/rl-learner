@@ -78,6 +78,10 @@ class LearnerDevelopmentTest(unittest.TestCase):
 
         self.assertEqual(len(batch), 2)
         self.assertEqual(stats["sample_evaluation_count"], 2)
+        raw = trainer.raw_metric_sum_counts()
+        self.assertEqual(raw["raw_advantage"]["count"], len(response.items))
+        self.assertAlmostEqual(raw["raw_advantage"]["sum"],
+                               sum(item.transition.advantage for item in response.items))
         self.assertEqual(
             [sample["item_id"] for sample in batch], ["item-0", "item-1"]
         )
@@ -113,7 +117,6 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 "RL_PPO_TRAIN_BATCH_SIZE": "32",
                 "RL_PPO_MINI_BATCH_SIZE": "16",
                 "RL_PPO_N_EPOCHS": "1",
-                "RL_PPO_TMAX": "16",
             },
         )
 
@@ -121,4 +124,6 @@ class LearnerDevelopmentTest(unittest.TestCase):
         self.assertEqual(config["training"]["train_batch_size"], 32)
         self.assertEqual(config["training"]["mini_batch_size"], 16)
         self.assertEqual(config["training"]["n_epochs"], 1)
-        self.assertEqual(config["training"]["tmax"], 16)
+        self.assertNotIn("tmax", config["training"])
+        self.assertNotIn("gamma", config["training"])
+        self.assertNotIn("gae_lambda", config["training"])

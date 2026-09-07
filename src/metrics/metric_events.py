@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 import threading
 import time
-from collections import deque
 from concurrent import futures
 from pathlib import Path
 from typing import Callable, Iterable
@@ -16,24 +14,16 @@ import grpc
 
 from proto import (
     common_pb2,
-    maze_metrics_pb2,
     training_metrics_pb2,
     training_pb2,
     training_pb2_grpc,
 )
 
 
-ROLE_FACT_KINDS = {
-    "aiserver": training_pb2.METRIC_FACT_KIND_MAZE_EPISODE,
-    "learner": training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE,
-}
-FACT_MESSAGE_TYPES = {
-    training_pb2.METRIC_FACT_KIND_MAZE_EPISODE:
-        maze_metrics_pb2.EpisodeMetricFact,
-    training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE:
-        training_metrics_pb2.TrainUpdateMetricFact,
-}
+from .registered_metrics import LocalMetricProjector
+from .train_metrics import TrainMetricProducer
 
+SOURCE_ROLES = {"aiserver", "learner"}
 
 class MetricEventContractError(ValueError):
     """A metric batch violates the immutable event contract."""
@@ -70,134 +60,6 @@ def _source_key(source: common_pb2.ServiceInstanceIdentity) -> str:
     )
 
 
-def _validate_sum_counts(
-    values,
-    owner: str,
-) -> None:
-    field_ids = [item.field_id for item in values]
-    if len(field_ids) != len(set(field_ids)):
-        raise MetricEventContractError(f"{owner} has duplicate field_id values")
-    for item in values:
-        if not item.field_id:
-            raise MetricEventContractError(
-                f"{owner} field_id is missing"
-            )
-        if int(item.count) <= 0 or not math.isfinite(float(item.sum)):
-            raise MetricEventContractError(
-                f"{owner} raw sum/count is invalid: {item.field_id}"
-            )
-
-
-def _decode_event(event: training_pb2.MetricEvent):
-    try:
-        message_type = FACT_MESSAGE_TYPES[int(event.fact_kind)]
-    except KeyError as error:
-        raise MetricEventContractError(
-            "metric event fact kind is unsupported"
-        ) from error
-    if not event.fact_payload:
-        raise MetricEventContractError("metric fact payload is missing")
-    message = message_type()
-    try:
-        message.ParseFromString(event.fact_payload)
-    except Exception as error:
-        raise MetricEventContractError(
-            "metric fact payload does not match its fact kind"
-        ) from error
-    return int(event.fact_kind), message
-
-
-def _validate_event(event: training_pb2.MetricEvent) -> None:
-    if int(event.event_sequence) <= 0 or not _has_field(
-        event, "observed_at_unix_ms"
-    ):
-        raise MetricEventContractError("metric event identity is invalid")
-    fact_kind, fact = _decode_event(event)
-    if fact_kind == training_pb2.METRIC_FACT_KIND_MAZE_EPISODE:
-        episode = fact
-        if not (
-            episode.environment_instance_id
-            and episode.episode_id
-            and episode.agents
-        ):
-            raise MetricEventContractError("episode metric fact is incomplete")
-        agent_ids = [int(agent.agent_id) for agent in episode.agents]
-        if len(agent_ids) != len(set(agent_ids)):
-            raise MetricEventContractError("episode metric fact repeats agent_id")
-        for agent in episode.agents:
-            if not agent.termination_reason:
-                raise MetricEventContractError(
-                    "agent episode termination_reason is missing"
-                )
-            if not agent.behavior_model_lineage_id:
-                raise MetricEventContractError(
-                    "agent episode behavior lineage is missing"
-                )
-            if (
-                not _has_field(agent, "minimum_behavior_model_step")
-                or not _has_field(agent, "maximum_behavior_model_step")
-                or int(agent.minimum_behavior_model_step)
-                > int(agent.maximum_behavior_model_step)
-            ):
-                raise MetricEventContractError(
-                    "agent episode behavior step range is invalid"
-                )
-            if not math.isfinite(float(agent.episode_return)):
-                raise MetricEventContractError("agent episode return is non-finite")
-            if int(agent.blocked_move_count) > int(agent.attempted_move_count):
-                raise MetricEventContractError(
-                    "agent episode blocked moves exceed attempted moves"
-                )
-            _validate_sum_counts(
-                agent.reward_components,
-                "episode reward component",
-            )
-            if any(
-                int(component.count) != int(agent.transition_count)
-                for component in agent.reward_components
-            ):
-                raise MetricEventContractError(
-                    "reward component count differs from agent transitions"
-                )
-            component_sum = sum(
-                float(component.sum) for component in agent.reward_components
-            )
-            tolerance = max(
-                1e-6, abs(float(agent.episode_return)) * 1e-6
-            )
-            if abs(component_sum - float(agent.episode_return)) > tolerance:
-                raise MetricEventContractError(
-                    "reward components do not conserve agent episode return"
-                )
-    elif fact_kind == training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE:
-        update = fact
-        if not (
-            update.train_update_id
-            and int(update.train_update_sequence) > 0
-            and update.delivery_id
-            and update.published_model.model_lineage_id
-            and _has_field(update.published_model, "model_step")
-            and update.behavior_model_lineage_id
-            and int(update.actual_batch_size) > 0
-        ):
-            raise MetricEventContractError("train update metric fact is incomplete")
-        if (
-            not _has_field(update, "minimum_behavior_model_step")
-            or not _has_field(update, "maximum_behavior_model_step")
-            or int(update.minimum_behavior_model_step)
-            > int(update.maximum_behavior_model_step)
-        ):
-            raise MetricEventContractError(
-                "train update model step contract is invalid"
-            )
-        _validate_sum_counts(
-            update.ppo_statistics,
-            "PPO statistic",
-        )
-    else:
-        raise MetricEventContractError("metric event schema is unsupported")
-
-
 def validate_metric_batch(
     batch: training_pb2.MetricBatch,
     *,
@@ -205,10 +67,8 @@ def validate_metric_batch(
     source: common_pb2.ServiceInstanceIdentity,
     previous_cursor: training_pb2.MetricBatchCursor,
 ) -> None:
-    try:
-        expected_fact_kind = ROLE_FACT_KINDS[role]
-    except KeyError as error:
-        raise MetricEventContractError("metric source role is invalid") from error
+    if role not in SOURCE_ROLES:
+        raise MetricEventContractError("metric source role is invalid")
     if not _same_message(batch.source, source):
         raise MetricEventContractError("metric batch source identity mismatch")
     if not _same_message(previous_cursor.source, source):
@@ -232,11 +92,10 @@ def validate_metric_batch(
         ):
             raise MetricEventContractError("metric event batch bounds are invalid")
         for event in batch.events:
-            if int(event.fact_kind) != expected_fact_kind:
-                raise MetricEventContractError(
-                    "metric fact owner differs from durable source role"
-                )
-            _validate_event(event)
+            if not _has_field(event, "observed_at_unix_ms"):
+                raise MetricEventContractError("metric observation time is missing")
+            if not event.fact_payload or int(event.fact_kind) <= 0:
+                raise MetricEventContractError("metric payload envelope is incomplete")
         next_event = sequences[-1]
     elif batch.HasField("gap"):
         gap = batch.gap
@@ -1145,620 +1004,6 @@ def create_learner_metric_event_server(
     return server
 
 
-def _empty_episode_statistics() -> dict:
-    return {
-        "environment_episode_count": 0,
-        "agent_episode_count": 0,
-        "successful_agent_count": 0,
-        "any_success_environment_count": 0,
-        "all_success_environment_count": 0,
-        "return_sum": 0.0,
-        "return_count": 0,
-        "return_min": None,
-        "return_max": None,
-        "transition_sum": 0,
-        "transition_agent_count": 0,
-        "unique_cell_sum": 0,
-        "unique_cell_agent_count": 0,
-        "blocked_move_sum": 0,
-        "attempted_move_sum": 0,
-        "path_ratio_sum": 0.0,
-        "path_ratio_count": 0,
-        "reward_components": {},
-        "termination_counts": {},
-        "minimum_behavior_model_step": None,
-        "maximum_behavior_model_step": None,
-        "behavior_model_lineages": set(),
-    }
-
-
-def _empty_train_statistics() -> dict:
-    return {
-        "train_update_count": 0,
-        "actual_batch_size_sum": 0,
-        "latest_train_update_sequence": 0,
-        "latest_model_step": 0,
-        "latest_cumulative_trained_samples": 0,
-        "ppo": {},
-        "minimum_behavior_model_step": None,
-        "maximum_behavior_model_step": None,
-        "behavior_model_lineages": set(),
-    }
-
-
-def _merge_minimum(current, candidate):
-    return candidate if current is None else min(current, candidate)
-
-
-def _merge_maximum(current, candidate):
-    return candidate if current is None else max(current, candidate)
-
-
-def _merge_episode_statistics(target: dict, source: dict) -> None:
-    for key in (
-        "environment_episode_count",
-        "agent_episode_count",
-        "successful_agent_count",
-        "any_success_environment_count",
-        "all_success_environment_count",
-        "return_count",
-        "transition_sum",
-        "transition_agent_count",
-        "unique_cell_sum",
-        "unique_cell_agent_count",
-        "blocked_move_sum",
-        "attempted_move_sum",
-        "path_ratio_count",
-    ):
-        target[key] += source[key]
-    target["return_sum"] += source["return_sum"]
-    target["path_ratio_sum"] += source["path_ratio_sum"]
-    if source["return_min"] is not None:
-        target["return_min"] = _merge_minimum(
-            target["return_min"], source["return_min"]
-        )
-        target["return_max"] = _merge_maximum(
-            target["return_max"], source["return_max"]
-        )
-    for name, counts in source["reward_components"].items():
-        item = target["reward_components"].setdefault(
-            name, {"sum": 0.0, "transition_count": 0, "agent_count": 0}
-        )
-        item["sum"] += counts["sum"]
-        item["transition_count"] += counts["transition_count"]
-        item["agent_count"] += counts["agent_count"]
-    for reason, count in source["termination_counts"].items():
-        target["termination_counts"][reason] = (
-            target["termination_counts"].get(reason, 0) + count
-        )
-    if source["minimum_behavior_model_step"] is not None:
-        target["minimum_behavior_model_step"] = _merge_minimum(
-            target["minimum_behavior_model_step"],
-            source["minimum_behavior_model_step"],
-        )
-        target["maximum_behavior_model_step"] = _merge_maximum(
-            target["maximum_behavior_model_step"],
-            source["maximum_behavior_model_step"],
-        )
-    target["behavior_model_lineages"].update(
-        source["behavior_model_lineages"]
-    )
-
-
-def _merge_train_statistics(target: dict, source: dict) -> None:
-    target["train_update_count"] += source["train_update_count"]
-    target["actual_batch_size_sum"] += source["actual_batch_size_sum"]
-    if source["latest_train_update_sequence"] >= target["latest_train_update_sequence"]:
-        for key in (
-            "latest_train_update_sequence",
-            "latest_model_step",
-            "latest_cumulative_trained_samples",
-        ):
-            target[key] = source[key]
-    for name, counts in source["ppo"].items():
-        item = target["ppo"].setdefault(name, {"sum": 0.0, "count": 0})
-        item["sum"] += counts["sum"]
-        item["count"] += counts["count"]
-    if source["minimum_behavior_model_step"] is not None:
-        target["minimum_behavior_model_step"] = _merge_minimum(
-            target["minimum_behavior_model_step"],
-            source["minimum_behavior_model_step"],
-        )
-        target["maximum_behavior_model_step"] = _merge_maximum(
-            target["maximum_behavior_model_step"],
-            source["maximum_behavior_model_step"],
-        )
-    target["behavior_model_lineages"].update(
-        source["behavior_model_lineages"]
-    )
-
-
-def _episode_event_statistics(
-    fact: maze_metrics_pb2.EpisodeMetricFact,
-) -> dict:
-    result = _empty_episode_statistics()
-    result["environment_episode_count"] = 1
-    successes = 0
-    for agent in fact.agents:
-        transitions = int(agent.transition_count)
-        attempted = int(agent.attempted_move_count)
-        blocked = int(agent.blocked_move_count)
-        if blocked > attempted:
-            raise MetricEventContractError(
-                "agent episode blocked moves exceed attempted moves"
-            )
-        result["agent_episode_count"] += 1
-        result["return_sum"] += float(agent.episode_return)
-        result["return_count"] += 1
-        result["return_min"] = _merge_minimum(
-            result["return_min"], float(agent.episode_return)
-        )
-        result["return_max"] = _merge_maximum(
-            result["return_max"], float(agent.episode_return)
-        )
-        result["transition_sum"] += transitions
-        result["transition_agent_count"] += 1
-        result["unique_cell_sum"] += int(agent.unique_cell_count)
-        result["unique_cell_agent_count"] += 1
-        result["blocked_move_sum"] += blocked
-        result["attempted_move_sum"] += attempted
-        result["termination_counts"][agent.termination_reason] = (
-            result["termination_counts"].get(agent.termination_reason, 0) + 1
-        )
-        result["minimum_behavior_model_step"] = _merge_minimum(
-            result["minimum_behavior_model_step"],
-            int(agent.minimum_behavior_model_step),
-        )
-        result["maximum_behavior_model_step"] = _merge_maximum(
-            result["maximum_behavior_model_step"],
-            int(agent.maximum_behavior_model_step),
-        )
-        result["behavior_model_lineages"].add(
-            agent.behavior_model_lineage_id
-        )
-        component_sum = 0.0
-        for component in agent.reward_components:
-            if int(component.count) != transitions:
-                raise MetricEventContractError(
-                    "reward component count differs from agent transitions"
-                )
-            item = result["reward_components"].setdefault(
-                component.field_id,
-                {"sum": 0.0, "transition_count": 0, "agent_count": 0},
-            )
-            item["sum"] += float(component.sum)
-            item["transition_count"] += int(component.count)
-            item["agent_count"] += 1
-            component_sum += float(component.sum)
-        tolerance = max(1e-6, abs(float(agent.episode_return)) * 1e-6)
-        if abs(component_sum - float(agent.episode_return)) > tolerance:
-            raise MetricEventContractError(
-                "reward component sums do not conserve agent episode return"
-            )
-        if agent.success:
-            successes += 1
-            result["successful_agent_count"] += 1
-            if int(agent.shortest_action_steps) > 0:
-                result["path_ratio_sum"] += transitions / int(
-                    agent.shortest_action_steps
-                )
-                result["path_ratio_count"] += 1
-    result["any_success_environment_count"] = 1 if successes else 0
-    result["all_success_environment_count"] = (
-        1 if successes == len(fact.agents) else 0
-    )
-    return result
-
-
-def _train_event_statistics(
-    fact: training_metrics_pb2.TrainUpdateMetricFact,
-) -> dict:
-    result = _empty_train_statistics()
-    result["train_update_count"] = 1
-    result["actual_batch_size_sum"] = int(fact.actual_batch_size)
-    result["latest_train_update_sequence"] = int(fact.train_update_sequence)
-    result["latest_model_step"] = int(fact.published_model.model_step)
-    result["latest_cumulative_trained_samples"] = int(
-        fact.cumulative_trained_samples
-    )
-    result["minimum_behavior_model_step"] = int(
-        fact.minimum_behavior_model_step
-    )
-    result["maximum_behavior_model_step"] = int(
-        fact.maximum_behavior_model_step
-    )
-    result["behavior_model_lineages"].add(fact.behavior_model_lineage_id)
-    for statistic in fact.ppo_statistics:
-        result["ppo"][statistic.field_id] = {
-            "sum": float(statistic.sum),
-            "count": int(statistic.count),
-        }
-    return result
-
-
-def _ratio(numerator, denominator):
-    return None if not denominator else numerator / denominator
-
-
-def _render_episode_statistics(
-    raw: dict,
-    *,
-    status: str,
-    window_kind: str,
-    requested_size: int | None = None,
-    start_unix_ms: int | None = None,
-    end_unix_ms: int | None = None,
-) -> dict:
-    episodes = int(raw["environment_episode_count"])
-    values = {}
-    if episodes:
-        values = {
-            "mean_agent_return": _ratio(raw["return_sum"], raw["return_count"]),
-            "min_agent_return": raw["return_min"],
-            "max_agent_return": raw["return_max"],
-            "agent_success_rate": _ratio(
-                raw["successful_agent_count"], raw["agent_episode_count"]
-            ),
-            "any_success_rate": _ratio(
-                raw["any_success_environment_count"], episodes
-            ),
-            "all_success_rate": _ratio(
-                raw["all_success_environment_count"], episodes
-            ),
-            "mean_episode_step": _ratio(
-                raw["transition_sum"], raw["transition_agent_count"]
-            ),
-            "mean_unique_cells": _ratio(
-                raw["unique_cell_sum"], raw["unique_cell_agent_count"]
-            ),
-            "blocked_move_rate": _ratio(
-                raw["blocked_move_sum"], raw["attempted_move_sum"]
-            ),
-            "path_ratio_mean": _ratio(
-                raw["path_ratio_sum"], raw["path_ratio_count"]
-            ),
-            "reward_components": {},
-        }
-        for name, item in sorted(raw["reward_components"].items()):
-            values["reward_components"][name] = {
-                "episode_mean": _ratio(item["sum"], item["agent_count"]),
-                "transition_mean": _ratio(
-                    item["sum"], item["transition_count"]
-                ),
-            }
-    raw_document = {
-        key: value
-        for key, value in raw.items()
-        if key not in {"behavior_model_lineages"}
-    }
-    raw_document["behavior_model_lineages"] = sorted(
-        raw["behavior_model_lineages"]
-    )
-    return {
-        "status": "no_data" if not episodes else status,
-        "window_kind": window_kind,
-        "requested_size": requested_size,
-        "complete_window": (
-            None if requested_size is None else episodes >= requested_size
-        ),
-        "start_unix_ms": start_unix_ms,
-        "end_unix_ms": end_unix_ms,
-        "values": values,
-        "raw": raw_document,
-    }
-
-
-def _render_train_statistics(
-    raw: dict,
-    *,
-    status: str,
-    window_kind: str,
-    start_unix_ms: int | None = None,
-    end_unix_ms: int | None = None,
-) -> dict:
-    count = int(raw["train_update_count"])
-    values = {}
-    if count:
-        values = {
-            "latest_train_update_sequence": int(
-                raw["latest_train_update_sequence"]
-            ),
-            "latest_model_step": int(raw["latest_model_step"]),
-            "latest_cumulative_trained_samples": int(
-                raw["latest_cumulative_trained_samples"]
-            ),
-            "ppo": {
-                name: {"mean": _ratio(item["sum"], item["count"])}
-                for name, item in sorted(raw["ppo"].items())
-            },
-        }
-    raw_document = {
-        key: value
-        for key, value in raw.items()
-        if key not in {"behavior_model_lineages"}
-    }
-    raw_document["behavior_model_lineages"] = sorted(
-        raw["behavior_model_lineages"]
-    )
-    return {
-        "status": "no_data" if not count else status,
-        "window_kind": window_kind,
-        "start_unix_ms": start_unix_ms,
-        "end_unix_ms": end_unix_ms,
-        "values": values,
-        "raw": raw_document,
-    }
-
-
-class LocalMetricProjector:
-    """Single-run projection of durable raw facts; never merges Server Pods."""
-
-    BUCKET_MS = 5_000
-    EPISODE_WINDOWS = (25, 100)
-    TIME_WINDOWS_MS = {
-        "5s": 5_000,
-        "1m": 60_000,
-        "1h": 3_600_000,
-        "24h": 86_400_000,
-    }
-
-    def __init__(self, store: RawMetricBatchStore):
-        self.store = store
-        self._lock = threading.RLock()
-        self._last_row_id = 0
-        self._view_revision = 0
-        self._episode_recent = deque(maxlen=max(self.EPISODE_WINDOWS))
-        self._episode_buckets: dict[int, dict] = {}
-        self._episode_all = _empty_episode_statistics()
-        self._episode_latest: dict | None = None
-        self._episode_first_observed_at: int | None = None
-        self._episode_maximum_observed_at: int | None = None
-        self._episode_last_observed_at: int | None = None
-        self._episode_source_keys: set[str] = set()
-        self._train_buckets: dict[int, dict] = {}
-        self._train_all = _empty_train_statistics()
-        self._train_latest: dict | None = None
-        self._train_first_observed_at: int | None = None
-        self._train_maximum_observed_at: int | None = None
-        self._train_last_observed_at: int | None = None
-        self._train_source_keys: set[str] = set()
-
-    @staticmethod
-    def _bucket_start(timestamp_unix_ms: int) -> int:
-        return (int(timestamp_unix_ms) // LocalMetricProjector.BUCKET_MS) * (
-            LocalMetricProjector.BUCKET_MS
-        )
-
-    def _accept_episode(
-        self,
-        source_key: str,
-        event: training_pb2.MetricEvent,
-        fact: maze_metrics_pb2.EpisodeMetricFact,
-    ) -> None:
-        statistics = _episode_event_statistics(fact)
-        self._episode_source_keys.add(source_key)
-        self._episode_recent.append(statistics)
-        self._episode_latest = statistics
-        _merge_episode_statistics(self._episode_all, statistics)
-        observed_at = int(event.observed_at_unix_ms)
-        self._episode_first_observed_at = (
-            observed_at
-            if self._episode_first_observed_at is None
-            else min(self._episode_first_observed_at, observed_at)
-        )
-        self._episode_maximum_observed_at = (
-            observed_at
-            if self._episode_maximum_observed_at is None
-            else max(self._episode_maximum_observed_at, observed_at)
-        )
-        self._episode_last_observed_at = observed_at
-        bucket = self._episode_buckets.setdefault(
-            self._bucket_start(observed_at),
-            _empty_episode_statistics(),
-        )
-        _merge_episode_statistics(bucket, statistics)
-
-    def _accept_train(
-        self,
-        source_key: str,
-        event: training_pb2.MetricEvent,
-        fact: training_metrics_pb2.TrainUpdateMetricFact,
-    ) -> None:
-        statistics = _train_event_statistics(fact)
-        self._train_source_keys.add(source_key)
-        self._train_latest = statistics
-        _merge_train_statistics(self._train_all, statistics)
-        observed_at = int(event.observed_at_unix_ms)
-        self._train_first_observed_at = (
-            observed_at
-            if self._train_first_observed_at is None
-            else min(self._train_first_observed_at, observed_at)
-        )
-        self._train_maximum_observed_at = (
-            observed_at
-            if self._train_maximum_observed_at is None
-            else max(self._train_maximum_observed_at, observed_at)
-        )
-        self._train_last_observed_at = observed_at
-        bucket = self._train_buckets.setdefault(
-            self._bucket_start(observed_at),
-            _empty_train_statistics(),
-        )
-        _merge_train_statistics(bucket, statistics)
-
-    @staticmethod
-    def _window_statistics(
-        buckets: dict[int, dict],
-        start_unix_ms: int,
-        end_unix_ms: int,
-        factory: Callable[[], dict],
-        merge: Callable[[dict, dict], None],
-    ) -> dict:
-        result = factory()
-        for bucket_start, statistics in buckets.items():
-            if start_unix_ms <= bucket_start <= end_unix_ms:
-                merge(result, statistics)
-        return result
-
-    def _advance(self) -> None:
-        batches = self.store.committed_batches_after(self._last_row_id)
-        for row_id, role, source_key, batch in batches:
-            for event in batch.events:
-                fact_kind, fact = _decode_event(event)
-                if (
-                    role == "aiserver"
-                    and fact_kind
-                    == training_pb2.METRIC_FACT_KIND_MAZE_EPISODE
-                ):
-                    self._accept_episode(source_key, event, fact)
-                elif (
-                    role == "learner"
-                    and fact_kind
-                    == training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE
-                ):
-                    self._accept_train(source_key, event, fact)
-                else:
-                    raise MetricEventContractError(
-                        "metric fact owner differs from durable source role"
-                    )
-            self._last_row_id = row_id
-            self._view_revision += 1
-
-    def _observed_window_bounds(
-        self,
-        first_observed_at: int | None,
-        maximum_observed_at: int | None,
-        duration_ms: int,
-    ) -> tuple[int, int]:
-        if first_observed_at is None or maximum_observed_at is None:
-            return (0, 0)
-        first_bucket = self._bucket_start(first_observed_at)
-        nominal_start_bucket = self._bucket_start(
-            maximum_observed_at - duration_ms
-        )
-        return (
-            max(first_bucket, nominal_start_bucket),
-            self._bucket_start(maximum_observed_at),
-        )
-
-    @staticmethod
-    def _projection_status(store_snapshot: dict) -> str:
-        if store_snapshot.get("incomplete_source_count", 0):
-            return "incomplete"
-        sources = store_snapshot.get("sources", [])
-        if sources and all(source.get("final_acknowledged") for source in sources):
-            return "final"
-        return "provisional"
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            self._advance()
-            store_snapshot = self.store.snapshot()
-            status = self._projection_status(store_snapshot)
-            episode_windows = {}
-            recent = list(self._episode_recent)
-            for size in self.EPISODE_WINDOWS:
-                raw = _empty_episode_statistics()
-                for item in recent[-size:]:
-                    _merge_episode_statistics(raw, item)
-                episode_windows[str(size)] = _render_episode_statistics(
-                    raw,
-                    status=status,
-                    window_kind="completed_environment_episodes",
-                    requested_size=size,
-                )
-            for label, duration in self.TIME_WINDOWS_MS.items():
-                start_unix_ms, end_bucket_unix_ms = self._observed_window_bounds(
-                    self._episode_first_observed_at,
-                    self._episode_maximum_observed_at,
-                    duration,
-                )
-                raw = self._window_statistics(
-                    self._episode_buckets,
-                    start_unix_ms,
-                    end_bucket_unix_ms,
-                    _empty_episode_statistics,
-                    _merge_episode_statistics,
-                )
-                episode_windows[label] = _render_episode_statistics(
-                    raw,
-                    status=status,
-                    window_kind="observed_time",
-                    start_unix_ms=start_unix_ms,
-                    end_unix_ms=(
-                        self._episode_maximum_observed_at or 0
-                    ),
-                )
-            episode_windows["all"] = _render_episode_statistics(
-                self._episode_all,
-                status=status,
-                window_kind="run_to_date",
-            )
-
-            train_windows = {}
-            for label, duration in self.TIME_WINDOWS_MS.items():
-                start_unix_ms, end_bucket_unix_ms = self._observed_window_bounds(
-                    self._train_first_observed_at,
-                    self._train_maximum_observed_at,
-                    duration,
-                )
-                raw = self._window_statistics(
-                    self._train_buckets,
-                    start_unix_ms,
-                    end_bucket_unix_ms,
-                    _empty_train_statistics,
-                    _merge_train_statistics,
-                )
-                train_windows[label] = _render_train_statistics(
-                    raw,
-                    status=status,
-                    window_kind="observed_time",
-                    start_unix_ms=start_unix_ms,
-                    end_unix_ms=(self._train_maximum_observed_at or 0),
-                )
-            train_windows["all"] = _render_train_statistics(
-                self._train_all,
-                status=status,
-                window_kind="run_to_date",
-            )
-            latest_episode = _render_episode_statistics(
-                self._episode_latest or _empty_episode_statistics(),
-                status=status,
-                window_kind="latest_environment_episode",
-            )
-            latest_train = _render_train_statistics(
-                self._train_latest or _empty_train_statistics(),
-                status=status,
-                window_kind="latest_train_update",
-            )
-            return {
-                "view_revision": self._view_revision,
-                "status": status,
-                "multi_server_aggregation_performed": False,
-                "server_source_policy": "sequential_run_scoped_lifecycles",
-                "server_source_count": len(self._episode_source_keys),
-                "learner_source_count": len(self._train_source_keys),
-                "episodes": {
-                    "first_observed_at_unix_ms": self._episode_first_observed_at,
-                    "maximum_observed_at_unix_ms": (
-                        self._episode_maximum_observed_at
-                    ),
-                    "last_observed_at_unix_ms": self._episode_last_observed_at,
-                    "latest": latest_episode,
-                    "windows": episode_windows,
-                },
-                "train_updates": {
-                    "first_observed_at_unix_ms": self._train_first_observed_at,
-                    "maximum_observed_at_unix_ms": (
-                        self._train_maximum_observed_at
-                    ),
-                    "last_observed_at_unix_ms": self._train_last_observed_at,
-                    "latest": latest_train,
-                    "windows": train_windows,
-                },
-            }
-
-
 class LocalTrainUpdateMetricWriter:
     """Persist committed Learner updates as one immutable local event each."""
 
@@ -1773,6 +1018,7 @@ class LocalTrainUpdateMetricWriter:
         self.store.activate_source("learner", self.source)
         self._lock = threading.Lock()
         self._finalized = False
+        self._producer = TrainMetricProducer()
         self._initial_train_update_sequence = int(
             initial_train_update_sequence
         )
@@ -1860,8 +1106,8 @@ class LocalTrainUpdateMetricWriter:
             event = training_pb2.MetricEvent(
                 event_sequence=event_sequence,
                 observed_at_unix_ms=observed_at,
-                fact_payload=fact.SerializeToString(deterministic=True),
-                fact_kind=training_pb2.METRIC_FACT_KIND_TRAIN_UPDATE,
+                fact_payload=self._producer.record(fact).SerializeToString(deterministic=True),
+                fact_kind=training_pb2.METRIC_FACT_KIND_REGISTERED_METRICS,
             )
             batch = training_pb2.MetricBatch(
                 source=self.source,
@@ -1929,11 +1175,15 @@ class AIServerMetricRelay:
         self._transport_last_error = ""
         self._ever_connected = False
 
-    def start(self) -> "AIServerMetricRelay":
+    def start(
+        self, initial_source: common_pb2.ServiceInstanceIdentity
+    ) -> "AIServerMetricRelay":
         if self._thread is not None:
             return self
+        _source_key(initial_source)
         self._thread = threading.Thread(
             target=self._run,
+            args=(_copy_message(initial_source),),
             name="aiserver-metric-relay",
             daemon=True,
         )
@@ -2111,11 +1361,15 @@ class AIServerMetricRelay:
             return True
         return False
 
-    def _run(self) -> None:
+    def _run(self, initial_source: common_pb2.ServiceInstanceIdentity) -> None:
         retry_delay = self.INITIAL_RETRY_DELAY_SEC
         while not self._stop.is_set():
             try:
-                source = self._discover_source()
+                source = (
+                    initial_source
+                    if self._active_source is None
+                    else self._discover_source()
+                )
                 if (
                     self._active_source is not None
                     and not _same_message(self._active_source, source)
@@ -2139,32 +1393,30 @@ class AIServerMetricRelay:
                     self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
                 )
             except MetricEventContractError as error:
+                self._record_terminal_failure("rejected", error)
                 if self._active_source is not None:
                     try:
-                        self.store.mark_incomplete(
-                            self._active_source,
-                            "metric_history_rejected",
-                        )
-                    except Exception:
-                        pass
-                self.logger.error("AIServer metric relay rejected history: %s", error)
-                self._stop.wait(retry_delay)
-                retry_delay = min(
-                    self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
-                )
+                        self.store.mark_incomplete(self._active_source, "metric_history_rejected")
+                    except Exception as store_error:
+                        self.logger.error("failed to mark rejected history: %s", store_error)
+                break
             except Exception as error:
-                self.logger.error("AIServer metric relay failed: %s", error)
-                self._stop.wait(retry_delay)
-                retry_delay = min(
-                    self.MAX_RETRY_DELAY_SEC, retry_delay * 2.0
-                )
+                self._record_terminal_failure("failed", error)
+                break
+
+    def _record_terminal_failure(self, state: str, error: Exception) -> None:
+        with self._state_lock:
+            self._transport_state = state
+            self._transport_last_error = str(error)
+        self.logger.error("AIServer metric relay %s: %s", state, error)
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=self.GET_RPC_TIMEOUT_SEC + 1.0)
         with self._state_lock:
-            self._transport_state = "stopped"
+            if self._transport_state not in {"rejected", "failed"}:
+                self._transport_state = "stopped"
         if self._active_source is not None:
             try:
                 if not self.store.is_final(self._active_source):

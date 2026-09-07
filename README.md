@@ -176,7 +176,54 @@ RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 | `9200` | Model Distributor |
 | `9005` | 可选 Learner Monitor |
 
-监控 API：`/monitor`、`/api/status`、`/api/metrics/catalog`、`/api/metrics/latest`、`/api/metrics`。
+监控 API：`/monitor`、`/api/status`、`/api/metrics/catalog`、`/api/metrics/query`、
+`/api/metrics/latest`、`/api/metrics`、`/api/metrics/history`。
+
+通用模板提供 Loss、PPO Stability、Sample Throughput、Sample Flow 和 Latency。
+Policy Loss、Value Loss 在 Loss 中固定追踪，Approx. KL 和 Entropy 在 PPO Stability 中固定追踪。
+当前 Maze 任务配置补充 Reward、Episode、Success Rate：Reward 默认只显示 Total Reward，
+Reward 类别可选择全部已注册分量，并按 Per Transition / Per Agent Episode 分组；Episode 默认显示
+Episode Length。Success Rate 默认仅显示 Any Agent Success Rate 和 All Agents Success Rate，
+两者分母均为完成的 environment episode 数。原 Agent Success Rate 字段保留注册和查询。
+
+Total Reward = 上报窗口内 reward sum / transition count，不是 Episode Return，也不是累计奖励。
+Episode Length = 上报窗口内 transition count / agent episode count；Episode Return = reward sum /
+agent episode count。默认使用最近 1 min 的上报窗口，以现有 5 s bucket 聚合；没有新上报时旧数据会
+随时间移出窗口，不用旧均值补齐。当前 AIServer 在 Episode 完成时上报，所以窗口统计已完成 Episode
+所包含的 transitions，并非尚未结束 Episode 的即时奖励。图表的时间范围只控制展示区间，和统计窗口分开。
+Learner Loss / KL / Entropy 保留最近一次 Update 的原始 sum/count 均值。
+
+字段在生产者的 `MetricRegistry.register/Register` 中声明并返回稳定 ID，同时声明英文显示名称、
+单位、scope、聚合操作和均值分母。目录 `/api/metrics/catalog?category=loss` 提供类别、默认面板与字段。
+`field_id` 是注册 ID（例如 `learner.ppo.policy_loss`），`series_id` 区分同一字段的来源与生命周期。
+`metric_values` 按 `series_id` 返回；多个来源分别绘制，不混合求均值。字段名称直接来自注册定义。
+
+通过指令读取一个或多个字段，例如：
+
+```text
+GET /api/metrics/query?field=task.maze.reward.total.per_transition&field=task.maze.episode_length&window=1m
+GET /api/metrics/query?field=learner.ppo.policy_loss&after_sequence=100
+```
+
+查询只返回所选字段的序列、值和最新状态记录。未注册字段列入 `unregistered_fields`，已注册但窗口无值
+返回 `null`。页面也使用这个查询入口，字段详情提供可直接打开的 GET 查询链接。
+`display_unit/display_scale` 只控制显示，例如 API 中 ratio `0.75` 显示为 `75.0%`。
+
+“创建监控窗口”与“变量”操作支持按类别、名称或字段搜索、选择追踪变量。技术术语使用英文；
+右上角可切换中文 / English 操作文案，语言和布局保存在当前浏览器。布局按任务配置的 `layout_key`
+分开保存；当前 Maze 沿用已有布局。“恢复默认面板”会重置窗口选择，
+已有浏览器布局也可用该操作应用本轮新的默认面板。单一来源按字段追踪，多个来源可分别选取；
+已选但未注册的字段显式显示缺失，不替换成别的字段。
+
+`tools/metrics_views.json` 提供通用展示模板，不含任务字段绑定；`configs/monitor_views.json` 是当前
+Maze 的展示配置。服务通过 `--views <path>` 选择基础模板，通过 `--task-views <path>` 添加任务配置。
+任务配置声明 `layout_key`、`panels`、`fields` 和可选 `categories`；面板按 `order` 排序，任务字段显示
+规则先于基础规则匹配，注册名称、值和统计分母不变。未被模板选中的注册字段仍可查询和添加。
+
+`run.sh` 默认加载 `configs/monitor_views.json`；设置 `RL_METRICS_TASK_VIEWS=/path/to/task-views.json`
+可选择另一个任务视图，设置 `RL_METRICS_TASK_VIEWS=''` 仅启用通用模板。独立运行
+`tools/metrics_server.py` 时默认只有通用模板，按需传入 `--task-views`。配置只影响预览，
+不改变 Learner 训练配置、AIServer 奖励计算或指标上报周期。
 
 ## 7. 刷新与清理开发容器
 

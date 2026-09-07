@@ -183,6 +183,9 @@ def training_chain_status(
         else learner_step - actor_step
     )
 
+    feedback = actor.get("model_feedback", {})
+    if feedback.get("last_error"):
+        reasons.append("actor_model_feedback_error")
     actor_state = str(actor.get("state", ""))
     actor_lifecycle_ready = actor_state == "AISERVER_STATE_READY"
     server_pod_reasons: list[str] = []
@@ -218,6 +221,8 @@ def training_chain_status(
     else:
         model_sync_state = "actor_ahead"
         model_sync_lag = actor_step - latest_step
+    if feedback.get("last_error"):
+        model_sync_state = "failed"
     return {
         "ready": not reasons,
         "state": "ready" if not reasons else "degraded",
@@ -232,6 +237,7 @@ def training_chain_status(
         },
         "model_sync": {
             "state": model_sync_state,
+            "feedback": feedback,
             "active_model_step": (
                 None if actor_step < 0 else actor_step
             ),
@@ -1203,10 +1209,6 @@ class TrainingRuntime:
             server.start()
             self.metric_event_server_started = True
             self._publish_metric_ready()
-        relay = getattr(self, "metric_event_relay", None)
-        if relay is None:
-            return
-        relay.start()
 
     def _stop_metric_events(self) -> None:
         writer = getattr(self, "metric_event_writer", None)
@@ -1791,7 +1793,9 @@ class TrainingRuntime:
             attempts,
         ) from last_error
 
-    def _wait_initial_model_loaded(self, document: dict) -> bool:
+    def _wait_initial_model_loaded(
+        self, document: dict
+    ) -> common_pb2.ServiceInstanceIdentity | None:
         expected = document["manifest"].identity
         deadline = (
             None
@@ -1836,7 +1840,9 @@ class TrainingRuntime:
                         expected.model_lineage_id,
                         int(expected.model_step),
                     )
-                    return True
+                    source = common_pb2.ServiceInstanceIdentity()
+                    source.CopyFrom(status.latest_ack_aiserver)
+                    return source
                 last = (
                     f"status={training_pb2.ModelLoadStatus.Name(status.latest_ack_status)} "
                     f"ack={model_identity_document(status.latest_ack_model)}"
@@ -1849,7 +1855,7 @@ class TrainingRuntime:
                 "Stop requested after bootstrap registration; skipping "
                 "AIServer ACK readiness"
             )
-            return False
+            return None
         raise RuntimeError(
             "AIServer did not ACK the bootstrap model identity before the "
             f"configured timeout: {last}"
@@ -1887,7 +1893,8 @@ class TrainingRuntime:
                 pinned_authority,
             )
         self.model_manifests[model_step] = document
-        if not self._wait_initial_model_loaded(document):
+        aiserver_source = self._wait_initial_model_loaded(document)
+        if aiserver_source is None:
             self.logger.info(
                 "Learner bootstrap published and registered; stopping before "
                 "AIServer activation: lineage=%s model_step=%d",
@@ -1895,6 +1902,9 @@ class TrainingRuntime:
                 model_step,
             )
             return False
+        relay = getattr(self, "metric_event_relay", None)
+        if relay is not None:
+            relay.start(aiserver_source)
         self._commit_learner_metrics(
             document,
             behavior_model={},
@@ -3003,6 +3013,11 @@ class TrainingRuntime:
                 ),
                 "active_segments": int(status.active_segment_count),
                 "model_identity": model_identity_document(status.loaded_model),
+                "model_feedback": {
+                    "candidate_model": model_identity_document(status.model_feedback.candidate_model),
+                    "stage": status.model_feedback.stage,
+                    "last_error": status.model_feedback.last_error,
+                },
                 "staged_model_identity": model_identity_document(
                     status.staged_model
                 ),

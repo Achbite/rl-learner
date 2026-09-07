@@ -335,6 +335,7 @@ if [ "${metrics_enabled}" = "1" ]; then
         --dir "${local_train_root}/metrics" \
         --port "${metrics_port}" \
         --source-id "${metrics_source_id}" \
+        --task-views "${RL_METRICS_TASK_VIEWS-${repo_dir}/configs/monitor_views.json}" \
         --mode training &
     metrics_pid=$!
     monitor_ready=0

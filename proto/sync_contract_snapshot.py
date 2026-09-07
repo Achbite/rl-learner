@@ -14,9 +14,6 @@ SNAPSHOT_FILES = {
         "python/training_pb2_grpc.py": "training_pb2_grpc.py",
         "python/training_metrics_pb2.py": "training_metrics_pb2.py",
     },
-    "task-maze": {
-        "python/maze_metrics_pb2.py": "maze_metrics_pb2.py",
-    },
 }
 
 

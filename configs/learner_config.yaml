@@ -8,9 +8,6 @@ training:
   device: cpu
   seed: 0                         # integer RNG seed, >=0
   learning_rate: 0.0003           # Adam step size, (0,1]
-  gamma: 0.99                     # reward discount, [0,1]
-  gae_lambda: 0.95                # GAE trace decay, [0,1]
-  tmax: 128                       # completed transitions per Agent/pinned segment
   clip_epsilon: 0.2               # PPO policy ratio clip, (0,1]
   value_clip_epsilon: 0.2         # value clip around behavior prediction, (0,1]
   entropy_coef: 0.01              # entropy regularization weight, [0,10]
