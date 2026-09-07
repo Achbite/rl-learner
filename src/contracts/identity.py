@@ -155,8 +155,7 @@ def validate_config(config: dict) -> None:
     expected_keys = {
         "identity": {"model_lineage_id"},
         "training": {
-            "device", "seed", "learning_rate", "gamma", "gae_lambda",
-            "tmax", "clip_epsilon", "value_clip_epsilon",
+            "device", "seed", "learning_rate", "clip_epsilon", "value_clip_epsilon",
             "entropy_coef", "value_coef", "max_grad_norm", "n_epochs",
             "train_batch_size", "mini_batch_size", "normalize_advantage",
         },
@@ -230,8 +229,6 @@ def validate_config(config: dict) -> None:
         raise ValueError("policy.action_mask_mode is invalid")
     finite_training_values = (
         "learning_rate",
-        "gamma",
-        "gae_lambda",
         "clip_epsilon",
         "value_clip_epsilon",
         "entropy_coef",
@@ -244,8 +241,6 @@ def validate_config(config: dict) -> None:
             raise ValueError(f"training.{name} must be finite")
     if (
         float(training["learning_rate"]) <= 0.0
-        or not 0.0 <= float(training["gamma"]) <= 1.0
-        or not 0.0 <= float(training["gae_lambda"]) <= 1.0
         or float(training["clip_epsilon"]) <= 0.0
         or float(training["value_clip_epsilon"]) <= 0.0
         or float(training["entropy_coef"]) < 0.0
@@ -260,7 +255,6 @@ def validate_config(config: dict) -> None:
         or int(training["n_epochs"]) <= 0
         or int(training["train_batch_size"]) <= 0
         or int(training["mini_batch_size"]) <= 0
-        or int(training["tmax"]) <= 0
         or int(config["sample_pool"]["get_timeout_ms"]) <= 0
         or int(config["sample_pool"]["lease_timeout_ms"]) <= 0
         or int(config["sample_pool"]["shutdown_drain_timeout_ms"])

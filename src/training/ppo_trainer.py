@@ -489,6 +489,10 @@ class PPOTrainer:
         self._model_step += 1
 
         self._last_raw_metric_sum_counts = {
+            "raw_advantage": {"sum": raw_advantage_sum, "count": raw_advantage_count},
+            "normalized_advantage": {
+                "sum": float(advantages.sum().item()), "count": int(advantages.numel()),
+            },
             "approx_kl": {
                 "sum": raw_approx_kl_sum,
                 "count": raw_sample_evaluation_count,

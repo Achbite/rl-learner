@@ -8,7 +8,6 @@ import glob
 import json
 import math
 import os
-import re
 import signal
 import threading
 import time
@@ -16,13 +15,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 
 DASHBOARD_PATH = Path(__file__).with_name("metrics_dashboard.html")
+VIEWS_PATH = Path(__file__).with_name("metrics_views.json")
 
 _CATALOG_FIELD_KEYS = (
     "field_id",
+    "series_id",
     "label",
     "group",
     "dimension",
@@ -33,14 +34,14 @@ _CATALOG_FIELD_KEYS = (
     "owner_component",
     "aggregation_kind",
     "window_kind",
-)
-_REWARD_COMPONENT_NAME = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
-_KNOWN_REWARD_COMPONENTS = (
-    "goal_reward",
-    "timeout_penalty",
-    "geodesic_progress",
-    "first_visit_bonus",
-    "wasted_action_penalty",
+    "denominator",
+    "metric_id",
+    "source_instance",
+    "lifecycle_epoch",
+    "source_label",
+    "description",
+    "display_unit",
+    "display_scale",
 )
 
 
@@ -58,12 +59,6 @@ def _metric_definition(
 ):
     if field_id.startswith("learner."):
         owner_component = "rl-learner"
-    elif field_id.startswith("server.episode.") or field_id.startswith(
-        "server.reward."
-    ) or field_id.startswith(
-        "server.training."
-    ) or field_id.startswith("server.task."):
-        owner_component = "maze-task-adapter"
     elif field_id.startswith("server.") or field_id.startswith(
         "sample.flow.produced"
     ) or field_id.startswith("sample.flow.outbound") or field_id.startswith(
@@ -90,6 +85,7 @@ def _metric_definition(
     return {
         "descriptor": {
             "field_id": field_id,
+            "series_id": field_id,
             "label": label,
             "group": group,
             "dimension": dimension,
@@ -122,174 +118,6 @@ _STATIC_METRIC_DEFINITIONS = (
         "training_depth", "sample_count", "samples", "learner", "total",
         "counter",
         ("learner", "trained_samples"),
-    ),
-    _metric_definition(
-        "server.episode.max_steps.current", "Episode Max Steps",
-        "training_depth", "environment_step", "step", "server",
-        "latest", "gauge",
-        ("actor", "metric_values", "server.episode.max_steps.current"),
-    ),
-    _metric_definition(
-        "learner.loss.policy", "Policy Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "policy_loss", "mean"),
-    ),
-    _metric_definition(
-        "learner.loss.value", "Value Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "value_loss", "mean"),
-    ),
-    _metric_definition(
-        "learner.loss.total", "Total Loss", "loss", "loss", "1",
-        "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "total_loss", "mean"),
-    ),
-    _metric_definition(
-        "server.episode.learning_return.mean", "Mean Learning Return",
-        "episode_return", "episode_return", "reward", "agent_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_agent_return"),
-    ),
-    _metric_definition(
-        "server.training.episode.learning_return.mean",
-        "Mean Training Agent Return", "episode_return", "episode_return",
-        "reward", "training_agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_agent_return"),
-    ),
-    _metric_definition(
-        "server.training.episode.learning_return.latest_mean",
-        "Latest Training Agent Return", "episode_return", "episode_return",
-        "reward", "latest_training_environment_episode", "latest", "gauge",
-        ("metric_event_views", "episodes", "latest", "values",
-         "mean_agent_return"),
-    ),
-    _metric_definition(
-        "server.training.episode.completed.total",
-        "Completed Training Episodes", "training_depth", "episode_count",
-        "episodes", "server", "total", "counter",
-        ("metric_event_views", "episodes", "windows", "all", "raw",
-         "environment_episode_count"),
-    ),
-    _metric_definition(
-        "server.episode.learning_return.min", "Min Learning Return",
-        "episode_return", "episode_return", "reward", "agent_episode_window",
-        "min", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "min_agent_return"),
-    ),
-    _metric_definition(
-        "server.episode.learning_return.max", "Max Learning Return",
-        "episode_return", "episode_return", "reward", "agent_episode_window",
-        "max", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "max_agent_return"),
-    ),
-    _metric_definition(
-        "server.episode.success.agent_rate", "Agent Success",
-        "episode_success", "percentage", "%", "agent_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "agent_success_rate"),
-        scale=100.0,
-    ),
-    _metric_definition(
-        "server.training.episode.success.agent_rate",
-        "Training Agent Success", "episode_success", "percentage", "%",
-        "training_agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "agent_success_rate"), scale=100.0,
-    ),
-    _metric_definition(
-        "server.training.episode.success.any_rate",
-        "Training Any Success", "episode_success", "percentage", "%",
-        "training_environment_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "any_success_rate"), scale=100.0,
-    ),
-    _metric_definition(
-        "server.training.episode.success.all_rate",
-        "Training All Success", "episode_success", "percentage", "%",
-        "training_environment_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "all_success_rate"), scale=100.0,
-    ),
-    _metric_definition(
-        "server.episode.success.any_rate", "Any Success",
-        "episode_success", "percentage", "%", "environment_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "any_success_rate"),
-        scale=100.0,
-    ),
-    _metric_definition(
-        "server.episode.success.all_rate", "All Success",
-        "episode_success", "percentage", "%", "environment_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "all_success_rate"),
-        scale=100.0,
-    ),
-    _metric_definition(
-        "server.episode.path_ratio.mean", "Path Ratio",
-        "episode_success", "ratio", "1", "successful_agent_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "path_ratio_mean"),
-    ),
-    _metric_definition(
-        "server.episode.step.mean", "Episode Step",
-        "episode_success", "environment_step", "step",
-        "agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_episode_step"),
-    ),
-    _metric_definition(
-        "server.episode.unique_cells.mean", "Unique Cells",
-        "episode_success", "cell_count", "cells", "agent_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_unique_cells"),
-    ),
-    _metric_definition(
-        "server.episode.blocked_move_rate", "Blocked Move Rate",
-        "episode_success", "percentage", "%", "agent_episode_window",
-        "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "blocked_move_rate"),
-        scale=100.0,
-    ),
-    _metric_definition(
-        "server.training.episode.path_ratio.mean",
-        "Training Path Ratio", "episode_success", "ratio", "1",
-        "successful_training_agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "path_ratio_mean"),
-    ),
-    _metric_definition(
-        "server.training.episode.step.mean", "Training Episode Step",
-        "episode_success", "environment_step", "step",
-        "training_agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_episode_step"),
-    ),
-    _metric_definition(
-        "server.training.episode.unique_cells.mean",
-        "Training Unique Cells", "episode_success", "cell_count", "cells",
-        "training_agent_episode_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "mean_unique_cells"),
-    ),
-    _metric_definition(
-        "server.training.episode.blocked_move_rate",
-        "Training Blocked Move Rate", "episode_success", "percentage", "%",
-        "training_transition_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "blocked_move_rate"), scale=100.0,
     ),
     _metric_definition(
         "sample.throughput.produced_per_second", "Produced / sec",
@@ -387,53 +215,9 @@ _STATIC_METRIC_DEFINITIONS = (
         ("actor", "update_rpc_max_ms"),
     ),
     _metric_definition(
-        "learner.ppo.entropy", "Policy Entropy", "ppo_stability",
-        "entropy", "1", "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "entropy", "mean"),
-    ),
-    _metric_definition(
-        "learner.ppo.approx_kl", "Approx. KL", "ppo_stability",
-        "divergence", "1", "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "approx_kl", "mean"),
-    ),
-    _metric_definition(
-        "learner.ppo.clip_fraction", "Clip Fraction", "ppo_stability",
-        "percentage", "%", "train_update", "mean", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "clip_fraction", "mean"), scale=100.0,
-    ),
-    _metric_definition(
-        "learner.ppo.gradient_norm", "Gradient Norm", "ppo_stability",
-        "norm", "1", "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "gradient_norm", "mean"),
-    ),
-    _metric_definition(
         "learner.ppo.max_importance_ratio", "Max Importance Ratio",
         "ppo_stability", "ratio", "1", "train_update", "max", "gauge",
         ("learner", "max_importance_ratio"),
-    ),
-    _metric_definition(
-        "learner.ppo.policy_lag", "Policy Lag", "ppo_stability",
-        "model_step", "step", "train_update", "latest", "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "policy_lag", "mean"),
-    ),
-    _metric_definition(
-        "learner.value.prediction_mean", "Value Prediction Mean",
-        "ppo_stability", "value", "reward", "train_update", "mean",
-        "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "value_prediction", "mean"),
-    ),
-    _metric_definition(
-        "learner.value.return_target_mean", "Return Target Mean",
-        "ppo_stability", "value", "reward", "train_update", "mean",
-        "gauge",
-        ("metric_event_views", "train_updates", "latest", "values", "ppo",
-         "return_target", "mean"),
     ),
     _metric_definition(
         "learner.value.explained_variance", "Explained Variance",
@@ -441,68 +225,6 @@ _STATIC_METRIC_DEFINITIONS = (
         "gauge", ("learner", "explained_variance"),
     ),
 )
-
-
-def reward_component_field_id(name: str) -> str:
-    if not isinstance(name, str) or not _REWARD_COMPONENT_NAME.fullmatch(name):
-        raise ValueError("reward component name must be canonical snake_case")
-    return f"server.reward.component.{name}.transition_mean"
-
-
-def training_reward_component_field_id(name: str, statistic: str) -> str:
-    if not isinstance(name, str) or not _REWARD_COMPONENT_NAME.fullmatch(name):
-        raise ValueError("reward component name must be canonical snake_case")
-    if statistic not in {
-        "episode_mean",
-        "transition_mean",
-        "latest_episode_mean",
-    }:
-        raise ValueError("unsupported training reward component statistic")
-    return f"server.training.reward.component.{name}.{statistic}"
-
-
-def _reward_component_definition(name: str):
-    field_id = reward_component_field_id(name)
-    return _metric_definition(
-        field_id,
-        " ".join(part.capitalize() for part in name.split("_")),
-        "reward_components",
-        "transition_reward",
-        "reward/transition",
-        "server_transition_window",
-        "mean",
-        "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "reward_components", name, "transition_mean"),
-    )
-
-
-def _training_reward_component_definition(name: str, statistic: str):
-    field_id = training_reward_component_field_id(name, statistic)
-    label = " ".join(part.capitalize() for part in name.split("_"))
-    if statistic == "episode_mean":
-        return _metric_definition(
-            field_id, f"{label} / Agent Episode", "reward_components",
-            "episode_reward", "reward/agent episode",
-            "training_agent_episode_window", "mean", "gauge",
-            ("metric_event_views", "episodes", "windows", "100", "values",
-             "reward_components", name, "episode_mean"),
-        )
-    if statistic == "latest_episode_mean":
-        return _metric_definition(
-            field_id, f"Latest {label} / Agent Episode", "reward_components",
-            "episode_reward", "reward/agent episode",
-            "latest_training_environment_episode", "latest", "gauge",
-            ("metric_event_views", "episodes", "latest", "values",
-             "reward_components", name, "episode_mean"),
-        )
-    return _metric_definition(
-        field_id, f"{label} / Transition", "reward_components",
-        "transition_reward", "reward/transition",
-        "training_transition_window", "mean", "gauge",
-        ("metric_event_views", "episodes", "windows", "100", "values",
-         "reward_components", name, "transition_mean"),
-    )
 
 
 def _nested(document, path):
@@ -518,7 +240,7 @@ def _finite_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    return number if math.isfinite(number) else None
+    return value if math.isfinite(number) else None
 
 
 _EVENT_WINDOWS = {"25", "100", "5s", "1m", "1h", "24h", "all"}
@@ -536,25 +258,25 @@ _HISTORY_DEFAULT_MAX_POINTS = 1500
 _HISTORY_MAX_POINTS_LIMIT = 6000
 
 
-def _project_metric_value(record, definition, event_window="100"):
+def _project_metric_value(record, definition, event_window="1m"):
     if event_window not in _EVENT_WINDOWS:
         raise ValueError("unsupported metric event window")
     path = definition["path"]
     selected_path = path
     if (
-        len(path) >= 5
-        and path[:3] == ("metric_event_views", "episodes", "windows")
-        and path[3] == "100"
+        len(path) == 7
+        and path[:2] == ("metric_event_views", "sources")
+        and path[3] == "windows" and path[4] == "100"
     ):
-        selected_path = (*path[:3], event_window, *path[4:])
+        selected_path = (*path[:4], event_window, *path[5:])
     value = _finite_number(_nested(record, selected_path))
-    return None if value is None else value * definition["scale"]
+    return value if value is None or definition["scale"] == 1.0 else value * definition["scale"]
 
 
-def project_metric_values(record, definitions, event_window="100"):
+def project_metric_values(record, definitions, event_window="1m"):
     projected = copy.deepcopy(record)
     projected["metric_values"] = {
-        definition["descriptor"]["field_id"]: _project_metric_value(
+        definition["descriptor"]["series_id"]: _project_metric_value(
             record, definition, event_window
         )
         for definition in definitions
@@ -585,6 +307,8 @@ class MetricsFileReader:
         tail_interval_seconds: float = 0.05,
         history_bucket_seconds: float = 15.0,
         history_max_records: int = 6000,
+        views_path=VIEWS_PATH,
+        task_views_path=None,
     ):
         if max_records <= 0:
             raise ValueError("max_records must be positive")
@@ -607,6 +331,18 @@ class MetricsFileReader:
             f"local-training-{uuid.uuid4().hex}"
         )
         self._runtime_mode = runtime_mode
+        # Dashboard templates select registered fields; they never decode a task
+        # protocol or change the producer's values, units or denominators.
+        with open(views_path, encoding="utf-8") as view_file:
+            self._views = json.load(view_file)
+        if task_views_path:
+            with open(task_views_path, encoding="utf-8") as view_file:
+                task_views = json.load(view_file)
+            self._views["layout_key"] = task_views["layout_key"]
+            self._views["categories"].extend(task_views.get("categories", []))
+            self._views["panels"].extend(task_views["panels"])
+            self._views["fields"] = task_views["fields"] + self._views["fields"]
+        self._views["panels"].sort(key=lambda panel: panel.get("order", 0))
         self._service_instance_id = service_instance_id or (
             f"learner-metrics-{uuid.uuid4().hex}"
         )
@@ -753,6 +489,7 @@ class MetricsFileReader:
                         self._corrupt_lines += 1
                         continue
                     self._records.append(record)
+                    self._history_definitions = None
                     self._total_record_count += 1
                     self._ingest_history(record)
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
@@ -799,22 +536,22 @@ class MetricsFileReader:
         now = time.monotonic()
         if (
             self._history_definitions is None
-            or now - self._history_definitions_at >= 60.0
+            or now - self._history_definitions_at >= 10.0
         ):
             self._history_definitions = self.metric_definitions()
             self._history_definitions_at = now
         return self._history_definitions
 
     def _project_history_record(self, record):
-        # 历史层固定以 100 局事件窗口投影，与实时层默认视图保持一致；
+        # 历史层使用最近一分钟的上报窗口，与页面当前均值视图保持一致；
         # 瘦身记录仅保留绘图所需字段，控制常驻内存。
         return {
             "sequence": record.get("sequence"),
             "timestamp": record.get("timestamp"),
             "metrics_source_id": record.get("metrics_source_id"),
             "metric_values": {
-                definition["descriptor"]["field_id"]: _project_metric_value(
-                    record, definition, "100"
+                definition["descriptor"]["series_id"]: _project_metric_value(
+                    record, definition, "1m"
                 )
                 for definition in self._definitions_for_history()
             },
@@ -900,53 +637,135 @@ class MetricsFileReader:
         with self._lock:
             return self._records[-1] if self._records else {}
 
-    def metric_definitions(self):
-        with self._lock:
-            reward_names = set(_KNOWN_REWARD_COMPONENTS)
-            for record in self._records:
-                for component_kind in (
-                    "reward_components",
-                    "transition_reward_components",
-                    "latest_reward_components",
-                ):
-                    components = _nested(
-                        record, ("actor", "episodes", component_kind)
-                    )
-                    if not isinstance(components, dict):
-                        continue
-                    reward_names.update(
-                        name
-                        for name in components
-                        if isinstance(name, str)
-                        and _REWARD_COMPONENT_NAME.fullmatch(name)
-                    )
-        definitions = list(_STATIC_METRIC_DEFINITIONS)
-        definitions.extend(
-            _reward_component_definition(name)
-            for name in sorted(reward_names)
-        )
-        definitions.extend(
-            _training_reward_component_definition(name, statistic)
-            for name in sorted(reward_names)
-            for statistic in (
-                "episode_mean",
-                "latest_episode_mean",
-                "transition_mean",
-            )
-        )
-        return definitions
+    def query_fields(self, fields, *, after_sequence=0, window="1m"):
+        """Read registered field IDs; preserve each source as a separate series."""
+        if not fields or any(not field for field in fields):
+            raise ValueError("at least one field is required")
+        if after_sequence < 0 or window not in _EVENT_WINDOWS:
+            raise ValueError("invalid field query cursor or window")
+        fields = list(dict.fromkeys(fields))
+        definitions = [item for item in self.metric_definitions()
+                       if item["descriptor"]["field_id"] in fields]
+        registered = {item["descriptor"]["field_id"] for item in definitions}
+        records = self.query(after_sequence)
+        latest = self.latest()
+        view = latest.get("metric_event_views", {})
+        status_record = {key: latest[key] for key in (
+            "sequence", "timestamp", "metrics_source_id", "learner", "model", "chain", "metric_events"
+        ) if key in latest}
+        status_record["actor"] = {key: latest.get("actor", {})[key] for key in (
+            "instance_id", "client_session_recent", "model_identity", "staged_model_identity",
+            "state", "ready", "error", "model_feedback"
+        ) if key in latest.get("actor", {})}
+        status_record["metric_event_views"] = {
+            "status": view.get("status"),
+            "sources": {key: {"instance_id": source["instance_id"], "last_error": source.get("last_error")}
+                        for key, source in view.get("sources", {}).items()},
+        }
+        status_record["metric_values"] = {
+            item["descriptor"]["series_id"]: _project_metric_value(latest, item, window)
+            for item in definitions
+        }
+        return {
+            "schema_version": 1,
+            "stream": "current",
+            "window": window,
+            "fields": fields,
+            "unregistered_fields": [field for field in fields if field not in registered],
+            "series": [{key: item["descriptor"][key] for key in _CATALOG_FIELD_KEYS
+                        if key in item["descriptor"]} for item in definitions],
+            "records": [{
+                "sequence": record.get("sequence"),
+                "timestamp": record.get("timestamp"),
+                "metrics_source_id": record.get("metrics_source_id"),
+                "metric_values": {
+                    item["descriptor"]["series_id"]: _project_metric_value(record, item, window)
+                    for item in definitions
+                },
+            } for record in records],
+            # The topology/status strip consumes the latest observation once,
+            # independently of the selected chart series.
+            "latest": status_record,
+        }
 
-    def catalog(self):
+    def metric_definitions(self):
+        definitions = {item["descriptor"]["field_id"]: {**item, "descriptor": dict(item["descriptor"])}
+                       for item in _STATIC_METRIC_DEFINITIONS}
+        with self._lock:
+            seen_sources = set()
+            for record in reversed(self._records):
+                sources = record.get("metric_event_views", {}).get("sources", {})
+                for source_key, source in sources.items():
+                    if source_key in seen_sources:
+                        continue
+                    seen_sources.add(source_key)
+                    for name, metric in source["catalog"].items():
+                        field_id = "registered/" + quote(source_key, safe="") + "/" + quote(name, safe="")
+                        window = "latest" if source["role"] == "learner" else "100"
+                        definition = _metric_definition(
+                            field_id, metric["display_name"],
+                            "custom", metric["unit"], metric["unit"],
+                            metric["scope"], metric["aggregation"], "gauge",
+                            ("metric_event_views", "sources", source_key, "windows", window, name, "value"),
+                        )
+                        definition["descriptor"].update({
+                            "field_id": name,
+                            "owner_component": source["role"],
+                            "aggregation_kind": metric["aggregation"],
+                            "window_kind": "latest_metric_event" if window == "latest" else "1m",
+                            "denominator": metric["denominator"],
+                            "metric_id": name,
+                            "source_instance": source["instance_id"],
+                            "lifecycle_epoch": source["lifecycle_epoch"],
+                        })
+                        definitions[field_id] = definition
+        # Presentation identity is separate from source/lifecycle identity. Keep
+        # every source as a separate series, with full identity in field details.
+        source_labels = {}
+        source_counts = {}
+        for definition in definitions.values():
+            descriptor = definition["descriptor"]
+            if "source_instance" in descriptor:
+                source_key = (descriptor["owner_component"], descriptor["source_instance"],
+                              descriptor["lifecycle_epoch"])
+                if source_key not in source_labels:
+                    role = descriptor["owner_component"]
+                    source_counts[role] = source_counts.get(role, 0) + 1
+                    title = "Learner" if role == "learner" else "ServerPod"
+                    source_labels[source_key] = f"{title} {source_counts[role]}"
+                descriptor["source_label"] = source_labels[source_key]
+            name = descriptor.get("metric_id", descriptor["field_id"])
+            for view in self._views["fields"]:
+                prefix, star, suffix = view["match"].partition("*")
+                if (not star and name != prefix) or (star and not (
+                    len(name) >= len(prefix) + len(suffix)
+                    and name.startswith(prefix) and name.endswith(suffix)
+                )):
+                    continue
+                descriptor.update({key: view[key] for key in (
+                    "display_unit", "display_scale"
+                ) if key in view})
+                descriptor["group"] = view["category"]
+                break
+            if descriptor.get("display_unit") == "%":
+                descriptor["dimension"] = "percentage"
+        return list(definitions.values())
+
+    def catalog(self, category=None):
         definitions = self.metric_definitions()
         return {
             "schema_version": 1,
             "catalog_version": 1,
+            "layout_key": self._views["layout_key"],
+            "categories": self._views["categories"],
+            "panels": self._views["panels"],
             "fields": [
                 {
                     key: definition["descriptor"][key]
-                    for key in _CATALOG_FIELD_KEYS
+                    for key in _CATALOG_FIELD_KEYS if key in definition["descriptor"]
                 }
                 for definition in definitions
+                if category is None or definition["descriptor"]["group"] == category
             ],
         }
 
@@ -1064,6 +883,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                         "/api",
                         "/api/metrics",
                         "/api/metrics/catalog",
+                        "/api/metrics/query",
                         "/api/metrics/history",
                         "/api/metrics/latest",
                         "/api/metrics/summary",
@@ -1081,6 +901,17 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
             self._response(
                 body, "text/html; charset=utf-8", status=200
             )
+        elif path == "/api/metrics/query":
+            try:
+                result = metrics_reader.query_fields(
+                    params.get("field", []),
+                    after_sequence=int(params.get("after_sequence", ["0"])[0]),
+                    window=params.get("window", ["1m"])[0],
+                )
+            except ValueError as error:
+                self._json_response({"schema_version": 1, "error": str(error)}, status=400)
+                return
+            self._json_response(result)
         elif path == "/api/metrics":
             try:
                 after_sequence = int(
@@ -1091,7 +922,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 limit = int(params.get("limit", ["0"])[0])
                 if after_sequence < 0 or limit < 0:
                     raise ValueError
-                event_window = params.get("window", ["100"])[0]
+                event_window = params.get("window", ["1m"])[0]
                 if event_window not in _EVENT_WINDOWS:
                     raise ValueError
             except ValueError:
@@ -1161,11 +992,11 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 }
             )
         elif path == "/api/metrics/catalog":
-            self._json_response(metrics_reader.catalog())
+            self._json_response(metrics_reader.catalog(params.get("category", [None])[0]))
         elif path == "/api/metrics/latest":
             latest = metrics_reader.latest()
             definitions = metrics_reader.metric_definitions()
-            event_window = params.get("window", ["100"])[0]
+            event_window = params.get("window", ["1m"])[0]
             if event_window not in _EVENT_WINDOWS:
                 self._json_response(
                     {"schema_version": 1, "error": "invalid event window"},
@@ -1243,6 +1074,10 @@ def main():
     )
     parser.add_argument("--dir", "-d", required=True)
     parser.add_argument("--port", "-p", type=int, default=9005)
+    parser.add_argument("--views", default=str(VIEWS_PATH),
+                        help="Dashboard presentation template; does not change metric facts")
+    parser.add_argument("--task-views",
+                        help="Task panel defaults and field presentation, added to --views")
     parser.add_argument(
         "--source-id",
         default=os.environ.get("RL_METRICS_SOURCE_ID", ""),
@@ -1256,6 +1091,8 @@ def main():
         args.dir,
         metrics_source_id=args.source_id,
         runtime_mode=args.mode,
+        views_path=args.views,
+        task_views_path=args.task_views,
     )
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):

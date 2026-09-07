@@ -1,0 +1,176 @@
+{
+  "categories": [
+    {
+      "id": "loss",
+      "label": "Loss"
+    },
+    {
+      "id": "reward",
+      "label": "Reward"
+    },
+    {
+      "id": "episode",
+      "label": "Episode"
+    },
+    {
+      "id": "success",
+      "label": "Success Rate"
+    },
+    {
+      "id": "ppo_stability",
+      "label": "PPO Stability"
+    },
+    {
+      "id": "advantage",
+      "label": "Advantage / Value"
+    },
+    {
+      "id": "training_depth",
+      "label": "Training Progress"
+    },
+    {
+      "id": "sample_throughput",
+      "label": "Sample Throughput"
+    },
+    {
+      "id": "sample_flow",
+      "label": "Sample Flow"
+    },
+    {
+      "id": "latency",
+      "label": "Latency"
+    },
+    {
+      "id": "task_metrics",
+      "label": "Task Metrics"
+    },
+    {
+      "id": "custom",
+      "label": "Registered Metrics"
+    }
+  ],
+  "panels": [
+    {
+      "id": "loss",
+      "title": "Loss",
+      "category": "loss",
+      "required": [
+        "learner.ppo.policy_loss",
+        "learner.ppo.value_loss"
+      ],
+      "defaults": [
+        "learner.ppo.policy_loss",
+        "learner.ppo.value_loss"
+      ],
+      "order": 10
+    },
+    {
+      "id": "ppo-stability",
+      "title": "PPO Stability",
+      "category": "ppo_stability",
+      "required": [
+        "learner.ppo.approx_kl",
+        "learner.ppo.entropy"
+      ],
+      "defaults": [
+        "learner.ppo.approx_kl",
+        "learner.ppo.clip_fraction",
+        "learner.value.explained_variance",
+        "learner.ppo.entropy"
+      ],
+      "focus": "learner.ppo.approx_kl",
+      "order": 50
+    },
+    {
+      "id": "sample-throughput",
+      "title": "Sample Throughput",
+      "category": "sample_throughput",
+      "defaults": [
+        "sample.throughput.produced_per_second",
+        "sample.throughput.accepted_per_second",
+        "sample.throughput.trained_per_second"
+      ],
+      "order": 60
+    },
+    {
+      "id": "sample-flow",
+      "title": "Sample Flow",
+      "category": "sample_flow",
+      "defaults": [
+        "sample.flow.produced.total",
+        "sample.flow.accepted.total",
+        "sample.flow.acknowledged.total",
+        "sample.flow.trained.total"
+      ],
+      "order": 70
+    },
+    {
+      "id": "latency",
+      "title": "Latency",
+      "category": "latency",
+      "defaults": [
+        "server.latency.sample_send.mean_ms",
+        "server.latency.inference.mean_ms",
+        "server.latency.inference.max_ms"
+      ],
+      "order": 80
+    }
+  ],
+  "fields": [
+    {
+      "match": "learner.ppo.policy_loss",
+      "category": "loss"
+    },
+    {
+      "match": "learner.ppo.value_loss",
+      "category": "loss"
+    },
+    {
+      "match": "learner.ppo.total_loss",
+      "category": "loss"
+    },
+    {
+      "match": "learner.ppo.approx_kl",
+      "category": "ppo_stability"
+    },
+    {
+      "match": "learner.ppo.entropy",
+      "category": "ppo_stability"
+    },
+    {
+      "match": "learner.ppo.clip_fraction",
+      "category": "ppo_stability",
+      "display_unit": "%",
+      "display_scale": 100
+    },
+    {
+      "match": "learner.ppo.gradient_norm",
+      "category": "ppo_stability"
+    },
+    {
+      "match": "learner.ppo.policy_lag",
+      "category": "ppo_stability"
+    },
+    {
+      "match": "learner.ppo.raw_advantage",
+      "category": "advantage"
+    },
+    {
+      "match": "learner.ppo.normalized_advantage",
+      "category": "advantage"
+    },
+    {
+      "match": "learner.ppo.return_target",
+      "category": "advantage"
+    },
+    {
+      "match": "learner.ppo.value_prediction",
+      "category": "advantage"
+    },
+    {
+      "match": "learner.update.*",
+      "category": "training_depth"
+    }
+  ],
+  "layout_key": "rl-monitor-panels/training"
+}

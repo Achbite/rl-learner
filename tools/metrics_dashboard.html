@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Learner 本地训练监控</title>
+  <title>Learner Training Monitor</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -193,7 +193,7 @@
       border-radius: 13px;
       box-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, .04), rgba(0, 0, 0, .24));
     }
-    .panel-head { padding: 12px 13px 9px; }
+    .panel-head { display: flex; justify-content: space-between; gap: 10px; padding: 12px 13px 9px; }
     .panel-title { margin: 0; font-size: 14px; }
     .tags { display: flex; flex-wrap: wrap; gap: 6px; min-height: 38px; padding: 0 13px 10px; }
     .tag, .add-metric {
@@ -213,39 +213,27 @@
     }
     .swatch { width: 11px; height: 4px; background: currentColor; border-radius: 999px; }
     .add-metric { display: inline-grid; place-items: center; min-width: 28px; }
-    .registry-picker {
-      display: grid;
-      gap: 5px;
-      margin: 0 13px 10px;
-      padding: 6px;
-      background: var(--soft);
-      border: 1px solid var(--separator);
-      border-radius: 9px;
-    }
-    .registry-picker[hidden] { display: none; }
-    .registry-option {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-width: 0;
-      padding: 7px 8px;
-      color: var(--label);
-      text-align: left;
-      background: var(--surface);
-      border: 1px solid var(--separator);
-      border-radius: 7px;
-      cursor: pointer;
-    }
-    .registry-id {
-      min-width: 0;
-      overflow: hidden;
-      color: var(--secondary);
-      font: 12px ui-monospace, "SFMono-Regular", Menlo, monospace;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
     .registry-empty { padding: 5px 7px; color: var(--secondary); }
+    .metric-editor { width: min(720px, calc(100vw - 32px)); max-height: 85vh; padding: 0; color: var(--label); background: var(--surface); border: 1px solid var(--separator); border-radius: 13px; }
+    .metric-editor::backdrop { background: rgba(0, 0, 0, .3); }
+    .editor-head, .editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px 18px; }
+    .editor-head h2 { margin: 0; font-size: 16px; }
+    .editor-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 0 18px 14px; }
+    .editor-fields label { display: grid; gap: 6px; color: var(--secondary); }
+    .editor-fields input, .editor-fields select { width: 100%; box-sizing: border-box; min-height: 34px; }
+    .editor-search { grid-column: 1 / -1; }
+    .metric-list { max-height: 42vh; overflow: auto; border-block: 1px solid var(--separator); padding: 6px 18px; }
+    .metric-section-title { margin: 12px 0 0; font-size: 12px; color: var(--secondary); }
+    .metric-choice { border-bottom: 1px solid var(--separator); padding: 9px 0; }
+    .metric-choice:last-child { border-bottom: 0; }
+    .metric-choice > label { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+    .metric-choice .choice-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .metric-choice .choice-meta { color: var(--secondary); font-size: 12px; }
+    .metric-choice details { margin: 6px 0 0 25px; color: var(--secondary); font-size: 12px; }
+    .metric-choice summary { cursor: pointer; }
+    .metric-choice dl { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 5px 12px; }
+    .metric-choice dd { margin: 0; overflow-wrap: anywhere; }
+    .editor-footer button:disabled { opacity: .5; cursor: default; }
     .chart-wrap { position: relative; padding: 0 8px 7px; }
     .chart { display: block; width: 100%; overflow: hidden; touch-action: none; }
     .chart-grid { stroke: var(--grid); stroke-width: 1; }
@@ -300,6 +288,7 @@
       border-top: 1px solid var(--separator);
       font-variant-numeric: tabular-nums;
     }
+    .metric-choice a { overflow-wrap: anywhere; }
     @media (max-width: 850px) {
       .pod-grid, .panel-grid { grid-template-columns: 1fr; }
     }
@@ -308,7 +297,8 @@
       .product-context { display: none; }
       .depth-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar { align-items: flex-start; }
-      .registry-option { align-items: flex-start; flex-direction: column; }
+      .editor-fields { grid-template-columns: 1fr; }
+      .metric-choice .choice-meta { max-width: 100px; text-align: right; }
     }
   </style>
 </head>
@@ -319,16 +309,17 @@
       <div class="brand-mark" aria-hidden="true">RL</div>
       <div class="brand-copy">
         <div class="brand-line">
-          <span class="product-title">本地训练监控</span>
+          <span class="product-title"><span data-i18n="Training Monitor">Training Monitor</span></span>
           <span id="run-context" class="product-context">Learner / 等待训练实例</span>
         </div>
       </div>
     </div>
-    <span id="live-status" class="live-badge" data-state="wait">正在连接</span>
+    <div class="toolbar-group"><select id="language" class="select" aria-label="Language / 语言"><option value="zh">中文</option><option value="en">English</option></select>
+    <span id="live-status" class="live-badge" data-state="wait">Connecting</span></div>
   </header>
 
-  <section class="topology" aria-label="本地训练运行拓扑">
-    <h1 class="section-title">运行拓扑</h1>
+  <section class="topology" data-i18n-aria="Training Topology" aria-label="Training Topology">
+    <h1 class="section-title"><span data-i18n="Topology">Topology</span></h1>
     <div class="pod-grid">
       <article class="pod-card" aria-label="Learner Pod">
         <div class="pod-head">
@@ -336,7 +327,7 @@
           <div><span id="learner-count" class="pod-count">— / 1</span> <span id="learner-state" class="pod-state" data-state="wait">等待</span></div>
         </div>
       </article>
-      <article class="pod-card" aria-label="Server Pod，由 AIServer 与 Client 组成">
+      <article class="pod-card" data-i18n-aria="Server Pod (AIServer + Client)" aria-label="Server Pod (AIServer + Client)">
         <div class="pod-head">
           <div class="pod-identity"><span class="pod-icon" aria-hidden="true">S</span><span class="pod-name">Server Pod</span></div>
           <div><span id="server-count" class="pod-count">— / 1</span> <span id="server-state" class="pod-state" data-state="wait">等待</span></div>
@@ -346,7 +337,7 @@
     </div>
   </section>
 
-  <section class="depth-strip" aria-label="训练状态">
+  <section class="depth-strip" data-i18n-aria="Training Status" aria-label="Training Status">
     <div class="depth-item"><div class="depth-label">Model Step</div><div id="model-step" class="depth-value">—</div></div>
     <div class="depth-item"><div class="depth-label">Train Update</div><div id="train-update" class="depth-value">—</div></div>
     <div class="depth-item"><div class="depth-label">Trained Transitions</div><div id="trained-samples" class="depth-value">—</div></div>
@@ -354,22 +345,26 @@
     <div class="depth-item"><div class="depth-label">Workload</div><div id="training-workload" class="depth-value">Training</div></div>
   </section>
 
-  <section class="toolbar" aria-label="曲线控制">
+  <section class="toolbar" data-i18n-aria="Chart Controls" aria-label="Chart Controls">
     <div class="toolbar-group">
-      <label class="toggle">时间范围
-        <select id="time-range" class="select" aria-label="时间范围"></select>
+      <label class="toggle"><span data-i18n="Time range">Time range</span>
+        <select id="time-range" class="select" data-i18n-aria="Time range" aria-label="Time range"></select>
       </label>
-      <label class="toggle">自动刷新
-        <select id="refresh-interval" class="select" aria-label="自动刷新间隔"></select>
+      <label class="toggle"><span data-i18n="Auto refresh">Auto refresh</span>
+        <select id="refresh-interval" class="select" data-i18n-aria="Refresh interval" aria-label="Refresh interval"></select>
       </label>
     </div>
     <div class="toolbar-group">
-      <button id="refresh-now" type="button" class="refresh-button">立即刷新</button>
+      <span class="toolbar-note" data-i18n="Mean window: 1 min">Mean window: 1 min</span>
+      <button id="create-panel" type="button" class="refresh-button"><span data-i18n="＋ Create panel">＋ Create panel</span></button>
+      <button id="reset-panels" type="button" class="refresh-button"><span data-i18n="Restore defaults">Restore defaults</span></button>
+      <button id="refresh-now" type="button" class="refresh-button"><span data-i18n="Refresh now">Refresh now</span></button>
       <span id="history-status" class="toolbar-note" role="status"></span>
+      <span id="layout-status" class="toolbar-note" role="status"></span>
     </div>
   </section>
 
-  <main id="panel-grid" class="panel-grid" aria-label="本地训练指标曲线"></main>
+  <main id="panel-grid" class="panel-grid" data-i18n-aria="Training Metrics" aria-label="Training Metrics"></main>
 
   <footer class="footer">
     <span id="stream-status">指标流：等待连接</span>
@@ -377,112 +372,186 @@
   </footer>
 </div>
 
+<dialog id="metric-editor" class="metric-editor" aria-labelledby="editor-title">
+  <form id="panel-form">
+    <div class="editor-head"><h2 id="editor-title"><span data-i18n="Create panel">Create panel</span></h2><button id="close-editor" type="button" class="refresh-button" data-i18n-aria="Close field selector" aria-label="Close field selector"><span data-i18n="Close">Close</span></button></div>
+    <div class="editor-fields">
+      <label><span data-i18n="Panel name">Panel name</span><input id="panel-name" class="select" required maxlength="80" data-i18n-placeholder="e.g. Advantage / Value" placeholder="e.g. Advantage / Value"></label>
+      <label><span data-i18n="Filter by category">Filter by category</span><select id="metric-category" class="select"></select></label>
+      <label class="editor-search"><span data-i18n="Search fields">Search fields</span><input id="metric-search" class="select" type="search" data-i18n-placeholder="Name or field, e.g. loss, success, task.…" placeholder="Name or field, e.g. loss, success, task.…"></label>
+    </div>
+    <p id="metric-collection-status" class="registry-empty" role="status" hidden></p>
+    <div id="metric-list" class="metric-list" data-i18n-aria="Available fields" aria-label="Available fields"></div>
+    <div class="editor-footer"><span id="selected-count" class="toolbar-note" role="status"></span><button id="save-panel" class="refresh-button" type="submit"><span data-i18n="Create panel">Create panel</span></button></div>
+  </form>
+</dialog>
+
 <script>
   "use strict";
+
+  const ZH = {
+    "Chart Controls": "曲线控制",
+    "Time range": "时间范围",
+    "Refresh interval": "自动刷新间隔",
+    "Auto refresh": "自动刷新",
+    "＋ Create panel": "＋ 创建监控窗口",
+    "Restore defaults": "恢复默认面板",
+    "Refresh now": "立即刷新",
+    "Create panel": "创建窗口",
+    "Close field selector": "关闭变量选择",
+    "Close": "关闭",
+    "Panel name": "窗口名称",
+    "Filter by category": "筛选指标类别",
+    "Search fields": "搜索字段",
+    "Available fields": "可选字段",
+    "e.g. Advantage / Value": "例如：优势与价值估计",
+    "Name or field, e.g. loss, success, task.…": "名称或字段路径，例如 loss、通关率、task.…",
+    "Mean window: 1 min": "均值窗口：1 min",
+    "Layout saved in this browser": "布局已保存在此浏览器",
+    "Panel layout must be a list": "窗口配置应为列表",
+    "Selected fields unavailable": "所选字段暂不可用",
+    "No data in the selected range": "所选范围暂无数据",
+    "Field details": "字段与统计口径",
+    "Required": "固定追踪",
+    "No matching fields": "没有匹配字段",
+    "Save panel": "保存窗口",
+    "All fields": "全部指标",
+    "All": "全部",
+    "Same unit": "同类",
+    "＋ Fields": "＋ 变量",
+    "Remove": "移除",
+    "Not refreshed yet": "尚未刷新",
+    " · Auto refresh is off": " · 自动刷新已关闭",
+    "No history yet": "暂无历史数据",
+    "History unavailable; showing retained data": "历史层不可用，仅显示保留段",
+    "Metrics unavailable": "指标不可用",
+    "AIServer metrics unavailable": "AIServer 指标采集不可用",
+    "Metric data incomplete": "指标数据不完整",
+    "Waiting for AIServer metrics": "等待 AIServer 指标",
+    "Freshness unknown": "时效未知",
+    "Waiting for metrics": "等待指标",
+    "Running": "运行中",
+    "Stale state": "状态过期",
+    "Error": "异常",
+    "Disconnected": "未连接",
+    "Stopping": "正在停止",
+    "Stopped": "已停止",
+    "Syncing model": "模型同步中",
+    "Waiting for Client": "等待 Client",
+    "Starting": "启动中",
+    "Waiting for model information": "等待模型信息",
+    "Waiting for AIServer and Client": "等待 AIServer 与 Client",
+    "Waiting for the first model": "等待首个可用模型",
+    "Connection failed": "连接失败",
+    "Metric freshness unavailable": "指标时效不可用",
+    "Metrics stale": "指标已过期",
+    "Live": "实时",
+    "Waiting for a training instance": "等待训练实例",
+    "State unknown": "状态未知",
+    " · Metric projection failed: ": " · 指标解析失败：",
+    " · Metric history incomplete": " · 指标历史不完整",
+    " · Event history unavailable": " · 历史事件不可用",
+    "Loading history…": "正在加载历史…",
+    "Last 1 min": "最近 1 分钟",
+    "Last 30 min": "最近 30 分钟",
+    "Last 1 hour": "最近 1 小时",
+    "Last 6 hours": "最近 6 小时",
+    "Last 24 hours": "最近 24 小时",
+    "Every 5 seconds": "每 5 秒",
+    "Every 30 seconds": "每 30 秒",
+    "Every 1 min": "每 1 分钟",
+    "Every 5 min": "每 5 分钟",
+    "Off": "关闭",
+    "Could not save layout: {error}": "布局保存失败：{error}",
+    "Could not read saved layout: {error}": "保存的布局读取失败：{error}",
+    "{title} chart, x-axis Wall Time": "{title} 曲线，横轴 Wall Time",
+    "{count} fields selected": "已选择 {count} 个变量",
+    "{name} · Field unavailable": "{name} · 字段暂不可用",
+    "Edit panel · {title}": "编辑窗口 · {title}",
+    "Show all {title} curves with the same unit": "显示 {title} 同量纲全部曲线",
+    "Focus {label} in {title}": "在 {title} 聚焦 {label}",
+    "Add fields to {title}": "向 {title} 添加追踪变量",
+    "{title} panel": "{title} 独立统计面板",
+    "Remove panel {title}": "移除窗口 {title}",
+    "{title} chart tabs": "{title} 曲线标签",
+    "History points: {count}": "历史点 {count}",
+    "Active step {step}": "当前 step {step}",
+    " · Staged step {step}": " · 已暂存 step {step}",
+    " · Latest step {step}": " · 最新 step {step}",
+    " · Lag {steps}": " · 追赶 {steps}",
+    "Active step {step} · Synced": "当前 step {step} · 已同步",
+    "Active step {step} · Distribution status pending": "当前 step {step} · 分发状态待刷新",
+    " · Update failed [{stage}]: {error}": " · 更新失败 [{stage}]: {error}",
+    "Metric stream: {stream} · ": "指标流：{stream} · ",
+    " · Metric relay {state}: {error}": " · 指标传输{state}: {error}",
+    "Updated {time}": "最近刷新 {time}",
+    "Metric stream: {error}": "指标流：{error}",
+    "Disconnected {time}": "连接中断 {time}",
+    "Read field data": "读取字段数据",
+    "Training Monitor": "Training Monitor",
+    "Training Topology": "Training Topology",
+    "Topology": "Topology",
+    "Training Metrics": "Training Metrics",
+    "Training Status": "Training Status"
+};
+  let language = "zh";
+  try { language = localStorage.getItem("rl-monitor-language") === "en" ? "en" : "zh"; }
+  catch (error) { document.getElementById("layout-status").textContent = `Language preference: ${error.message}`; }
+  const locale = () => language === "zh" ? "zh-CN" : "en-US";
+  const t = (key, values = {}) => (language === "zh" ? (ZH[key] || key) : key)
+    .replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(values, name) ? values[name] : match);
+  const translateStatic = () => {
+    document.documentElement.lang = locale();
+    document.querySelectorAll("[data-i18n]").forEach(element => element.textContent = t(element.dataset.i18n));
+    document.querySelectorAll("[data-i18n-aria]").forEach(element => element.setAttribute("aria-label", t(element.dataset.i18nAria)));
+    document.querySelectorAll("[data-i18n-placeholder]").forEach(element => element.placeholder = t(element.dataset.i18nPlaceholder));
+    document.getElementById("language").value = language;
+  };
+
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const COLORS = ["--blue", "--green", "--orange", "--red", "--purple", "--teal", "--pink", "--indigo"];
   const MODEL_STEP_ID = "learner.model_step";
   const TRAIN_UPDATE_ID = "learner.train_update.total";
   const TRAINED_SAMPLES_ID = "learner.trained_samples.total";
-  const TRAINING_EPISODE_ID = "server.training.episode.completed.total";
   const PRODUCED_SAMPLES_ID = "sample.flow.produced.total";
-  // 时间范围与自动刷新档位（Grafana 同款快速档），EVENT_WINDOW 固定为
-  // 服务端 episode 聚合窗口，避免时间档被误当作事件窗口下发。
+  // Chart time range and statistic window are independent. Task means use
+  // reports observed in the trailing minute; sum/count supplies the weights.
   const TIME_RANGES = [
-    {key: "1m", label: "最近 1 分钟", seconds: 60},
-    {key: "30m", label: "最近 30 分钟", seconds: 30 * 60},
-    {key: "1h", label: "最近 1 小时", seconds: 60 * 60},
-    {key: "6h", label: "最近 6 小时", seconds: 6 * 60 * 60},
-    {key: "24h", label: "最近 24 小时", seconds: 24 * 60 * 60},
-    {key: "all", label: "全部", seconds: null}
+    {key: "1m", label: "Last 1 min", seconds: 60},
+    {key: "30m", label: "Last 30 min", seconds: 30 * 60},
+    {key: "1h", label: "Last 1 hour", seconds: 60 * 60},
+    {key: "6h", label: "Last 6 hours", seconds: 6 * 60 * 60},
+    {key: "24h", label: "Last 24 hours", seconds: 24 * 60 * 60},
+    {key: "all", label: "All", seconds: null}
   ];
   const REFRESH_INTERVALS = [
-    {key: "5s", label: "每 5 秒", ms: 5000},
-    {key: "30s", label: "每 30 秒", ms: 30000},
-    {key: "1m", label: "每 1 分钟", ms: 60000},
-    {key: "5m", label: "每 5 分钟", ms: 300000},
-    {key: "off", label: "关闭", ms: 0}
+    {key: "5s", label: "Every 5 seconds", ms: 5000},
+    {key: "30s", label: "Every 30 seconds", ms: 30000},
+    {key: "1m", label: "Every 1 min", ms: 60000},
+    {key: "5m", label: "Every 5 min", ms: 300000},
+    {key: "off", label: "Off", ms: 0}
   ];
-  const EVENT_WINDOW = "100";
+  const EVENT_WINDOW = "1m";
   const HISTORY_RANGES = new Set(["6h", "24h", "all"]);
   const TICK_STEPS_SECONDS = [
     1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
     3600, 7200, 21600, 43200, 86400
   ];
-  const REWARD_COMPONENT_IDS = [
-    "server.training.reward.component.goal_reward.episode_mean",
-    "server.training.reward.component.timeout_penalty.episode_mean",
-    "server.training.reward.component.geodesic_progress.episode_mean",
-    "server.training.reward.component.first_visit_bonus.episode_mean",
-    "server.training.reward.component.wasted_action_penalty.episode_mean"
-  ];
-  const groups = [
-    {
-      id: "loss", title: "Loss", catalogGroup: "loss",
-      initial: ["learner.loss.policy", "learner.loss.value"]
-    },
-    {
-      id: "episode-return", title: "Agent Episode Return", catalogGroup: "episode_return",
-      initial: [
-        "server.training.episode.learning_return.mean",
-        "server.training.episode.learning_return.latest_mean"
-      ]
-    },
-    {
-      id: "reward-components", title: "Reward Components", catalogGroup: "reward_components",
-      initial: REWARD_COMPONENT_IDS
-    },
-    {
-      id: "episode-success", title: "Agent Success Rate", catalogGroup: "episode_success",
-      initial: [
-        "server.training.episode.success.any_rate",
-        "server.training.episode.success.all_rate"
-      ]
-    },
-    {
-      id: "sample-throughput", title: "Sample Throughput", catalogGroup: "sample_throughput",
-      initial: [
-        "sample.throughput.produced_per_second",
-        "sample.throughput.accepted_per_second",
-        "sample.throughput.trained_per_second"
-      ]
-    },
-    {
-      id: "sample-flow", title: "Sample Flow", catalogGroup: "sample_flow",
-      initial: [
-        "sample.flow.produced.total",
-        "sample.flow.accepted.total",
-        "sample.flow.acknowledged.total",
-        "sample.flow.trained.total"
-      ]
-    },
-    {
-      id: "latency", title: "Latency", catalogGroup: "latency",
-      initial: [
-        "server.latency.sample_send.mean_ms",
-        "server.latency.inference.mean_ms",
-        "server.latency.inference.max_ms"
-      ]
-    },
-    {
-      id: "ppo-stability", title: "PPO Stability", catalogGroup: "ppo_stability",
-      initial: [
-        "learner.ppo.entropy",
-        "learner.ppo.approx_kl",
-        "learner.ppo.clip_fraction",
-        "learner.value.prediction_mean",
-        "learner.value.return_target_mean",
-        "learner.value.explained_variance"
-      ]
-    }
-  ].map(group => ({...group, keys: [], initialized: false, styles: new Map()}));
-  const groupById = new Map(groups.map(group => [group.id, group]));
+  const groups = [];
+  const groupById = new Map();
   const registry = new Map();
+  let layoutKey = null;
+  let panelTemplates = [];
+  let categories = [];
+  let editingGroup = null;
+  let selectedFields = new Set();
   const state = {
     records: [],
     recordLimit: 4096,
     cursor: 0,
+    queriedFields: "",
+    latest: {},
     sourceId: "",
     timeRange: "30m",
     refreshMs: 5000,
@@ -498,17 +567,26 @@
     catalogFetchedAt: 0,
     polling: false,
     status: null,
-    lastRefreshText: "",
+    layoutNotice: null,
+    lastRefreshAt: null,
+    lastRefreshEvent: "Updated {time}",
     timer: null
   };
 
   const byId = id => document.getElementById(id);
+  const setLayoutStatus = (key, values = {}) => {
+    state.layoutNotice = {key, values};
+    byId("layout-status").textContent = t(key, values);
+  };
   const finiteNumber = value => {
     if (typeof value === "boolean" || value === null || value === "") return null;
     const converted = Number(value);
     return Number.isFinite(converted) ? converted : null;
   };
-  const metricValue = (record, fieldId) => finiteNumber(record?.metric_values?.[fieldId]);
+  const metricValue = (record, fieldId) => {
+    const value = finiteNumber(record?.metric_values?.[fieldId]);
+    return value === null ? null : value * (registry.get(fieldId)?.display_scale ?? 1);
+  };
   const nested = (object, path) => path.reduce(
     (value, key) => value && value[key] !== undefined ? value[key] : undefined,
     object
@@ -539,7 +617,7 @@
   };
   const formatInteger = value => {
     const number = finiteNumber(value);
-    return number === null ? "—" : number.toLocaleString("zh-CN", {
+    return number === null ? "—" : number.toLocaleString(locale(), {
       maximumFractionDigits: 20
     });
   };
@@ -547,32 +625,102 @@
     if (value === null || !Number.isFinite(value)) return "—";
     const absolute = Math.abs(value);
     if (absolute > 0 && absolute < .001) return value.toExponential(2);
-    if (absolute >= 1000) return value.toLocaleString("zh-CN", {
-      maximumFractionDigits: 12
+    if (absolute >= 1000) return value.toLocaleString(locale(), {
+      maximumFractionDigits: 2
     });
-    const digits = absolute < .1 ? 4 : absolute < 10 ? 2 : 1;
-    return `${value > 0 ? "+" : ""}${value.toFixed(digits)}`;
+    const digits = absolute < .1 ? 4 : absolute < 100 ? 3 : 1;
+    return value.toFixed(digits);
   };
   const formatMetric = (metric, value) => {
     if (!metric || value === null || !Number.isFinite(value)) return "—";
-    if (metric.unit === "%") return `${value.toFixed(1)}%`;
+    const unit = metric.display_unit || metric.unit;
+    if (unit === "%") return `${value.toFixed(1)}%`;
     if (metric.unit === "ms") return `${formatScalar(value)} ms`;
     if (["samples/s", "transitions/s"].includes(metric.unit)) {
       return `${formatScalar(value)}/s`;
     }
-    if (["samples", "transitions", "step", "update", "version"].includes(metric.unit)) {
+    if (["samples", "transitions", "step", "update", "version", "count"].includes(unit)) {
       return formatInteger(value);
     }
     return formatScalar(value);
   };
-  const fieldIdsForGroup = group => [...registry.values()]
-    .filter(metric => metric.group === group.catalogGroup)
-    .map(metric => metric.field_id);
+  const matchesMetric = (selector, metric) => {
+    if (selector === metric.series_id) return true;
+    const name = metric.field_id;
+    const star = selector.indexOf("*");
+    return star < 0 ? name === selector :
+      name.length >= selector.length - 1 &&
+      name.startsWith(selector.slice(0, star)) && name.endsWith(selector.slice(star + 1));
+  };
+  const fieldLabel = metric => {
+    const duplicates = [...registry.values()].filter(item =>
+      (item.field_id) === (metric.field_id)
+    ).length > 1;
+    return metric.label + (duplicates && metric.source_label ? ` · ${metric.source_label}` : "");
+  };
+  const dimensionKey = metric => [
+    metric.dimension, metric.display_unit || metric.unit,
+    metric.unit === "reward" ? metric.denominator || "" : ""
+  ].join("|");
+  const resolveGroup = group => {
+    group.keys = [...new Set([...(group.required || []), ...group.selections].flatMap(
+      selector => [...registry.values()].filter(metric => matchesMetric(selector, metric))
+        .map(metric => metric.series_id)
+    ))];
+    if (!group.focusChosen && group.initialFocus) {
+      const preferred = group.keys.find(id => matchesMetric(group.initialFocus, registry.get(id)));
+      if (preferred) state.focus[group.id] = preferred;
+    }
+    normalizeFocus(group);
+    assignGroupStyles(group);
+  };
+  const addGroup = (template, saved) => {
+    const group = {
+      ...template, ...saved,
+      required: template.required || [],
+      selections: saved?.selections || template.selections || template.defaults || [],
+      initialFocus: template.focus,
+      keys: [], styles: new Map()
+    };
+    groups.push(group);
+    groupById.set(group.id, group);
+    resolveGroup(group);
+    return group;
+  };
+  const saveLayout = () => {
+    try {
+      if (layoutKey === null) throw new Error(t("Metrics unavailable"));
+      localStorage.setItem(layoutKey, JSON.stringify(groups.map(group => ({
+        id: group.id, title: group.title, category: group.category,
+        selections: group.selections, custom: !!group.custom
+      }))));
+      setLayoutStatus("Layout saved in this browser");
+    } catch (error) {
+      setLayoutStatus("Could not save layout: {error}", {error: error.message});
+    }
+  };
+  const initializeGroups = saved => {
+    groups.splice(0);
+    groupById.clear();
+    const entropy = saved?.find(item => item.id === "entropy" && !item.custom);
+    panelTemplates.forEach(template => {
+      let stored = saved?.find(item => item.id === template.id && !item.custom);
+      if (template.id === "ppo-stability" && entropy) {
+        stored = {...stored, selections: [...new Set([
+          ...(stored?.selections || template.defaults), ...(entropy.selections || [])
+        ])]};
+      }
+      addGroup(template, stored);
+    });
+    saved?.filter(item => item.custom).forEach(item => addGroup(item));
+    buildPanels();
+  };
   // 按量纲分桶：共享 Y 轴要求同量纲，因此多线对比只在同一量纲内成立。
   const dimensionBuckets = group => {
     const buckets = new Map();
     group.keys.forEach(fieldId => {
-      const dimension = registry.get(fieldId)?.dimension;
+      const metric = registry.get(fieldId);
+      const dimension = metric ? dimensionKey(metric) : null;
       if (!dimension) return;
       if (!buckets.has(dimension)) buckets.set(dimension, []);
       buckets.get(dimension).push(fieldId);
@@ -598,7 +746,8 @@
     if (selected !== "all") return selected ? [selected] : [];
     const buckets = dimensionBuckets(group);
     const anchor = state.anchor[group.id];
-    const anchorDimension = registry.get(anchor)?.dimension;
+    const anchorMetric = registry.get(anchor);
+    const anchorDimension = anchorMetric ? dimensionKey(anchorMetric) : null;
     const anchored = anchorDimension ? buckets.get(anchorDimension) : null;
     if (anchored && anchored.length >= 2) return anchored;
     const fallback = largestBucket(buckets);
@@ -611,40 +760,53 @@
     state.focus[group.id] = groupSupportsAll(group) ? "all" : group.keys[0];
   };
 
-  const applyCatalog = document => {
-    if (document?.schema_version !== 1 || document?.catalog_version !== 1 ||
-        !Array.isArray(document.fields)) {
+  const applyCatalog = catalog => {
+    if (catalog?.schema_version !== 1 || catalog?.catalog_version !== 1 ||
+        !Array.isArray(catalog.fields) || !Array.isArray(catalog.panels) ||
+        typeof catalog.layout_key !== "string" || !catalog.layout_key) {
       throw new Error("metrics catalog contract mismatch");
     }
     const nextRegistry = new Map();
-    document.fields.forEach(field => {
+    catalog.fields.forEach(field => {
       const required = [
-        "field_id", "label", "group", "dimension", "unit",
+        "field_id", "series_id", "label", "group", "dimension", "unit",
         "scope", "statistic", "value_kind"
       ];
       if (!required.every(key => typeof field[key] === "string" && field[key])) return;
-      nextRegistry.set(field.field_id, {...field});
+      nextRegistry.set(field.series_id, {...field});
     });
+    const fieldsChanged = nextRegistry.size !== registry.size ||
+      [...nextRegistry.keys()].some(id => !registry.has(id));
     registry.clear();
     nextRegistry.forEach((value, key) => registry.set(key, value));
-    groups.forEach(group => {
-      const available = fieldIdsForGroup(group);
-      const availableSet = new Set(available);
-      if (!group.initialized) {
-        group.keys = group.initial.filter(fieldId => availableSet.has(fieldId));
-        if (!group.keys.length && available.length) group.keys = [available[0]];
-        group.initialized = true;
-      } else {
-        group.keys = group.keys.filter(fieldId => availableSet.has(fieldId));
-        if (!group.keys.length && available.length) {
-          const preferred = group.initial.find(fieldId => availableSet.has(fieldId));
-          group.keys = [preferred || available[0]];
+    panelTemplates = catalog.panels;
+    categories = catalog.categories;
+    if (layoutKey !== catalog.layout_key) {
+      layoutKey = catalog.layout_key;
+      state.focus = {};
+      state.anchor = {};
+      state.domains.clear();
+      byId("metric-editor").close();
+      editingGroup = null;
+      selectedFields.clear();
+      let saved = null;
+      try {
+        const stored = localStorage.getItem(layoutKey);
+        if (stored) {
+          saved = JSON.parse(stored);
+          if (!Array.isArray(saved)) throw new Error(t("Panel layout must be a list"));
         }
+      } catch (error) {
+        saved = null;
+        setLayoutStatus("Could not read saved layout: {error}", {error: error.message});
       }
-      normalizeFocus(group);
-      assignGroupStyles(group);
+      initializeGroups(saved);
+    }
+    groups.forEach(group => {
+      resolveGroup(group);
       refreshPanelControls(group);
     });
+    if (fieldsChanged && byId("metric-editor").open) renderMetricChoices();
   };
 
   const refreshCatalog = async force => {
@@ -669,14 +831,16 @@
   const formatTickTime = (timestamp, spanSeconds) => {
     const date = new Date(timestamp * 1000);
     if (spanSeconds > 86400) {
-      return date.toLocaleString("zh-CN", {
+      return date.toLocaleString(locale(), {
+        hour12: false,
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
         minute: "2-digit"
       });
     }
-    return date.toLocaleTimeString("zh-CN", {
+    return date.toLocaleTimeString(locale(), {
+      hour12: false,
       hour: "2-digit",
       minute: "2-digit",
       second: spanSeconds <= 600 ? "2-digit" : undefined
@@ -880,21 +1044,16 @@
   const hoverState = new Map();
 
   // 图例直接显示各曲线当前值，多线面板无需悬停即可读数。
-  const applyLegendValues = (group, series) => {
+  const applyLegendValues = (group, records) => {
     const panel = document.querySelector(`[data-group="${group.id}"]`);
     if (!panel) return;
-    const latest = new Map(series.map(item => [
-      item.metric.field_id,
-      item.points[item.points.length - 1]?.value ?? null
-    ]));
+    const latest = records[records.length - 1];
     panel.querySelectorAll(".tag[data-metric]").forEach(tag => {
       const slot = tag.querySelector(".tag-value");
       if (!slot) return;
       const fieldId = tag.dataset.metric;
       const metric = registry.get(fieldId);
-      slot.textContent = latest.has(fieldId)
-        ? formatMetric(metric, latest.get(fieldId))
-        : "";
+      slot.textContent = metric ? formatMetric(metric, metricValue(latest, fieldId)) : "";
     });
   };
 
@@ -964,7 +1123,7 @@
     const time = document.createElement("div");
     time.className = "tooltip-time";
     time.textContent = new Date(rows[0].point.timestamp * 1000)
-      .toLocaleTimeString("zh-CN");
+      .toLocaleTimeString(locale());
     tooltip.appendChild(time);
     rows.forEach(row => {
       const line = document.createElement("div");
@@ -977,7 +1136,7 @@
       if (row.style.dash) swatch.dataset.dash = "true";
       const label = document.createElement("span");
       label.className = "tooltip-label";
-      label.textContent = row.metric.label;
+      label.textContent = fieldLabel(row.metric);
       name.append(swatch, label);
       const value = document.createElement("span");
       value.className = "tooltip-value";
@@ -1016,8 +1175,9 @@
     const domain = context.domain;
     const selected = state.focus[group.id];
     const keys = resolvedKeys(group);
+    applyLegendValues(group, context.records);
     panel.dataset.focus = selected || "";
-    svg.setAttribute("aria-label", `${group.title} 曲线，横轴 Wall Time`);
+    svg.setAttribute("aria-label", t("{title} chart, x-axis Wall Time", {title: group.title}));
 
     const geometry = chartGeometry(panel);
     const {width, height, left, right, top, chartWidth, chartHeight} = geometry;
@@ -1028,7 +1188,8 @@
     if (!domain || !keys.length) {
       delete panel.dataset.yMin;
       delete panel.dataset.yMax;
-      appendText(svg, width / 2, height / 2, "等待指标", "middle", "empty-chart");
+      appendText(svg, width / 2, height / 2,
+        t(keys.length ? "No data in the selected range" : "Selected fields unavailable"), "middle", "empty-chart");
       return;
     }
     const span = domain.maximum - domain.minimum;
@@ -1049,7 +1210,7 @@
       delete panel.dataset.yMin;
       delete panel.dataset.yMax;
       appendText(
-        svg, width / 2, height / 2, "所选范围暂无数据", "middle", "empty-chart"
+        svg, width / 2, height / 2, t("No data in the selected range"), "middle", "empty-chart"
       );
       return;
     }
@@ -1130,7 +1291,6 @@
     });
     // 缓存几何与序列供 crosshair 命中查询，避免每次指针移动重算数据。
     hoverState.set(group.id, {geometry, domain, span, series, xFor, yFor});
-    applyLegendValues(group, series);
   };
 
   const buildRenderContext = () => {
@@ -1142,17 +1302,164 @@
     groups.forEach(group => renderPanel(group, context));
   };
   const renderGroup = group => renderPanel(group, buildRenderContext());
-  const closeAllPickers = () => {
-    document.querySelectorAll(".registry-picker").forEach(element => {
-      element.hidden = true;
-    });
-    document.querySelectorAll(".add-metric").forEach(element => {
-      element.setAttribute("aria-expanded", "false");
-    });
+  const isRequired = (group, metric) => !!group &&
+    (group.required || []).some(selector => matchesMetric(selector, metric));
+  const updateSelectedCount = () => {
+    byId("selected-count").textContent = t("{count} fields selected", {count: selectedFields.size});
+    byId("save-panel").disabled = selectedFields.size === 0;
   };
-  const catalogCandidates = group => {
-    const tracked = new Set(group.keys);
-    return fieldIdsForGroup(group).filter(fieldId => !tracked.has(fieldId));
+  const metricDetails = metric => {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = t("Field details");
+    details.appendChild(summary);
+    if (metric.description) {
+      const description = document.createElement("p");
+      description.textContent = metric.description;
+      details.appendChild(description);
+    }
+    const aggregationNames = {mean: "Weighted Mean (sum / count)", sum: "Sum", min: "Min", max: "Max", latest: "Latest", weighted_mean: "Weighted Mean", not_mergeable: "Producer statistic"};
+    const aggregation = metric.aggregation_kind || metric.statistic;
+    const values = [
+      ["Field", metric.field_id],
+      ["Unit", metric.unit],
+      ["Display unit", metric.display_unit || metric.unit],
+      ["Aggregation", aggregationNames[aggregation] || aggregation],
+      ["Scope", metric.scope],
+      ["Denominator", metric.denominator || "N/A"],
+      ["Window", metric.window_kind === "1m" ? "Trailing 1 min of reports" :
+        metric.window_kind === "latest_metric_event" ? "Latest update" : metric.window_kind],
+      ["Source", metric.source_instance || metric.owner_component]
+    ];
+    const list = document.createElement("dl");
+    values.forEach(([label, value]) => {
+      if (value === undefined) return;
+      const key = document.createElement("dt");
+      key.textContent = label;
+      const text = document.createElement("dd");
+      text.textContent = String(value);
+      list.append(key, text);
+    });
+    details.appendChild(list);
+    const query = new URLSearchParams({field: metric.field_id, window: EVENT_WINDOW});
+    const command = document.createElement("a");
+    command.href = `/api/metrics/query?${query}`;
+    command.target = "_blank";
+    command.rel = "noopener";
+    command.textContent = t("Read field data") + ` · GET ${command.getAttribute("href")}`;
+    details.appendChild(command);
+    return details;
+  };
+  const renderMetricChoices = () => {
+    const list = byId("metric-list");
+    list.replaceChildren();
+    const category = byId("metric-category").value;
+    const query = byId("metric-search").value.trim().toLocaleLowerCase();
+    const rewardSection = metric => metric.group === "reward"
+      ? metric.denominator || "" : null;
+    const sectionOrder = metric => {
+      const section = rewardSection(metric);
+      return section === null ? 0 : section === "transition" ? 1 : section === "agent_episode" ? 2 : 3;
+    };
+    const candidates = [...registry.values()].filter(metric =>
+      (!category || metric.group === category) &&
+      (!query || [metric.label, metric.field_id, metric.metric_id, metric.series_id, metric.source_label]
+        .filter(Boolean).join(" ").toLocaleLowerCase().includes(query))
+    ).sort((a, b) => sectionOrder(a) - sectionOrder(b) ||
+      (rewardSection(a) || "").localeCompare(rewardSection(b) || "") ||
+      Number(selectedFields.has(b.series_id)) - Number(selectedFields.has(a.series_id)));
+    let previousSection = null;
+    candidates.forEach(metric => {
+      const section = rewardSection(metric);
+      if (section !== null && section !== previousSection) {
+        const heading = document.createElement("h3");
+        heading.className = "metric-section-title";
+        const title = {transition: "Per Transition", agent_episode: "Per Agent Episode"}[section]
+          || section || "Other Reward Fields";
+        heading.textContent = category === "reward" ? title : `Reward · ${title}`;
+        list.appendChild(heading);
+      }
+      previousSection = section;
+      const row = document.createElement("div");
+      row.className = "metric-choice";
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selectedFields.has(metric.series_id);
+      checkbox.disabled = isRequired(editingGroup, metric);
+      checkbox.setAttribute("aria-label", fieldLabel(metric));
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selectedFields.add(metric.series_id);
+        else selectedFields.delete(metric.series_id);
+        updateSelectedCount();
+      });
+      const name = document.createElement("span");
+      name.className = "choice-label";
+      name.textContent = fieldLabel(metric);
+      const metadata = document.createElement("span");
+      metadata.className = "choice-meta";
+      metadata.textContent = [metric.display_unit || metric.unit,
+        metric.source_label, checkbox.disabled ? t("Required") : ""].filter(Boolean).join(" · ");
+      label.append(checkbox, name, metadata);
+      row.append(label, metricDetails(metric));
+      list.appendChild(row);
+    });
+    // A missing field does not prove a missing registration; retain the selection.
+    [...selectedFields].filter(id => !registry.has(id)).forEach(selector => {
+      const row = document.createElement("div");
+      row.className = "metric-choice";
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = true;
+      checkbox.disabled = (editingGroup?.required || []).includes(selector);
+      const text = document.createElement("span");
+      text.className = "choice-label";
+      const name = selector.startsWith("registered/")
+        ? decodeURIComponent(selector.split("/").pop()) : selector;
+      text.textContent = t("{name} · Field unavailable", {name: name});
+      checkbox.addEventListener("change", () => {
+        selectedFields.delete(selector);
+        renderMetricChoices();
+      });
+      label.append(checkbox, text);
+      row.appendChild(label);
+      list.appendChild(row);
+    });
+    if (!candidates.length) {
+      const empty = document.createElement("p");
+      empty.className = "registry-empty";
+      empty.textContent = t("No matching fields");
+      list.appendChild(empty);
+    }
+    updateSelectedCount();
+  };
+  const openEditor = group => {
+    editingGroup = group;
+    selectedFields = new Set(group?.keys || []);
+    [...(group?.required || []), ...(group?.selections || [])].forEach(selector => {
+      if (![...registry.values()].some(metric => matchesMetric(selector, metric))) {
+        selectedFields.add(selector);
+      }
+    });
+    byId("editor-title").textContent = group ? t("Edit panel · {title}", {title: group.title}) : t("Create panel");
+    byId("save-panel").textContent = group ? t("Save panel") : t("Create panel");
+    byId("panel-name").value = group?.title || "";
+    byId("metric-search").value = "";
+    const select = byId("metric-category");
+    select.replaceChildren();
+    [{id: "", label: "All fields"}, ...categories].forEach(category => {
+      const option = document.createElement("option");
+      option.value = category.id;
+      option.textContent = t(category.label);
+      select.appendChild(option);
+    });
+    // A panel's category organizes the dashboard; it does not restrict which
+    // registered fields can be added to that panel.
+    select.value = "";
+    renderCollectionStatus(state.latest);
+    renderMetricChoices();
+    byId("metric-editor").showModal();
   };
 
   function refreshPanelControls(group) {
@@ -1160,12 +1467,11 @@
     if (!panel) return;
     normalizeFocus(group);
     const tags = panel.querySelector(".tags");
-    const picker = panel.querySelector(".registry-picker");
     // 仅在标签集合发生结构变化时重建 DOM；每轮轮询无条件重建会丢失键盘焦点、
     // 重置候选列表的展开状态，并让图例数值闪烁。
-    const signature = `${
+    const signature = `${language}:${
       groupSupportsAll(group) ? (isUniformGroup(group) ? "all|" : "same|") : ""
-    }${group.keys.join(",")}`;
+    }${group.keys.map(id => `${id}:${fieldLabel(registry.get(id))}`).join(",")}`;
     if (tags.dataset.signature !== signature) {
       tags.replaceChildren();
       const addTag = (fieldId, label, style) => {
@@ -1176,8 +1482,8 @@
         button.setAttribute(
           "aria-label",
           fieldId === "all"
-            ? `显示 ${group.title} 同量纲全部曲线`
-            : `在 ${group.title} 聚焦 ${label}`
+            ? t("Show all {title} curves with the same unit", {title: group.title})
+            : t("Focus {label} in {title}", {title: group.title, label: label})
         );
         const swatch = document.createElement("span");
         swatch.className = "swatch";
@@ -1189,6 +1495,7 @@
         value.className = "tag-value";
         button.append(swatch, text, value);
         button.addEventListener("click", () => {
+          group.focusChosen = true;
           state.focus[group.id] = fieldId;
           // 记录锚点量纲，使聚合视图显示与该指标同量纲的曲线。
           if (fieldId !== "all") state.anchor[group.id] = fieldId;
@@ -1200,7 +1507,7 @@
       if (groupSupportsAll(group)) {
         addTag(
           "all",
-          isUniformGroup(group) ? "全部" : "同类",
+          isUniformGroup(group) ? t("All") : t("Same unit"),
           {color: "var(--secondary)", dash: false}
         );
       }
@@ -1208,7 +1515,7 @@
         const metric = registry.get(fieldId);
         if (!metric) return;
         const style = styleFor(group, fieldId);
-        addTag(fieldId, metric.label, {
+        addTag(fieldId, fieldLabel(metric), {
           color: `var(${style.color})`,
           dash: style.dash
         });
@@ -1217,16 +1524,9 @@
       const add = document.createElement("button");
       add.type = "button";
       add.className = "add-metric";
-      add.textContent = "＋";
-      add.setAttribute("aria-label", `向 ${group.title} 添加追踪变量`);
-      add.setAttribute("aria-expanded", String(!picker.hidden));
-      add.addEventListener("click", () => {
-        const open = picker.hidden;
-        closeAllPickers();
-        picker.hidden = !open;
-        add.setAttribute("aria-expanded", String(open));
-        if (open) refreshPicker(group, picker);
-      });
+      add.textContent = t("＋ Fields");
+      add.setAttribute("aria-label", t("Add fields to {title}", {title: group.title}));
+      add.addEventListener("click", () => openEditor(group));
       tags.appendChild(add);
       tags.dataset.signature = signature;
     }
@@ -1238,63 +1538,38 @@
     });
   }
 
-  const refreshPicker = (group, picker) => {
-    picker.replaceChildren();
-    const candidates = catalogCandidates(group);
-    if (!candidates.length) {
-      const empty = document.createElement("div");
-      empty.className = "registry-empty";
-      empty.textContent = "暂无可添加变量";
-      picker.appendChild(empty);
-      return;
-    }
-    candidates.forEach(fieldId => {
-      const metric = registry.get(fieldId);
-      const option = document.createElement("button");
-      option.type = "button";
-      option.className = "registry-option";
-      option.setAttribute(
-        "aria-label",
-        `添加 ${metric.label}，字段 ID ${metric.field_id}`
-      );
-      const label = document.createElement("span");
-      label.textContent = metric.label;
-      const id = document.createElement("span");
-      id.className = "registry-id";
-      id.textContent = metric.field_id;
-      option.append(label, id);
-      option.addEventListener("click", () => {
-        if (!group.keys.includes(fieldId)) group.keys.push(fieldId);
-        state.focus[group.id] = fieldId;
-        state.anchor[group.id] = fieldId;
-        closeAllPickers();
-        assignGroupStyles(group);
-        refreshPanelControls(group);
-        renderGroup(group);
-      });
-      picker.appendChild(option);
-    });
-  };
-
   const buildPanels = () => {
     const grid = byId("panel-grid");
+    grid.replaceChildren();
     groups.forEach(group => {
       const panel = document.createElement("section");
       panel.className = "panel";
       panel.dataset.group = group.id;
-      panel.setAttribute("aria-label", `${group.title} 独立统计面板`);
+      panel.setAttribute("aria-label", t("{title} panel", {title: group.title}));
       const head = document.createElement("div");
       head.className = "panel-head";
       const title = document.createElement("h2");
       title.className = "panel-title";
       title.textContent = group.title;
       head.appendChild(title);
+      if (group.custom) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "refresh-button";
+        remove.textContent = t("Remove");
+        remove.setAttribute("aria-label", t("Remove panel {title}", {title: group.title}));
+        remove.addEventListener("click", () => {
+          groups.splice(groups.indexOf(group), 1);
+          groupById.delete(group.id);
+          hoverState.delete(group.id);
+          panel.remove();
+          saveLayout();
+        });
+        head.appendChild(remove);
+      }
       const tags = document.createElement("div");
       tags.className = "tags";
-      tags.setAttribute("aria-label", `${group.title} 曲线标签`);
-      const picker = document.createElement("div");
-      picker.className = "registry-picker";
-      picker.hidden = true;
+      tags.setAttribute("aria-label", t("{title} chart tabs", {title: group.title}));
       const wrap = document.createElement("div");
       wrap.className = "chart-wrap";
       const chart = svgElement("svg", {
@@ -1307,7 +1582,7 @@
       wrap.append(chart, tooltip);
       chart.addEventListener("pointermove", event => showTooltip(group, event));
       chart.addEventListener("pointerleave", () => hideTooltip(panel));
-      panel.append(head, tags, picker, wrap);
+      panel.append(head, tags, wrap);
       grid.appendChild(panel);
       refreshPanelControls(group);
       renderGroup(group);
@@ -1329,11 +1604,15 @@
   };
   // 关闭自动刷新后画面会停在最后一次拉取的数据上，
   // 必须显式提示，否则容易被误读为训练已停止。
-  const updateRefreshNote = (text) => {
-    const suffix = state.refreshMs > 0 ? "" : " · 自动刷新已关闭";
-    if (text !== undefined) state.lastRefreshText = text;
-    byId("last-refresh").textContent =
-      `${state.lastRefreshText || "尚未刷新"}${suffix}`;
+  const updateRefreshNote = (event) => {
+    const suffix = state.refreshMs > 0 ? "" : t(" · Auto refresh is off");
+    if (event) {
+      state.lastRefreshAt = new Date();
+      state.lastRefreshEvent = event;
+    }
+    byId("last-refresh").textContent = (state.lastRefreshAt
+      ? t(state.lastRefreshEvent, {time: state.lastRefreshAt.toLocaleTimeString(locale())})
+      : t("Not refreshed yet")) + suffix;
   };
   // 当前所有面板追踪的字段并集：历史端点按此裁剪响应，
   // 未裁剪时单次 24h 响应可达 20MB 量级。
@@ -1378,14 +1657,14 @@
       state.historyFetchedAt = Date.now();
       state.historyAvailable = true;
       byId("history-status").textContent = state.historyRecords.length
-        ? `历史点 ${formatInteger(state.historyRecords.length)}`
-        : "暂无历史数据";
+        ? t("History points: {count}", {count: formatInteger(state.historyRecords.length)})
+        : t("No history yet");
     } catch (error) {
       state.historyAvailable = false;
       state.historyRecords = [];
       state.historyRange = "";
       state.historyCursor = 0;
-      byId("history-status").textContent = "历史层不可用，仅显示保留段";
+      byId("history-status").textContent = t("History unavailable; showing retained data");
     }
   };
   const ingest = records => {
@@ -1413,7 +1692,26 @@
       ? Number(latest.sequence)
       : 0;
   };
+  const collectionIssue = record => {
+    const relayState = record?.metric_events?.aiserver_relay?.state;
+    if (["rejected", "failed", "unavailable"].includes(relayState)) {
+      return "AIServer metrics unavailable";
+    }
+    if (["projection_error", "incomplete", "unavailable"].includes(record?.metric_event_views?.status)) {
+      return "Metric data incomplete";
+    }
+    return ["starting", "waiting"].includes(relayState) ? "Waiting for AIServer metrics" : "";
+  };
+  const renderCollectionStatus = record => {
+    const issue = collectionIssue(record);
+    const message = byId("metric-collection-status");
+    message.hidden = !issue;
+    message.textContent = issue ? t(issue) : "";
+    message.title = record?.metric_events?.aiserver_relay?.last_error || "";
+  };
   const renderStatus = (status, record) => {
+    const mode = status?.mode;
+    byId("training-workload").textContent = mode ? mode[0].toUpperCase() + mode.slice(1) : "—";
     const actor = record?.actor || {};
     const metricsAvailable = finiteNumber(status?.latest_sequence) !== null;
     const learnerConnected = status?.service === "learner-metrics" && metricsAvailable;
@@ -1446,63 +1744,71 @@
       : serverPresent ? "1 / 1" : "0 / 1";
     setStatus(
       byId("learner-state"),
-      !learnerConnected ? "指标不可用" : freshnessUnavailable ? "时效未知" : stale ? "等待指标" : "运行中",
+      !learnerConnected ? t("Metrics unavailable") : freshnessUnavailable ? t("Freshness unknown") : stale ? t("Waiting for metrics") : t("Running"),
       !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
     );
     setStatus(
       byId("server-state"),
-      serverReady ? "运行中" :
-        stale && actor.instance_id ? "状态过期" :
-        actor.error ? "异常" :
-        !serverPresent ? "未连接" :
-        actor.state === "AISERVER_STATE_DRAINING" ? "正在停止" :
-        actor.state === "AISERVER_STATE_STOPPED" ? "已停止" :
-        !hasActiveModel ? "模型同步中" :
-        !clientConnected ? "等待 Client" : "启动中",
+      serverReady ? t("Running") :
+        stale && actor.instance_id ? t("Stale state") :
+        actor.error ? t("Error") :
+        !serverPresent ? t("Disconnected") :
+        actor.state === "AISERVER_STATE_DRAINING" ? t("Stopping") :
+        actor.state === "AISERVER_STATE_STOPPED" ? t("Stopped") :
+        !hasActiveModel ? t("Syncing model") :
+        !clientConnected ? t("Waiting for Client") : t("Starting"),
       serverReady ? "ok" : actor.error ? "bad" : "wait"
     );
-    let modelSyncText = "等待模型信息";
+    let modelSyncText = t("Waiting for model information");
     if (!serverPresent) {
-      modelSyncText = "等待 AIServer 与 Client";
+      modelSyncText = t("Waiting for AIServer and Client");
     } else if (!hasActiveModel) {
-      modelSyncText = "等待首个可用模型";
+      modelSyncText = t("Waiting for the first model");
     } else if (latestModelStep === null) {
-      modelSyncText = `当前 step ${formatInteger(activeModelStep)}`;
+      modelSyncText = t("Active step {step}", {step: formatInteger(activeModelStep)});
     } else if (activeModelStep < latestModelStep) {
       const staged = stagedModelStep !== null &&
         stagedModelStep > activeModelStep
-        ? ` · 已暂存 step ${formatInteger(stagedModelStep)}`
+        ? t(" · Staged step {step}", {step: formatInteger(stagedModelStep)})
         : "";
-      modelSyncText = `当前 step ${formatInteger(activeModelStep)}` + staged +
-        ` · 最新 step ${formatInteger(latestModelStep)}` +
-        ` · 追赶 ${formatInteger(latestModelStep - activeModelStep)}`;
+      modelSyncText = t("Active step {step}", {step: formatInteger(activeModelStep)}) + staged +
+        t(" · Latest step {step}", {step: formatInteger(latestModelStep)}) +
+        t(" · Lag {steps}", {steps: formatInteger(latestModelStep - activeModelStep)});
     } else if (activeModelStep === latestModelStep) {
-      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 已同步`;
+      modelSyncText = t("Active step {step} · Synced", {step: formatInteger(activeModelStep)});
     } else {
-      modelSyncText = `当前 step ${formatInteger(activeModelStep)} · 分发状态待刷新`;
+      modelSyncText = t("Active step {step} · Distribution status pending", {step: formatInteger(activeModelStep)});
+    }
+    const feedback = record?.actor?.model_feedback;
+    if (feedback?.last_error) {
+      modelSyncText += t(" · Update failed [{stage}]: {error}", {stage: feedback.stage, error: feedback.last_error});
     }
     byId("server-model-sync").textContent = modelSyncText;
+    const issue = collectionIssue(record);
+    renderCollectionStatus(record);
     setStatus(
       byId("live-status"),
-      !learnerConnected ? "连接失败" :
-        freshnessUnavailable ? "指标时效不可用" :
-        stale ? "指标已过期" : "实时",
-      !learnerConnected ? "bad" : freshnessUnavailable || stale ? "wait" : "ok"
+      !learnerConnected ? t("Connection failed") :
+        freshnessUnavailable ? t("Metric freshness unavailable") :
+        stale ? t("Metrics stale") : issue ? t(issue) : t("Live"),
+      !learnerConnected ? "bad" : freshnessUnavailable || stale || issue ? "wait" : "ok"
     );
     byId("run-context").textContent =
-      `Learner / ${status?.metrics_source_id || "等待训练实例"}`;
+      `Learner / ${status?.metrics_source_id || t("Waiting for a training instance")}`;
     const eventViewStatus = record?.metric_event_views?.status;
-    const latestEventUpdate = finiteNumber(
-      record?.metric_event_views?.train_updates?.latest?.values?.latest_train_update_sequence
-    );
-    const eventNote = eventViewStatus === "incomplete"
-      ? ` · 历史事件存在缺口${latestEventUpdate === null ? "" :
-          `，最新 Update ${formatInteger(latestEventUpdate)}`}`
-      : eventViewStatus === "unavailable" ? " · 历史事件不可用" : "";
+    const projectionErrors = Object.values(record?.metric_event_views?.sources || {})
+      .filter(source => source.last_error)
+      .map(source => `${source.instance_id} #${source.last_error.event_sequence}: ${source.last_error.message}`);
+    const relay = record?.metric_events?.aiserver_relay;
+    const eventNote = eventViewStatus === "projection_error"
+      ? t(" · Metric projection failed: ") + projectionErrors.join("; ")
+      : eventViewStatus === "incomplete" ? t(" · Metric history incomplete")
+      : eventViewStatus === "unavailable" ? t(" · Event history unavailable") : "";
     byId("stream-status").textContent =
-      `指标流：${status?.stream || "—"} · ` +
+      t("Metric stream: {stream} · ", {stream: status?.stream || "—"}) +
       `stale=${status?.stale_status || "unavailable"} · ` +
-      `sequence ${formatInteger(status?.latest_sequence)}` + eventNote;
+      `sequence ${formatInteger(status?.latest_sequence)}` + eventNote +
+      (["rejected", "failed", "unavailable"].includes(relay?.state) ? t(" · Metric relay {state}: {error}", {state: relay.state, error: relay.last_error}) : "");
   };
   const renderSummary = record => {
     const modelStep = metricValue(record, MODEL_STEP_ID);
@@ -1533,16 +1839,22 @@
       const sourceChanged = state.sourceId !== status.metrics_source_id;
       if (sourceChanged) resetStream(status.metrics_source_id);
       await refreshCatalog(sourceChanged || registry.size === 0);
-      const metricsResponse = await fetch(
-        `/api/metrics?after_sequence=${encodeURIComponent(state.cursor)}` +
-        `&window=${EVENT_WINDOW}`,
-        {cache: "no-store"}
-      );
+      const fields = [...new Set([
+        ...groups.flatMap(group => group.keys.map(id => registry.get(id).field_id)),
+        MODEL_STEP_ID, TRAIN_UPDATE_ID, TRAINED_SAMPLES_ID, PRODUCED_SAMPLES_ID
+      ])].sort();
+      const signature = JSON.stringify(fields);
+      const after = signature === state.queriedFields ? state.cursor : 0;
+      const query = new URLSearchParams({after_sequence: String(after), window: EVENT_WINDOW});
+      fields.forEach(field => query.append("field", field));
+      const metricsResponse = await fetch(`/api/metrics/query?${query}`, {cache: "no-store"});
       if (!metricsResponse.ok) {
         throw new Error(`metrics HTTP ${metricsResponse.status}`);
       }
       const document = await metricsResponse.json();
       ingest(document.records || []);
+      state.queriedFields = signature;
+      state.latest = document.latest || {};
       if (HISTORY_RANGES.has(state.timeRange)) {
         const historyStale = Date.now() - state.historyFetchedAt > 60000;
         if (state.historyRange !== state.timeRange || historyStale) {
@@ -1550,23 +1862,23 @@
         }
       }
       state.status = status;
-      const latest = state.records[state.records.length - 1] || {};
+      const latest = state.latest;
       renderStatus(status, latest);
       renderSummary(latest);
       groups.forEach(refreshPanelControls);
       renderAllPanels();
       updateRefreshNote(
-        `最近刷新 ${new Date().toLocaleTimeString("zh-CN")}`
+        "Updated {time}"
       );
     } catch (error) {
-      setStatus(byId("live-status"), "连接失败", "bad");
-      setStatus(byId("learner-state"), "未连接", "bad");
-      setStatus(byId("server-state"), "状态未知", "bad");
+      setStatus(byId("live-status"), t("Connection failed"), "bad");
+      setStatus(byId("learner-state"), t("Disconnected"), "bad");
+      setStatus(byId("server-state"), t("State unknown"), "bad");
       byId("learner-count").textContent = "— / 1";
       byId("server-count").textContent = "— / 1";
-      byId("stream-status").textContent = `指标流：${String(error)}`;
+      byId("stream-status").textContent = t("Metric stream: {error}", {error: String(error)});
       updateRefreshNote(
-        `连接中断 ${new Date().toLocaleTimeString("zh-CN")}`
+        "Disconnected {time}"
       );
     } finally {
       state.polling = false;
@@ -1575,10 +1887,11 @@
 
   const populateSelect = (id, options, current) => {
     const select = byId(id);
+    select.replaceChildren();
     options.forEach(option => {
       const element = document.createElement("option");
       element.value = option.key;
-      element.textContent = option.label;
+      element.textContent = t(option.label);
       select.appendChild(element);
     });
     select.value = current;
@@ -1595,7 +1908,7 @@
     state.domains.clear();
     // 历史档需要等待数据到位后再统一渲染，避免"先空后满"的两段式闪烁。
     if (HISTORY_RANGES.has(state.timeRange)) {
-      byId("history-status").textContent = "正在加载历史…";
+      byId("history-status").textContent = t("Loading history…");
     }
     await loadHistory(true);
     renderAllPanels();
@@ -1606,6 +1919,51 @@
     applyRefreshInterval();
   });
   byId("refresh-now").addEventListener("click", () => poll());
+  byId("create-panel").addEventListener("click", () => openEditor(null));
+  byId("close-editor").addEventListener("click", () => byId("metric-editor").close());
+  byId("metric-category").addEventListener("change", renderMetricChoices);
+  byId("metric-search").addEventListener("input", renderMetricChoices);
+  byId("reset-panels").addEventListener("click", async () => {
+    state.focus = {};
+    state.anchor = {};
+    state.domains.clear();
+    initializeGroups(null);
+    saveLayout();
+    await poll();
+    await loadHistory(true);
+    renderAllPanels();
+  });
+  byId("panel-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const title = byId("panel-name").value.trim();
+    if (!title || !selectedFields.size) return;
+    const selections = [...selectedFields].map(fieldId => {
+      const metric = registry.get(fieldId);
+      // Follow the logical field across runs. When the catalog contains multiple
+      // sources for it, preserve the particular series selected in the editor.
+      return metric?.metric_id &&
+        [...registry.values()].filter(item => item.metric_id === metric.metric_id).length === 1
+        ? metric.metric_id : fieldId;
+    });
+    let group = editingGroup;
+    if (group) {
+      group.title = title;
+      group.selections = selections;
+      resolveGroup(group);
+    } else {
+      group = addGroup({
+        id: `custom-${crypto.randomUUID()}`, title, custom: true,
+        category: byId("metric-category").value,
+        selections
+      });
+    }
+    byId("metric-editor").close();
+    buildPanels();
+    saveLayout();
+    await poll();
+    await loadHistory(true);
+    renderAllPanels();
+  });
   // viewBox 依赖容器实际宽度，布局变化后需重算，否则字号与刻度会失配。
   let resizeTimer = null;
   window.addEventListener("resize", () => {
@@ -1616,6 +1974,29 @@
     }, 160);
   });
 
+  byId("language").addEventListener("change", event => {
+    language = event.target.value;
+    try { localStorage.setItem("rl-monitor-language", language); }
+    catch (error) { setLayoutStatus("Could not save layout: {error}", {error: error.message}); }
+    translateStatic();
+    if (state.layoutNotice) setLayoutStatus(state.layoutNotice.key, state.layoutNotice.values);
+    populateSelect("time-range", TIME_RANGES, state.timeRange);
+    populateSelect("refresh-interval", REFRESH_INTERVALS, REFRESH_INTERVALS.find(item => item.ms === state.refreshMs).key);
+    buildPanels();
+    renderStatus(state.status, state.latest);
+    renderSummary(state.latest);
+    updateRefreshNote();
+    if (HISTORY_RANGES.has(state.timeRange)) {
+      byId("history-status").textContent = !state.historyAvailable
+        ? t("History unavailable; showing retained data")
+        : state.historyRecords.length ? t("History points: {count}", {count: formatInteger(state.historyRecords.length)}) : t("No history yet");
+    }
+    if (byId("metric-editor").open) {
+      byId("metric-editor").close();
+      openEditor(editingGroup);
+    }
+  });
+  translateStatic();
   populateSelect("time-range", TIME_RANGES, state.timeRange);
   populateSelect("refresh-interval", REFRESH_INTERVALS, "5s");
   buildPanels();
