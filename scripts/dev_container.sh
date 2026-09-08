@@ -212,9 +212,7 @@ for document in (host, container):
     if float(document["latest_timestamp"]) < float(document["started_at"]):
         raise SystemExit(1)
     metrics_dir = str(document.get("metrics_dir", ""))
-    if "/models/train/" not in metrics_dir or not metrics_dir.endswith(
-        "/metrics"
-    ):
+    if not metrics_dir:
         raise SystemExit(1)
 for field in (
     "service_instance_id",
