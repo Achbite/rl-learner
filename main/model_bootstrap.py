@@ -11,7 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proto import training_pb2
+from proto.training import training_pb2
+from proto.training import model_identity_pb2
 from src.config.effective_config import load_effective_config
 from src.contracts.identity import (
     validate_config,
@@ -42,7 +43,7 @@ def export_initial_model(
         os.fsync(stream.fileno())
     os.replace(temporary, model_path)
     manifest = training_pb2.ModelArtifactManifest(
-        identity=training_pb2.ModelIdentity(
+        identity=model_identity_pb2.ModelIdentity(
             model_lineage_id=config["identity"]["model_lineage_id"],
             model_step=0,
         ),

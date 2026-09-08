@@ -355,7 +355,7 @@
       </label>
     </div>
     <div class="toolbar-group">
-      <span class="toolbar-note" data-i18n="Mean window: 1 min">Mean window: 1 min</span>
+      <span id="mean-window" class="toolbar-note"></span>
       <button id="create-panel" type="button" class="refresh-button"><span data-i18n="＋ Create panel">＋ Create panel</span></button>
       <button id="reset-panels" type="button" class="refresh-button"><span data-i18n="Restore defaults">Restore defaults</span></button>
       <button id="refresh-now" type="button" class="refresh-button"><span data-i18n="Refresh now">Refresh now</span></button>
@@ -406,7 +406,10 @@
     "Available fields": "可选字段",
     "e.g. Advantage / Value": "例如：优势与价值估计",
     "Name or field, e.g. loss, success, task.…": "名称或字段路径，例如 loss、通关率、task.…",
-    "Mean window: 1 min": "均值窗口：1 min",
+    "Mean window: {seconds} s": "均值窗口：{seconds} s",
+    "unreachable": "来源不可达",
+    "no_measurement": "尚无测量",
+    "window_empty": "当前窗口无数据",
     "Layout saved in this browser": "布局已保存在此浏览器",
     "Panel layout must be a list": "窗口配置应为列表",
     "Selected fields unavailable": "所选字段暂不可用",
@@ -427,6 +430,8 @@
     "Metrics unavailable": "指标不可用",
     "AIServer metrics unavailable": "AIServer 指标采集不可用",
     "Metric data incomplete": "指标数据不完整",
+    "Metric catalog unavailable": "指标目录不可用",
+    " · Metric catalog failed: ": " · 指标目录读取失败：",
     "Waiting for AIServer metrics": "等待 AIServer 指标",
     "Freshness unknown": "时效未知",
     "Waiting for metrics": "等待指标",
@@ -494,6 +499,7 @@
     "Training Metrics": "Training Metrics",
     "Training Status": "Training Status"
 };
+  let meanWindowMs = 60000;
   let language = "zh";
   try { language = localStorage.getItem("rl-monitor-language") === "en" ? "en" : "zh"; }
   catch (error) { document.getElementById("layout-status").textContent = `Language preference: ${error.message}`; }
@@ -506,6 +512,7 @@
     document.querySelectorAll("[data-i18n-aria]").forEach(element => element.setAttribute("aria-label", t(element.dataset.i18nAria)));
     document.querySelectorAll("[data-i18n-placeholder]").forEach(element => element.placeholder = t(element.dataset.i18nPlaceholder));
     document.getElementById("language").value = language;
+    document.getElementById("mean-window").textContent = t("Mean window: {seconds} s", {seconds: meanWindowMs / 1000});
   };
 
 
@@ -516,7 +523,7 @@
   const TRAINED_SAMPLES_ID = "learner.trained_samples.total";
   const PRODUCED_SAMPLES_ID = "sample.flow.produced.total";
   // Chart time range and statistic window are independent. Task means use
-  // reports observed in the trailing minute; sum/count supplies the weights.
+  // complete producer intervals in the configured window; sum/count supplies the weights.
   const TIME_RANGES = [
     {key: "1m", label: "Last 1 min", seconds: 60},
     {key: "30m", label: "Last 30 min", seconds: 30 * 60},
@@ -532,7 +539,7 @@
     {key: "5m", label: "Every 5 min", ms: 300000},
     {key: "off", label: "Off", ms: 0}
   ];
-  const EVENT_WINDOW = "1m";
+  const EVENT_WINDOW = "current";
   const HISTORY_RANGES = new Set(["6h", "24h", "all"]);
   const TICK_STEPS_SECONDS = [
     1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
@@ -779,6 +786,8 @@
       [...nextRegistry.keys()].some(id => !registry.has(id));
     registry.clear();
     nextRegistry.forEach((value, key) => registry.set(key, value));
+    meanWindowMs = catalog.mean_window_ms;
+    byId("mean-window").textContent = t("Mean window: {seconds} s", {seconds: meanWindowMs / 1000});
     panelTemplates = catalog.panels;
     categories = catalog.categories;
     if (layoutKey !== catalog.layout_key) {
@@ -1327,7 +1336,7 @@
       ["Aggregation", aggregationNames[aggregation] || aggregation],
       ["Scope", metric.scope],
       ["Denominator", metric.denominator || "N/A"],
-      ["Window", metric.window_kind === "1m" ? "Trailing 1 min of reports" :
+      ["Window", metric.window_kind === "current" ? t("Mean window: {seconds} s", {seconds: meanWindowMs / 1000}) :
         metric.window_kind === "latest_metric_event" ? "Latest update" : metric.window_kind],
       ["Source", metric.source_instance || metric.owner_component]
     ];
@@ -1359,7 +1368,7 @@
       ? metric.denominator || "" : null;
     const sectionOrder = metric => {
       const section = rewardSection(metric);
-      return section === null ? 0 : section === "transition" ? 1 : section === "agent_episode" ? 2 : 3;
+      return section === null ? 0 : section === "agent_episode" ? 1 : section === "transition" ? 2 : 3;
     };
     const candidates = [...registry.values()].filter(metric =>
       (!category || metric.group === category) &&
@@ -1399,7 +1408,7 @@
       const metadata = document.createElement("span");
       metadata.className = "choice-meta";
       metadata.textContent = [metric.display_unit || metric.unit,
-        metric.source_label, checkbox.disabled ? t("Required") : ""].filter(Boolean).join(" · ");
+        metric.source_label, metric.availability && metric.availability !== "available" ? t(metric.availability) : "", checkbox.disabled ? t("Required") : ""].filter(Boolean).join(" · ");
       label.append(checkbox, name, metadata);
       row.append(label, metricDetails(metric));
       list.appendChild(row);
@@ -1459,6 +1468,7 @@
     select.value = "";
     renderCollectionStatus(state.latest);
     renderMetricChoices();
+    byId("metric-list").scrollTop = 0;
     byId("metric-editor").showModal();
   };
 
@@ -1693,6 +1703,9 @@
       : 0;
   };
   const collectionIssue = record => {
+    if (Object.keys(record?.metric_event_views?.catalog_errors || {}).length) {
+      return "Metric catalog unavailable";
+    }
     const relayState = record?.metric_events?.aiserver_relay?.state;
     if (["rejected", "failed", "unavailable"].includes(relayState)) {
       return "AIServer metrics unavailable";
@@ -1796,6 +1809,8 @@
     byId("run-context").textContent =
       `Learner / ${status?.metrics_source_id || t("Waiting for a training instance")}`;
     const eventViewStatus = record?.metric_event_views?.status;
+    const catalogErrors = Object.entries(record?.metric_event_views?.catalog_errors || {})
+      .map(([role, error]) => `${role}: ${error}`);
     const projectionErrors = Object.values(record?.metric_event_views?.sources || {})
       .filter(source => source.last_error)
       .map(source => `${source.instance_id} #${source.last_error.event_sequence}: ${source.last_error.message}`);
@@ -1808,13 +1823,20 @@
       t("Metric stream: {stream} · ", {stream: status?.stream || "—"}) +
       `stale=${status?.stale_status || "unavailable"} · ` +
       `sequence ${formatInteger(status?.latest_sequence)}` + eventNote +
+      (catalogErrors.length ? t(" · Metric catalog failed: ") + catalogErrors.join("; ") : "") +
       (["rejected", "failed", "unavailable"].includes(relay?.state) ? t(" · Metric relay {state}: {error}", {state: relay.state, error: relay.last_error}) : "");
   };
   const renderSummary = record => {
-    const modelStep = metricValue(record, MODEL_STEP_ID);
-    const trainUpdate = metricValue(record, TRAIN_UPDATE_ID);
-    const trainedSamples = metricValue(record, TRAINED_SAMPLES_ID);
-    const producedSamples = metricValue(record, PRODUCED_SAMPLES_ID);
+    const valueFromSource = (fieldId, source) => {
+      const matches = [...registry.values()].filter(metric =>
+        metric.field_id === fieldId && metric.source_instance === source?.instance_id &&
+        metric.lifecycle_epoch === source?.lifecycle_epoch);
+      return matches.length === 1 ? metricValue(record, matches[0].series_id) : null;
+    };
+    const modelStep = valueFromSource(MODEL_STEP_ID, record?.learner);
+    const trainUpdate = valueFromSource(TRAIN_UPDATE_ID, record?.learner);
+    const trainedSamples = valueFromSource(TRAINED_SAMPLES_ID, record?.learner);
+    const producedSamples = valueFromSource(PRODUCED_SAMPLES_ID, record?.actor);
     byId("model-step").textContent = formatInteger(modelStep);
     byId("train-update").textContent = formatInteger(trainUpdate);
     byId("trained-samples").textContent = formatInteger(trainedSamples);

@@ -118,58 +118,9 @@
   ],
   "fields": [
     {
-      "match": "learner.ppo.policy_loss",
-      "category": "loss"
-    },
-    {
-      "match": "learner.ppo.value_loss",
-      "category": "loss"
-    },
-    {
-      "match": "learner.ppo.total_loss",
-      "category": "loss"
-    },
-    {
-      "match": "learner.ppo.approx_kl",
-      "category": "ppo_stability"
-    },
-    {
-      "match": "learner.ppo.entropy",
-      "category": "ppo_stability"
-    },
-    {
       "match": "learner.ppo.clip_fraction",
-      "category": "ppo_stability",
       "display_unit": "%",
       "display_scale": 100
-    },
-    {
-      "match": "learner.ppo.gradient_norm",
-      "category": "ppo_stability"
-    },
-    {
-      "match": "learner.ppo.policy_lag",
-      "category": "ppo_stability"
-    },
-    {
-      "match": "learner.ppo.raw_advantage",
-      "category": "advantage"
-    },
-    {
-      "match": "learner.ppo.normalized_advantage",
-      "category": "advantage"
-    },
-    {
-      "match": "learner.ppo.return_target",
-      "category": "advantage"
-    },
-    {
-      "match": "learner.ppo.value_prediction",
-      "category": "advantage"
-    },
-    {
-      "match": "learner.update.*",
-      "category": "training_depth"
     }
   ],
   "layout_key": "rl-monitor-panels/training"

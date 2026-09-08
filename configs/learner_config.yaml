@@ -58,7 +58,7 @@ aiserver_status:
 # config disables that relay because Infra is the sole durable consumer for
 # every source.
 metric_events:
-  server_enabled: false
+  server_enabled: true
   server_port: 9006
   aiserver_relay_enabled: true
 
@@ -68,6 +68,8 @@ dashboard:
   enabled: true
   server_port: 9005
   backend: jsonl
+  mean_window_ms: 60000
+  time_bucket_ms: 5000
 
 log:
   console_level: INFO

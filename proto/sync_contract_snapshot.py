@@ -7,14 +7,19 @@ import tempfile
 from pathlib import Path
 
 
-SNAPSHOT_FILES = {
-    "training": {
-        "python/common_pb2.py": "common_pb2.py",
-        "python/training_pb2.py": "training_pb2.py",
-        "python/training_pb2_grpc.py": "training_pb2_grpc.py",
-        "python/training_metrics_pb2.py": "training_metrics_pb2.py",
-    },
-}
+SNAPSHOT_FILES = {'training': {'python/proto/common/identity_pb2.py': 'common/identity_pb2.py',
+              'python/proto/training/model_identity_pb2.py': 'training/model_identity_pb2.py',
+              'python/proto/training/training_pb2.py': 'training/training_pb2.py',
+              'python/proto/metrics/registry_pb2.py': 'metrics/registry_pb2.py',
+              'python/proto/metrics/catalog_pb2.py': 'metrics/catalog_pb2.py',
+              'python/proto/metrics/transport_pb2.py': 'metrics/transport_pb2.py',
+              'python/proto/metrics/training_pb2.py': 'metrics/training_pb2.py',
+              'python/proto/training/training_pb2_grpc.py': 'training/training_pb2_grpc.py',
+              'python/proto/metrics/catalog_pb2_grpc.py': 'metrics/catalog_pb2_grpc.py',
+              'python/proto/metrics/transport_pb2_grpc.py': 'metrics/transport_pb2_grpc.py',
+              'python/proto/common/__init__.py': 'common/__init__.py',
+              'python/proto/training/__init__.py': 'training/__init__.py',
+              'python/proto/metrics/__init__.py': 'metrics/__init__.py'}}
 
 
 def require_regular_file(path: Path) -> None:
@@ -32,9 +37,13 @@ def sync_snapshot(artifact_root: Path, target_root: Path, profile: str) -> None:
         for artifact_name, local_name in files.items():
             source = artifact_root / artifact_name
             require_regular_file(source)
-            shutil.copyfile(source, stage / local_name)
+            staged = stage / local_name
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, staged)
         for local_name in files.values():
-            os.replace(stage / local_name, target_root / local_name)
+            target = target_root / local_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(stage / local_name, target)
 
 
 def main() -> None:

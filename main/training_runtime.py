@@ -20,12 +20,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proto import (
-    common_pb2,
-    training_metrics_pb2,
-    training_pb2,
-    training_pb2_grpc,
-)
+from proto.common import identity_pb2 as common_pb2
+from proto.metrics import training_pb2 as training_metrics_pb2
+from proto.training import training_pb2
+from proto.training import training_pb2_grpc
+from proto.metrics import registry_pb2 as metric_registry_pb2
+from proto.training import model_identity_pb2
 from src.contracts.identity import (
     model_identity_document,
     read_manifest_file,
@@ -37,14 +37,12 @@ from src.config.command_line import parse_startup_arguments
 from src.config.effective_config import effective_config_log, load_effective_config
 from src.log.logger import setup_logger
 from src.metrics.metric_events import (
-    AIServerMetricRelay,
-    LocalMetricProjector,
     LocalTrainUpdateMetricWriter,
     MetricEventContractError,
     RawMetricBatchStore,
     create_learner_metric_event_server,
 )
-from src.metrics.metrics_backend import DisabledMetricsBackend, create_backend
+from src.preview.collector import PreviewCollector
 from src.training.ppo_trainer import PPOTrainer
 
 
@@ -123,134 +121,6 @@ def atomic_write_json(path: Path, document: dict) -> None:
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _identity_dict(document: dict | None) -> dict:
-    if not document:
-        return {}
-    identity = document.get("identity", document)
-    return {
-        "model_lineage_id": str(identity.get("model_lineage_id", "")),
-        "model_step": int(identity.get("model_step", -1)),
-    }
-
-
-def _identity_equal(left: dict | None, right: dict | None) -> bool:
-    return bool(left and right) and _identity_dict(left) == _identity_dict(right)
-
-
-def training_chain_status(
-    actor: dict,
-    sample_pool: dict,
-    learner: dict,
-    model: dict,
-    error: str = "",
-) -> dict:
-    """Return task-neutral readiness from exact service/model identities."""
-    reasons: list[str] = []
-    if error:
-        reasons.append("learner_update_error")
-    for name, document in (
-        ("actor", actor),
-        ("sample_pool", sample_pool),
-        ("model_distributor", model),
-    ):
-        if document.get("error"):
-            reasons.append(f"{name}_status_error")
-        if not document.get("ready"):
-            reasons.append(f"{name}_not_ready")
-        if not document.get("instance_id"):
-            reasons.append(f"{name}_instance_missing")
-    if sample_pool.get("ingress_ready") is not True:
-        reasons.append("sample_pool_ingress_ready_false")
-
-    learner_model = learner.get("model_identity", {})
-    actor_model = actor.get("model_identity", {})
-    published_model = model.get("latest_model_identity", {})
-    acknowledged_model = model.get("latest_ack_model_identity", {})
-    if not _identity_equal(learner_model, published_model):
-        reasons.append("published_model_identity_mismatch")
-    if not _identity_equal(actor_model, acknowledged_model):
-        reasons.append("actor_model_ack_mismatch")
-    if model.get("latest_ack_status") != "MODEL_LOAD_STATUS_LOADED":
-        reasons.append("actor_model_ack_not_loaded")
-
-    learner_step = int(_identity_dict(learner_model).get("model_step", -1))
-    actor_step = int(_identity_dict(actor_model).get("model_step", -1))
-    model_lag = (
-        None
-        if learner_step < 0 or actor_step < 0
-        else learner_step - actor_step
-    )
-
-    feedback = actor.get("model_feedback", {})
-    if feedback.get("last_error"):
-        reasons.append("actor_model_feedback_error")
-    actor_state = str(actor.get("state", ""))
-    actor_lifecycle_ready = actor_state == "AISERVER_STATE_READY"
-    server_pod_reasons: list[str] = []
-    if actor.get("error"):
-        server_pod_reasons.append("actor_status_error")
-    if not actor.get("instance_id"):
-        server_pod_reasons.append("actor_instance_missing")
-    if not actor_lifecycle_ready:
-        server_pod_reasons.append("actor_lifecycle_not_ready")
-    if actor_step < 0:
-        server_pod_reasons.append("active_model_missing")
-
-    staged_step = int(
-        _identity_dict(actor.get("staged_model_identity", {})).get(
-            "model_step", -1
-        )
-    )
-    latest_step = int(
-        _identity_dict(published_model).get("model_step", -1)
-    )
-    if actor_step < 0:
-        model_sync_state = "waiting_for_initial_model"
-        model_sync_lag = None
-    elif latest_step < 0:
-        model_sync_state = "unknown"
-        model_sync_lag = None
-    elif actor_step < latest_step:
-        model_sync_state = "catching_up"
-        model_sync_lag = latest_step - actor_step
-    elif actor_step == latest_step:
-        model_sync_state = "synchronized"
-        model_sync_lag = 0
-    else:
-        model_sync_state = "actor_ahead"
-        model_sync_lag = actor_step - latest_step
-    if feedback.get("last_error"):
-        model_sync_state = "failed"
-    return {
-        "ready": not reasons,
-        "state": "ready" if not reasons else "degraded",
-        "reasons": reasons,
-        "model_lag": model_lag,
-        "server_pod": {
-            "ready": not server_pod_reasons,
-            "state": (
-                "running" if not server_pod_reasons else "not_ready"
-            ),
-            "reasons": server_pod_reasons,
-        },
-        "model_sync": {
-            "state": model_sync_state,
-            "feedback": feedback,
-            "active_model_step": (
-                None if actor_step < 0 else actor_step
-            ),
-            "staged_model_step": (
-                None if staged_step < 0 else staged_step
-            ),
-            "latest_model_step": (
-                None if latest_step < 0 else latest_step
-            ),
-            "lag": model_sync_lag,
-        },
-        "error": error,
-    }
 
 
 class ModelPublisher:
@@ -629,7 +499,7 @@ class ModelPublisher:
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
             manifest = training_pb2.ModelArtifactManifest(
-                identity=training_pb2.ModelIdentity(
+                identity=model_identity_pb2.ModelIdentity(
                     model_lineage_id=self.lineage_id,
                     model_step=step,
                 ),
@@ -997,7 +867,6 @@ class TrainingRuntime:
         self.metrics_source_id = str(
             os.environ.get("RL_METRICS_SOURCE_ID", "")
         )
-        self.sequence = 0
         self.train_updates = 0
         self.trained_samples = 0
         self._run_start_train_updates = 0
@@ -1021,7 +890,6 @@ class TrainingRuntime:
             "error": "",
         }
         self._metrics_lock = threading.RLock()
-        self._metrics_poll_lock = threading.Lock()
         self._committed_learner_metrics = {
             "model_identity": {},
             "model_step": self.trainer.model_step,
@@ -1029,15 +897,6 @@ class TrainingRuntime:
             "run_train_updates": self.train_updates,
             "run_trained_samples": self.trained_samples,
         }
-        self._metrics_stop = threading.Event()
-        self._metrics_thread: threading.Thread | None = None
-        self._rate_snapshot: dict[str, object] = {}
-        self._last_actor_snapshot: dict = {}
-        self._last_sample_pool_snapshot: dict = {}
-        self._last_model_snapshot: dict = {}
-        self._last_resource_time = time.monotonic()
-        self._last_process_cpu = time.process_time()
-
         self.publisher.prepare()
         model_path = str(config["model"].get("initial_model_path") or "")
         if model_path:
@@ -1093,18 +952,10 @@ class TrainingRuntime:
         self.actor_stub = training_pb2_grpc.AIServerTrainingStatusServiceStub(
             self.actor_channel
         )
-        self.metric_event_stub = training_pb2_grpc.MetricEventServiceStub(
-            self.actor_channel
-        )
 
         dashboard = config["dashboard"]
-        self.metrics_backend = self._create_metrics_backend(
-            str(dashboard["backend"]), str(self.publisher.metrics_dir)
-        )
         self.metric_event_store: RawMetricBatchStore | None = None
         self.metric_event_writer: LocalTrainUpdateMetricWriter | None = None
-        self.metric_event_relay: AIServerMetricRelay | None = None
-        self.metric_event_projector: LocalMetricProjector | None = None
         self.metric_event_server = None
         self.metric_event_server_started = False
         self.metric_event_server_port = int(
@@ -1117,17 +968,19 @@ class TrainingRuntime:
             config["metric_events"]["aiserver_relay_enabled"]
         )
         self._initialize_metric_events()
-
-    def _create_metrics_backend(self, backend_type: str, metrics_dir: str):
-        try:
-            return create_backend(backend_type, metrics_dir)
-        except OSError as error:
-            self.logger.error(
-                "metrics backend unavailable; training will continue without "
-                "local metrics persistence: %s",
-                error,
+        self.preview = None
+        if dashboard["enabled"]:
+            self.preview = PreviewCollector(
+                endpoints={"learner": f"127.0.0.1:{self.metric_event_server_port}",
+                           "aiserver": self.actor_address, "sample_pool": self.sample_address,
+                           "distributor": self.model_address},
+                learner_source=self.learner_service, source_id=self.metrics_source_id,
+                directory=self.publisher.metrics_dir, backend=dashboard["backend"], logger=self.logger,
+                collect_aiserver=self.metric_event_relay_enabled,
+                mean_window_ms=dashboard.get("mean_window_ms", 60000),
+                bucket_ms=dashboard.get("time_bucket_ms", 5000),
             )
-            return DisabledMetricsBackend(str(error))
+
 
     def _initialize_metric_events(self) -> None:
         store: RawMetricBatchStore | None = None
@@ -1140,23 +993,15 @@ class TrainingRuntime:
                 self.learner_service,
                 initial_train_update_sequence=self.train_updates,
             )
-            relay = None
-            if self.metric_event_relay_enabled:
-                relay = AIServerMetricRelay(
-                    store=store,
-                    consumer=self.learner_service,
-                    status_stub=self.actor_stub,
-                    event_stub=self.metric_event_stub,
-                    logger=self.logger,
-                )
             event_server = None
             if self.metric_event_server_enabled:
                 event_server = create_learner_metric_event_server(
                     store=store,
                     source=self.learner_service,
                     port=self.metric_event_server_port,
+                    writer=writer,
+                    status_snapshot=self._learner_metrics_snapshot,
                 )
-            projector = LocalMetricProjector(store)
         except (OSError, MetricEventContractError, RuntimeError) as error:
             if store is not None:
                 try:
@@ -1169,8 +1014,6 @@ class TrainingRuntime:
             raise
         self.metric_event_store = store
         self.metric_event_writer = writer
-        self.metric_event_relay = relay
-        self.metric_event_projector = projector
         self.metric_event_server = event_server
 
     def _publish_metric_ready(self) -> None:
@@ -1213,7 +1056,6 @@ class TrainingRuntime:
     def _stop_metric_events(self) -> None:
         writer = getattr(self, "metric_event_writer", None)
         store = getattr(self, "metric_event_store", None)
-        relay = getattr(self, "metric_event_relay", None)
         server = getattr(self, "metric_event_server", None)
         if writer is not None:
             try:
@@ -1254,8 +1096,8 @@ class TrainingRuntime:
                 self.logger.error(
                     "Learner metric final ACK wait failed: %s", error
                 )
-        if relay is not None:
-            relay.close()
+        if self.preview is not None:
+            self.preview.close()
         if server is not None:
             try:
                 server.stop(2.0).wait(timeout=3.0)
@@ -1269,45 +1111,6 @@ class TrainingRuntime:
                 store.close()
             except Exception as error:
                 self.logger.error("metric-event store close failed: %s", error)
-
-    def _metric_event_snapshot(self) -> dict:
-        store = getattr(self, "metric_event_store", None)
-        if store is None:
-            return {
-                "enabled": False,
-                "incomplete": True,
-                "reason": "uninitialized",
-            }
-        try:
-            snapshot = store.snapshot()
-            relay = getattr(self, "metric_event_relay", None)
-            if relay is not None:
-                snapshot["aiserver_relay"] = relay.snapshot()
-            snapshot["raw_service"] = {
-                "enabled": self.metric_event_server_enabled,
-                "started": self.metric_event_server_started,
-                "container_port": self.metric_event_server_port,
-            }
-            return snapshot
-        except Exception as error:
-            return {
-                "enabled": False,
-                "incomplete": True,
-                "reason": str(error),
-            }
-
-    def _metric_event_view_snapshot(self) -> dict:
-        projector = getattr(self, "metric_event_projector", None)
-        if projector is None:
-            return {
-                "status": "unavailable",
-                "reason": "uninitialized",
-            }
-        try:
-            return projector.snapshot()
-        except Exception as error:
-            self.logger.error("metric-event projection failed: %s", error)
-            return {"status": "incomplete", "reason": str(error)}
 
     @staticmethod
     def _model_distributor_authority(
@@ -1503,7 +1306,7 @@ class TrainingRuntime:
             raise ValueError(
                 "initial model lookup requires exactly one selector"
             )
-        selector = training_pb2.ModelIdentity(
+        selector = model_identity_pb2.ModelIdentity(
             model_lineage_id=self.publisher.lineage_id,
             model_step=0 if model_step is None else int(model_step),
         )
@@ -1902,9 +1705,8 @@ class TrainingRuntime:
                 model_step,
             )
             return False
-        relay = getattr(self, "metric_event_relay", None)
-        if relay is not None:
-            relay.start(aiserver_source)
+        if self.preview is not None:
+            self.preview.bind_aiserver(aiserver_source)
         self._commit_learner_metrics(
             document,
             behavior_model={},
@@ -2041,7 +1843,7 @@ class TrainingRuntime:
 
     def _resolvable_model_identity(
         self, step: int
-    ) -> training_pb2.ModelIdentity | None:
+    ) -> model_identity_pb2.ModelIdentity | None:
         document = self.model_manifests.get(int(step))
         if not isinstance(document, dict):
             return None
@@ -2974,385 +2776,6 @@ class TrainingRuntime:
             if rollback is not None and not rollback.get("retained"):
                 self._discard_update_rollback(rollback)
 
-    @staticmethod
-    def _component_error_snapshot(component: str, error: str) -> dict:
-        return {
-            "component": component,
-            "ready": False,
-            "error": error,
-            "timestamp": time.time(),
-        }
-
-    @staticmethod
-    def _raw_mean(raw_sum: float, count: int) -> float | None:
-        if count < 0 or not math.isfinite(raw_sum):
-            raise ValueError("raw sum/count metric is invalid")
-        return None if count == 0 else raw_sum / count
-
-    def _actor_snapshot(self) -> dict:
-        try:
-            status = self.actor_stub.GetAIServerStatus(
-                training_pb2.AIServerStatusReq(), timeout=1.5
-            )
-            self._aiserver_authority(status.aiserver)
-            inference_count = int(status.inference_count)
-            push_rpc_count = int(status.push_rpc_count)
-            segment_close_counts = {
-                training_pb2.SegmentCloseReason.Name(item.reason): int(
-                    item.count
-                )
-                for item in status.segment_close_counts
-            }
-            return {
-                "ready": bool(status.ready),
-                "state": training_pb2.AIServerState.Name(status.state),
-                "instance_id": status.aiserver.instance_id,
-                "lifecycle_epoch": int(status.aiserver.lifecycle_epoch),
-                "active_sessions": int(
-                    status.active_actor_session_count
-                ),
-                "active_segments": int(status.active_segment_count),
-                "model_identity": model_identity_document(status.loaded_model),
-                "model_feedback": {
-                    "candidate_model": model_identity_document(status.model_feedback.candidate_model),
-                    "stage": status.model_feedback.stage,
-                    "last_error": status.model_feedback.last_error,
-                },
-                "staged_model_identity": model_identity_document(
-                    status.staged_model
-                ),
-                "produced": int(status.produced_unique_transitions),
-                "produced_envelopes": int(
-                    status.produced_unique_envelopes
-                ),
-                "accepted": int(status.accepted_unique_transitions),
-                "push_attempts": int(status.push_attempt_count),
-                "duplicate_push_attempts": int(
-                    status.duplicate_push_attempt_count
-                ),
-                "rejected_push_attempts": int(
-                    status.rejected_push_attempt_count
-                ),
-                "retry_attempts": int(status.retry_attempt_count),
-                "final_drop": int(status.final_drop_unique_transitions),
-                "outbound_queue_envelopes": int(
-                    status.outbound_queue_envelopes
-                ),
-                "outbound_queue_transitions": int(
-                    status.outbound_queue_transitions
-                ),
-                "outbound_queue_estimated_bytes": int(
-                    status.outbound_queue_estimated_bytes
-                ),
-                "outbound_queue_high_watermark": int(
-                    status.outbound_queue_high_watermark
-                ),
-                "inference_count": inference_count,
-                "inference_latency_sum_ms": float(
-                    status.inference_latency_sum_ms
-                ),
-                "inference_mean_ms": self._raw_mean(
-                    float(status.inference_latency_sum_ms), inference_count
-                ),
-                "inference_max_ms": (
-                    None
-                    if inference_count == 0
-                    else float(status.inference_latency_max_ms)
-                ),
-                "push_rpc_count": push_rpc_count,
-                "push_rpc_latency_sum_ms": float(
-                    status.push_rpc_latency_sum_ms
-                ),
-                "push_rpc_mean_ms": self._raw_mean(
-                    float(status.push_rpc_latency_sum_ms), push_rpc_count
-                ),
-                "push_rpc_max_ms": (
-                    None
-                    if push_rpc_count == 0
-                    else float(status.push_rpc_latency_max_ms)
-                ),
-                "closed_segment_count": int(status.closed_segment_count),
-                "segment_close_counts": segment_close_counts,
-                "pending_action_excluded_count": int(
-                    status.pending_action_excluded_count
-                ),
-                "rollout_estimator_failure_count": int(
-                    status.rollout_estimator_failure_count
-                ),
-                "per_agent_model_activation_count": int(
-                    status.per_agent_model_activation_count
-                ),
-                "superseded_without_agent_activation_count": int(
-                    status.superseded_without_agent_activation_count
-                ),
-                "quarantined_transition_count": int(
-                    status.quarantined_transition_count
-                ),
-                "quarantined_envelope_count": int(
-                    status.quarantined_envelope_count
-                ),
-                "error": status.last_error,
-                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
-            }
-        except (grpc.RpcError, RuntimeError, ValueError) as error:
-            return self._component_error_snapshot("aiserver", str(error))
-
-    def _sample_pool_snapshot(self) -> dict:
-        try:
-            status = self._sample_pool_status()
-            authority = self._sample_pool_authority(status.sample_pool)
-            return {
-                "ready": bool(status.ready),
-                "ingress_ready": bool(status.ingress_ready),
-                "pool_ready": bool(status.pool_ready),
-                "component": authority.component,
-                "instance_id": authority.instance_id,
-                "lifecycle_epoch": int(authority.lifecycle_epoch),
-                "backend_type": training_pb2.SampleBackendType.Name(
-                    status.backend_type
-                ),
-                "push_attempt_count": int(status.push_attempt_count),
-                "accepted": int(status.accepted_unique_transitions),
-                "accepted_envelopes": int(
-                    status.accepted_unique_envelopes
-                ),
-                "duplicate_push_attempt_count": int(
-                    status.duplicate_push_attempt_count
-                ),
-                "duplicate_transition_attempts": int(
-                    status.duplicate_transition_attempts
-                ),
-                "rejected_push_attempt_count": int(
-                    status.rejected_push_attempt_count
-                ),
-                "rejected_transition_attempts": int(
-                    status.rejected_transition_attempts
-                ),
-                "acked": int(status.acked_unique_transitions),
-                "acked_deliveries": int(status.acked_unique_deliveries),
-                "trained": int(status.trained_transition_count),
-                "invalid": int(status.invalid_transition_count),
-                "shutdown_untrained": int(
-                    status.shutdown_untrained_transition_count
-                ),
-                "finalized": bool(status.finalized),
-                "finalization_id": status.finalization_id,
-                "finalized_at_unix_ms": (
-                    int(status.finalized_at_unix_ms)
-                    if self._has_field(status, "finalized_at_unix_ms")
-                    else None
-                ),
-                "finalized_transitions": int(
-                    status.finalized_transition_count
-                ),
-                "ready_transitions": int(status.ready_transitions),
-                "leased_transitions": int(status.leased_transitions),
-                "resident_transitions": int(status.resident_transitions),
-                "resident_envelopes": int(status.resident_envelopes),
-                "resident_estimated_bytes": int(
-                    status.resident_estimated_bytes
-                ),
-                "capacity_transitions": int(status.capacity_transitions),
-                "capacity_bytes": int(status.capacity_bytes),
-                "pressure_state": training_pb2.PressureState.Name(
-                    status.pressure_state
-                ),
-                "evicted_transitions": int(
-                    status.evicted_transition_count
-                ),
-                "evicted_envelopes": int(status.evicted_envelope_count),
-                "unsampled_evicted_transitions": int(
-                    status.unsampled_evicted_transition_count
-                ),
-                "previously_drawn_evicted_transitions": int(
-                    status.previously_drawn_evicted_transition_count
-                ),
-                "draw_attempt_count": int(status.draw_attempt_count),
-                "drawn_transition_slot_count": int(
-                    status.drawn_transition_slot_count
-                ),
-                "target_hit_count": int(status.target_hit_count),
-                "partial_get_count": int(status.partial_get_count),
-                "empty_timeout_count": int(status.empty_timeout_count),
-                "redelivery_count": int(status.redelivery_count),
-                "nack_count": int(status.nack_count),
-                "expired_lease_count": int(status.expired_lease_count),
-                "lease_renew_count": int(status.lease_renew_count),
-                "oldest_ready_transition_age_ms": (
-                    int(status.oldest_ready_transition_age_ms)
-                    if self._has_field(
-                        status, "oldest_ready_transition_age_ms"
-                    )
-                    else None
-                ),
-                "minimum_ready_model_step": (
-                    int(status.minimum_ready_model_step)
-                    if self._has_field(status, "minimum_ready_model_step")
-                    else None
-                ),
-                "maximum_ready_model_step": (
-                    int(status.maximum_ready_model_step)
-                    if self._has_field(status, "maximum_ready_model_step")
-                    else None
-                ),
-                "last_error": status.last_error,
-                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
-            }
-        except (grpc.RpcError, RuntimeError) as error:
-            return self._component_error_snapshot(
-                "sample-pool", str(error)
-            )
-
-    def _model_snapshot(self) -> dict:
-        try:
-            status = self.model_stub.GetModelDistributorStatus(
-                training_pb2.ModelDistributorStatusReq(), timeout=1.5
-            )
-            authority = self._model_distributor_authority(
-                status.distributor
-            )
-            available_range = self._validate_model_status_available_range(
-                status
-            )
-            return {
-                "ready": bool(status.ready),
-                "component": authority.component,
-                "instance_id": authority.instance_id,
-                "lifecycle_epoch": int(authority.lifecycle_epoch),
-                "registered_model_count": int(status.registered_model_count),
-                "latest_model_identity": model_identity_document(
-                    status.latest_model
-                ),
-                "latest_ack_model_identity": model_identity_document(
-                    status.latest_ack_model
-                ),
-                "latest_ack_status": training_pb2.ModelLoadStatus.Name(
-                    status.latest_ack_status
-                ),
-                "latest_ack_aiserver": status.latest_ack_aiserver.instance_id,
-                "available_floor_model_step": (
-                    None if available_range is None else available_range[0]
-                ),
-                "latest_available_model_step": (
-                    None if available_range is None else available_range[1]
-                ),
-                "last_error": status.last_error,
-                "timestamp": int(status.timestamp_unix_ms) / 1000.0,
-            }
-        except (grpc.RpcError, RuntimeError, ValueError) as error:
-            return self._component_error_snapshot(
-                "model-distributor", str(error)
-            )
-
-    def _resource_snapshot(self) -> dict:
-        now = time.monotonic()
-        process_cpu = time.process_time()
-        elapsed = now - self._last_resource_time
-        cpu_delta = process_cpu - self._last_process_cpu
-        cpu = None if elapsed <= 0.0 else cpu_delta / elapsed * 100.0
-        self._last_resource_time = now
-        self._last_process_cpu = process_cpu
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss_mb = float(usage.ru_maxrss) / 1024.0
-        if sys.platform == "darwin":
-            rss_mb /= 1024.0
-        return {
-            "cpu_percent": cpu,
-            "process_cpu_seconds_delta": cpu_delta,
-            "window_seconds": elapsed,
-            "memory_mb": rss_mb,
-        }
-
-    def _rates(self, actor: dict, sample_pool: dict, timestamp: float) -> dict:
-        sources = {
-            "produced": actor,
-            "accepted": sample_pool,
-            "acked": sample_pool,
-            "trained": sample_pool,
-        }
-        counters: dict[str, object] = {
-            "timestamp": timestamp,
-            "actor_instance_id": actor.get("instance_id"),
-            "sample_pool_instance_id": sample_pool.get("instance_id"),
-        }
-        missing = [
-            name
-            for name, source in sources.items()
-            if source.get("error") or name not in source
-        ]
-        if missing:
-            return {
-                "available": False,
-                "reason": "missing_counter",
-                "missing_counters": missing,
-                "window_seconds": None,
-            }
-        counters.update(
-            {name: float(source[name]) for name, source in sources.items()}
-        )
-        previous = self._rate_snapshot
-        self._rate_snapshot = counters
-        if not previous:
-            return {
-                "available": False,
-                "reason": "initial_snapshot",
-                "missing_counters": [],
-                "window_seconds": None,
-            }
-        if (
-            counters["actor_instance_id"]
-            != previous.get("actor_instance_id")
-            or counters["sample_pool_instance_id"]
-            != previous.get("sample_pool_instance_id")
-        ):
-            return {
-                "available": False,
-                "reason": "source_identity_changed",
-                "missing_counters": [],
-                "window_seconds": None,
-                "previous_actor_instance_id": previous.get(
-                    "actor_instance_id"
-                ),
-                "actor_instance_id": counters["actor_instance_id"],
-                "previous_sample_pool_instance_id": previous.get(
-                    "sample_pool_instance_id"
-                ),
-                "sample_pool_instance_id": counters[
-                    "sample_pool_instance_id"
-                ],
-            }
-        elapsed = timestamp - float(previous["timestamp"])
-        if elapsed <= 0:
-            return {
-                "available": False,
-                "reason": "non_positive_window",
-                "missing_counters": [],
-                "window_seconds": elapsed,
-            }
-        deltas = {
-            name: counters[name] - float(previous[name])
-            for name in sources
-        }
-        if any(delta < 0.0 for delta in deltas.values()):
-            return {
-                "available": False,
-                "reason": "counter_regression",
-                "missing_counters": [],
-                "window_seconds": elapsed,
-                **{f"{name}_delta": delta for name, delta in deltas.items()},
-            }
-        return {
-            "available": True,
-            "reason": "",
-            "missing_counters": [],
-            "window_seconds": elapsed,
-            **{f"{name}_delta": delta for name, delta in deltas.items()},
-            **{
-                f"{name}_sps": delta / elapsed
-                for name, delta in deltas.items()
-            },
-        }
-
     def _commit_learner_metrics(
         self,
         manifest: dict,
@@ -3463,7 +2886,7 @@ class TrainingRuntime:
                     f"PPO raw sum/count is invalid: {field_id}"
                 )
             statistics.append(
-                training_pb2.RawMetricSumCount(
+                metric_registry_pb2.RawMetricSumCount(
                     field_id=field_id,
                     sum=raw_sum,
                     count=count,
@@ -3526,85 +2949,9 @@ class TrainingRuntime:
             "optimizer_step_count": context.get("optimizer_step_count"),
             "behavior_model": context.get("behavior_model", {}),
             "disposition": context.get("disposition", ""),
+            "error": context.get("error", ""),
             "train_update_id": context.get("train_update_id", ""),
         }
-
-    def _record_metrics(self) -> None:
-        # Observability is intentionally outside the PPO transaction lock.
-        # Component RPC latency and metrics-file I/O must never block model
-        # update, registration, or sample settlement.
-        with self._metrics_poll_lock:
-            actor = self._actor_snapshot()
-            sample_pool = self._sample_pool_snapshot()
-            model = self._model_snapshot()
-            now = time.time()
-            learner = self._learner_metrics_snapshot()
-            with self._metrics_lock:
-                context = copy.deepcopy(self._metrics_context)
-                self.sequence += 1
-                sequence = self.sequence
-                rates = self._rates(actor, sample_pool, now)
-            chain = training_chain_status(
-                actor,
-                sample_pool,
-                learner,
-                model,
-                str(context.get("error", "")),
-            )
-            record = {
-                "mode": "training",
-                "metrics_source_id": self.metrics_source_id,
-                "sequence": sequence,
-                "timestamp": now,
-                "interval_ms": (
-                    None
-                    if rates.get("window_seconds") is None
-                    else float(rates["window_seconds"]) * 1000.0
-                ),
-                "configured_poll_interval_ms": 1000,
-                "learner": learner,
-                "actor": actor,
-                "sample_pool": sample_pool,
-                "model": model,
-                "chain": chain,
-                "rates": rates,
-                "resources": {"learner": self._resource_snapshot()},
-                "metric_events": self._metric_event_snapshot(),
-                "metric_event_views": self._metric_event_view_snapshot(),
-            }
-            self.metrics_backend.write(record)
-            with self._metrics_lock:
-                self._last_actor_snapshot = actor
-                self._last_sample_pool_snapshot = sample_pool
-                self._last_model_snapshot = model
-
-    def _record_metrics_best_effort(self, phase: str) -> None:
-        try:
-            self._record_metrics()
-        except Exception as error:
-            self.logger.error(
-                "metrics snapshot failed during %s: %s", phase, error
-            )
-
-    def _metrics_loop(self) -> None:
-        while not self._metrics_stop.wait(1.0):
-            try:
-                self._record_metrics()
-            except Exception as error:
-                self.logger.error("metrics snapshot failed: %s", error)
-
-    def _start_metrics(self) -> None:
-        self._metrics_thread = threading.Thread(
-            target=self._metrics_loop,
-            name="learner-metrics",
-            daemon=True,
-        )
-        self._metrics_thread.start()
-
-    def _stop_metrics(self) -> None:
-        self._metrics_stop.set()
-        if self._metrics_thread:
-            self._metrics_thread.join(timeout=3.0)
 
     def _shutdown_sample_authority(
         self,
@@ -3884,7 +3231,8 @@ class TrainingRuntime:
     def run(self) -> int:
         try:
             self._start_metric_events()
-            self._start_metrics()
+            if self.preview is not None:
+                self.preview.start()
             ready_authority = None
             if self._initialize_models():
                 ready_authority = self._wait_for_sample_pool()
@@ -3927,22 +3275,19 @@ class TrainingRuntime:
                 ready_authority
             )
             self._shutdown_finalize_sample_pool(shutdown_authority)
-            self._record_metrics_best_effort("graceful shutdown")
+            if self.preview is not None:
+                self.preview.record_best_effort("graceful shutdown")
             return 0
         except Exception as error:
             with self._metrics_lock:
                 self._metrics_context["error"] = str(error)
                 self._metrics_context["disposition"] = "FAILED"
             self.logger.exception("Learner training failed")
-            self._record_metrics_best_effort("failure reporting")
+            if self.preview is not None:
+                self.preview.record_best_effort("failure reporting")
             return 1
         finally:
-            self._stop_metrics()
             self._stop_metric_events()
-            try:
-                self.metrics_backend.close()
-            except Exception as error:
-                self.logger.error("metrics backend close failed: %s", error)
             self.actor_channel.close()
             self.model_channel.close()
             self.sample_channel.close()

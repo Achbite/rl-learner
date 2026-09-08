@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 import time
 from collections import deque
 
 from google.protobuf.message import DecodeError
-from proto import training_pb2 as wire
+from proto.metrics import catalog_pb2 as metric_catalog_pb2
+from proto.metrics import registry_pb2 as metric_registry_pb2
+from proto.metrics import transport_pb2 as metric_transport_pb2
 
 
 class MetricDefinitionError(ValueError):
@@ -21,16 +24,16 @@ def _validate_definition(definition):
                 definition.unit, definition.scope)):
         raise MetricDefinitionError("metric definition is incomplete")
     if definition.value_type not in (
-        wire.METRIC_VALUE_TYPE_SCALAR, wire.METRIC_VALUE_TYPE_UNSIGNED,
-        wire.METRIC_VALUE_TYPE_SUM_COUNT,
+        metric_registry_pb2.METRIC_VALUE_TYPE_SCALAR, metric_registry_pb2.METRIC_VALUE_TYPE_UNSIGNED,
+        metric_registry_pb2.METRIC_VALUE_TYPE_SUM_COUNT,
     ) or definition.aggregation not in (
-        wire.METRIC_AGGREGATION_LATEST, wire.METRIC_AGGREGATION_SUM,
-        wire.METRIC_AGGREGATION_MIN, wire.METRIC_AGGREGATION_MAX,
-        wire.METRIC_AGGREGATION_MEAN,
+        metric_registry_pb2.METRIC_AGGREGATION_LATEST, metric_registry_pb2.METRIC_AGGREGATION_SUM,
+        metric_registry_pb2.METRIC_AGGREGATION_MIN, metric_registry_pb2.METRIC_AGGREGATION_MAX,
+        metric_registry_pb2.METRIC_AGGREGATION_MEAN,
     ):
         raise MetricDefinitionError(f"unsupported metric definition: {definition.metric_id}")
-    mean = definition.aggregation == wire.METRIC_AGGREGATION_MEAN
-    if mean != (definition.value_type == wire.METRIC_VALUE_TYPE_SUM_COUNT):
+    mean = definition.aggregation == metric_registry_pb2.METRIC_AGGREGATION_MEAN
+    if mean != (definition.value_type == metric_registry_pb2.METRIC_VALUE_TYPE_SUM_COUNT):
         raise MetricDefinitionError("MEAN requires SUM_COUNT; scalar means are invalid")
     if mean != bool(definition.denominator):
         raise MetricDefinitionError("only MEAN requires a denominator")
@@ -43,11 +46,12 @@ class MetricRegistry:
         self._definitions = {}
 
     def register(self, metric_id, *, unit, scope, value_type, aggregation,
-                 denominator="", display_name=None):
-        definition = wire.MetricDefinition(
+                 denominator="", display_name=None, category="custom", description=""):
+        definition = metric_registry_pb2.MetricDefinition(
             metric_id=metric_id, display_name=display_name or metric_id,
             unit=unit, scope=scope, value_type=value_type,
             aggregation=aggregation, denominator=denominator,
+            category=category, description=description,
         )
         previous = self._definitions.get(metric_id)
         if previous is not None:
@@ -58,6 +62,12 @@ class MetricRegistry:
         self._definitions[metric_id] = definition
         return metric_id
 
+    def catalog(self, source):
+        return metric_catalog_pb2.GetMetricCatalogRsp(source=source, entries=[
+            metric_catalog_pb2.MetricCatalogEntry(definition=self._definitions[name])
+            for name in sorted(self._definitions)
+        ])
+
     def record(self, points, *, attributes=None):
         points = list(points)
         try:
@@ -65,7 +75,7 @@ class MetricRegistry:
                            for name in sorted({p.metric_id for p in points})]
         except KeyError as error:
             raise MetricDefinitionError(f"unregistered metric: {error.args[0]}") from error
-        record = wire.RegisteredMetricRecord(
+        record = metric_registry_pb2.RegisteredMetricRecord(
             definitions=definitions, points=points, attributes=attributes or {},
         )
         _validate_points(points, self._definitions)
@@ -91,14 +101,18 @@ def _validate_points(points, definitions):
     if not points:
         raise MetricDefinitionError("metric record has no points")
     expected = {
-        wire.METRIC_VALUE_TYPE_SCALAR: "scalar",
-        wire.METRIC_VALUE_TYPE_UNSIGNED: "unsigned_value",
-        wire.METRIC_VALUE_TYPE_SUM_COUNT: "sum_count",
+        metric_registry_pb2.METRIC_VALUE_TYPE_SCALAR: "scalar",
+        metric_registry_pb2.METRIC_VALUE_TYPE_UNSIGNED: "unsigned_value",
+        metric_registry_pb2.METRIC_VALUE_TYPE_SUM_COUNT: "sum_count",
     }
     for point in points:
         definition = definitions.get(point.metric_id)
         if definition is None:
             raise MetricDefinitionError(f"record lacks definition: {point.metric_id}")
+        has_start = point.HasField("interval_start_unix_ms")
+        has_end = point.HasField("interval_end_unix_ms")
+        if has_start != has_end or (has_start and point.interval_start_unix_ms > point.interval_end_unix_ms):
+            raise MetricDefinitionError(f"invalid metric interval: {point.metric_id}")
         kind = point.WhichOneof("value")
         if kind != expected[definition.value_type]:
             raise MetricDefinitionError(f"metric value type differs: {point.metric_id}")
@@ -111,17 +125,17 @@ def _validate_points(points, definitions):
 
 
 def _merge_value(totals, name, operation, value):
-    if operation == wire.METRIC_AGGREGATION_MEAN:
+    if operation == metric_registry_pb2.METRIC_AGGREGATION_MEAN:
         raw = totals.setdefault(name, {"sum": 0.0, "count": 0})
         raw["sum"] += value["sum"]
         raw["count"] += value["count"]
-    elif name not in totals or operation == wire.METRIC_AGGREGATION_LATEST:
+    elif name not in totals or operation == metric_registry_pb2.METRIC_AGGREGATION_LATEST:
         totals[name] = value
-    elif operation == wire.METRIC_AGGREGATION_SUM:
+    elif operation == metric_registry_pb2.METRIC_AGGREGATION_SUM:
         totals[name] += value
-    elif operation == wire.METRIC_AGGREGATION_MIN:
+    elif operation == metric_registry_pb2.METRIC_AGGREGATION_MIN:
         totals[name] = min(totals[name], value)
-    elif operation == wire.METRIC_AGGREGATION_MAX:
+    elif operation == metric_registry_pb2.METRIC_AGGREGATION_MAX:
         totals[name] = max(totals[name], value)
 
 
@@ -133,10 +147,15 @@ def _merge(totals, definitions, points):
         _merge_value(totals, point.metric_id, definitions[point.metric_id].aggregation, value)
 
 
-def _render(totals):
-    return {name: {"value": raw["sum"] / raw["count"], **raw}
-            if isinstance(raw, dict) else {"value": raw}
-            for name, raw in totals.items()}
+def _render(totals, coverage=None):
+    rendered = {name: {"value": raw["sum"] / raw["count"], **raw}
+                if isinstance(raw, dict) else {"value": raw}
+                for name, raw in totals.items()}
+    if coverage is not None:
+        for name, value in rendered.items():
+            value.update(interval_start_unix_ms=coverage[name][0],
+                         interval_end_unix_ms=coverage[name][1])
+    return rendered
 
 
 class LocalMetricProjector:
@@ -144,29 +163,52 @@ class LocalMetricProjector:
 
     TIME_WINDOWS_MS = {"5s": 5_000, "1m": 60_000, "1h": 3_600_000, "24h": 86_400_000}
 
-    def __init__(self, store, *, clock=time.time):
+    def __init__(self, store, *, clock=time.time, bucket_ms=5000, mean_window_ms=60000):
         self.store = store
+        self.bucket_ms = bucket_ms
+        self.mean_window_ms = mean_window_ms
         self._clock = clock
         self._lock = threading.Lock()
         self._row_id = 0
         self._sources = {}
 
+    def _state(self, key, role, source):
+        return self._sources.setdefault(key, {
+            "role": role, "component": source.component, "instance_id": source.instance_id,
+            "lifecycle_epoch": int(source.lifecycle_epoch), "definitions": {}, "origins": {},
+            "totals": {}, "latest": {}, "recent": deque(maxlen=100), "buckets": {},
+            "maximum_observed_at": 0, "event_count": 0, "error_count": 0, "last_error": None,
+        })
+
+    def register_catalog(self, role, catalog):
+        key = json.dumps([catalog.source.component, catalog.source.instance_id,
+                          int(catalog.source.lifecycle_epoch)], separators=(",", ":"))
+        with self._lock:
+            state = self._state(key, role, catalog.source)
+            for entry in catalog.entries:
+                definition = entry.definition
+                _validate_definition(definition)
+                previous = state["definitions"].get(definition.metric_id)
+                if previous is not None and previous != definition:
+                    raise MetricDefinitionError(f"metric definition changed: {definition.metric_id}")
+                state["definitions"][definition.metric_id] = copy.deepcopy(definition)
+                state["origins"][definition.metric_id] = {
+                    "status_method": entry.status_method,
+                    "status_field": entry.status_field,
+                    "status_count_field": entry.status_count_field,
+                }
+        return key
+
     def snapshot(self):
         with self._lock:
             snapshot_at = int(self._clock() * 1000)
             for row_id, role, source_key, batch in self.store.committed_batches_after(self._row_id):
-                state = self._sources.setdefault(source_key, {
-                    "role": role, "instance_id": batch.source.instance_id,
-                    "lifecycle_epoch": int(batch.source.lifecycle_epoch),
-                    "definitions": {}, "totals": {}, "latest": {}, "recent": deque(maxlen=100),
-                    "buckets": {}, "maximum_observed_at": 0,
-                    "event_count": 0, "error_count": 0, "last_error": None,
-                })
+                state = self._state(source_key, role, batch.source)
                 for event in batch.events:
                     try:
-                        if event.fact_kind != wire.METRIC_FACT_KIND_REGISTERED_METRICS:
+                        if event.fact_kind != metric_transport_pb2.METRIC_FACT_KIND_REGISTERED_METRICS:
                             raise MetricDefinitionError("unsupported metric fact kind")
-                        record = wire.RegisteredMetricRecord.FromString(event.fact_payload)
+                        record = metric_registry_pb2.RegisteredMetricRecord.FromString(event.fact_payload)
                         definitions = validate_record(record, state["definitions"])
                     except (DecodeError, MetricDefinitionError) as error:
                         state["error_count"] += 1
@@ -183,11 +225,19 @@ class LocalMetricProjector:
                     state["latest"].update(latest)
                     observed_at = int(event.observed_at_unix_ms)
                     state["maximum_observed_at"] = max(state["maximum_observed_at"], observed_at)
-                    bucket = observed_at // 5000 * 5000
-                    bucket_state = state["buckets"].setdefault(bucket, {"totals": {}, "sequences": {}})
-                    _merge(bucket_state["totals"], definitions, record.points)
-                    bucket_state["sequences"].update({p.metric_id: int(event.event_sequence) for p in record.points})
-                    floor = (state["maximum_observed_at"] - self.TIME_WINDOWS_MS["24h"]) // 5000 * 5000
+                    for point in record.points:
+                        end = (int(point.interval_end_unix_ms) if point.HasField("interval_end_unix_ms")
+                               else observed_at)
+                        start = (int(point.interval_start_unix_ms) if point.HasField("interval_start_unix_ms")
+                                 else end)
+                        bucket = (end + self.bucket_ms - 1) // self.bucket_ms * self.bucket_ms
+                        bucket_state = state["buckets"].setdefault(bucket, {
+                            "totals": {}, "sequences": {}, "coverage": {}})
+                        _merge(bucket_state["totals"], definitions, [point])
+                        bucket_state["sequences"][point.metric_id] = int(event.event_sequence)
+                        old = bucket_state["coverage"].get(point.metric_id, (start, end))
+                        bucket_state["coverage"][point.metric_id] = (min(start, old[0]), max(end, old[1]))
+                    floor = (state["maximum_observed_at"] - self.TIME_WINDOWS_MS["24h"]) // self.bucket_ms * self.bucket_ms
                     state["buckets"] = {key: value for key, value in state["buckets"].items() if key >= floor}
                     state["event_count"] += 1
                 # Content errors are retained and reported once. They do not
@@ -202,35 +252,43 @@ class LocalMetricProjector:
                     for _, _, record in list(state["recent"])[-size:]:
                         _merge(totals, state["definitions"], record.points)
                     windows[str(size)] = _render(totals)
-                for label, duration in self.TIME_WINDOWS_MS.items():
+                for label, duration in {**self.TIME_WINDOWS_MS, "current": self.mean_window_ms}.items():
                     totals = {}
                     # A quiet producer must age out of the current window;
                     # anchoring to its last event would keep old rewards fresh.
-                    floor = (snapshot_at - duration + 1) // 5000 * 5000
+                    boundary = snapshot_at // self.bucket_ms * self.bucket_ms
+                    floor = boundary - duration
+                    coverage = {}
                     latest_sequences = {}
                     for bucket, bucket_state in state["buckets"].items():
-                        if bucket < floor or bucket > snapshot_at:
+                        if bucket <= floor or bucket > boundary:
                             continue
                         for name, value in bucket_state["totals"].items():
                             operation = state["definitions"][name].aggregation
                             sequence = bucket_state["sequences"][name]
-                            if operation == wire.METRIC_AGGREGATION_LATEST:
+                            if operation == metric_registry_pb2.METRIC_AGGREGATION_LATEST:
                                 if sequence <= latest_sequences.get(name, 0):
                                     continue
                                 latest_sequences[name] = sequence
                             _merge_value(totals, name, operation, value)
-                    windows[label] = _render(totals)
+                            start, end = bucket_state["coverage"][name]
+                            old = coverage.get(name, (start, end))
+                            coverage[name] = (min(start, old[0]), max(end, old[1]))
+                    windows[label] = _render(totals, coverage)
+                    for value in windows[label].values():
+                        value.update(window_start_unix_ms=floor, window_end_unix_ms=boundary)
                 catalog = {}
                 for name, definition in state["definitions"].items():
                     catalog[name] = {
                         field: getattr(definition, field) for field in (
-                            "metric_id", "display_name", "unit", "scope", "denominator")
+                            "metric_id", "display_name", "unit", "scope", "denominator", "category", "description")
                     }
-                    catalog[name]["value_type"] = wire.MetricValueType.Name(definition.value_type).removeprefix("METRIC_VALUE_TYPE_").lower()
-                    catalog[name]["aggregation"] = wire.MetricAggregation.Name(definition.aggregation).removeprefix("METRIC_AGGREGATION_").lower()
+                    catalog[name].update(state["origins"].get(name, {}))
+                    catalog[name]["value_type"] = metric_registry_pb2.MetricValueType.Name(definition.value_type).removeprefix("METRIC_VALUE_TYPE_").lower()
+                    catalog[name]["aggregation"] = metric_registry_pb2.MetricAggregation.Name(definition.aggregation).removeprefix("METRIC_AGGREGATION_").lower()
                 sources[key] = {
                     field: state[field] for field in (
-                        "role", "instance_id", "lifecycle_epoch", "event_count",
+                        "role", "component", "instance_id", "lifecycle_epoch", "event_count",
                         "error_count", "last_error")
                 }
                 sources[key].update({
@@ -240,7 +298,14 @@ class LocalMetricProjector:
                     "latest_observed_at_unix_ms": state["recent"][-1][1] if state["recent"] else None,
                     "windows": windows,
                     "window_kind": "source_events",
-                    "time_bucket_ms": 5000,
+                    "time_bucket_ms": self.bucket_ms,
+                    "mean_window_ms": self.mean_window_ms,
+                    "query_time_unix_ms": snapshot_at,
+                    "current_intervals": [
+                        {"end_unix_ms": bucket, "values": _render(value["totals"], value["coverage"])}
+                        for bucket, value in sorted(state["buckets"].items())
+                        # Keep the pending boundary for queries after the final snapshot.
+                        if snapshot_at // self.bucket_ms * self.bucket_ms - self.mean_window_ms < bucket],
                     "recent_event_count": len(state["recent"]),
                 })
             status = "provisional"

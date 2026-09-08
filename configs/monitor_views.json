@@ -6,7 +6,7 @@
       "title": "Reward",
       "category": "reward",
       "defaults": [
-        "task.maze.reward.total.per_transition"
+        "task.maze.return"
       ],
       "order": 20
     },
@@ -32,76 +32,24 @@
   ],
   "fields": [
     {
-      "match": "task.maze.reward.total.per_transition",
-      "category": "reward"
-    },
-    {
-      "match": "task.maze.return",
-      "category": "episode"
-    },
-    {
-      "match": "task.maze.return_min",
-      "category": "episode"
-    },
-    {
-      "match": "task.maze.return_max",
-      "category": "episode"
-    },
-    {
       "match": "task.maze.success",
-      "category": "success",
       "display_unit": "%",
       "display_scale": 100
     },
     {
       "match": "task.maze.any_success",
-      "category": "success",
       "display_unit": "%",
       "display_scale": 100
     },
     {
       "match": "task.maze.all_success",
-      "category": "success",
       "display_unit": "%",
       "display_scale": 100
-    },
-    {
-      "match": "task.maze.reward.*.per_episode",
-      "category": "reward"
-    },
-    {
-      "match": "task.maze.reward.*.per_transition",
-      "category": "reward"
-    },
-    {
-      "match": "task.maze.episode_length",
-      "category": "episode"
-    },
-    {
-      "match": "task.maze.unique_cells",
-      "category": "task_metrics"
     },
     {
       "match": "task.maze.blocked_move_rate",
-      "category": "task_metrics",
       "display_unit": "%",
       "display_scale": 100
-    },
-    {
-      "match": "task.maze.path_ratio",
-      "category": "task_metrics"
-    },
-    {
-      "match": "task.maze.agent_episodes",
-      "category": "episode"
-    },
-    {
-      "match": "task.maze.environment_episodes",
-      "category": "episode"
-    },
-    {
-      "match": "task.maze.termination.*",
-      "category": "task_metrics"
     }
   ]
 }

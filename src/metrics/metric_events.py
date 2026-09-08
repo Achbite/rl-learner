@@ -12,12 +12,12 @@ from typing import Callable, Iterable
 
 import grpc
 
-from proto import (
-    common_pb2,
-    training_metrics_pb2,
-    training_pb2,
-    training_pb2_grpc,
-)
+from proto.common import identity_pb2 as common_pb2
+from proto.metrics import training_pb2 as training_metrics_pb2
+from proto.training import training_pb2_grpc
+from proto.metrics import catalog_pb2_grpc as metric_catalog_pb2_grpc
+from proto.metrics import transport_pb2 as metric_transport_pb2
+from proto.metrics import transport_pb2_grpc as metric_transport_pb2_grpc
 
 
 from .registered_metrics import LocalMetricProjector
@@ -61,11 +61,11 @@ def _source_key(source: common_pb2.ServiceInstanceIdentity) -> str:
 
 
 def validate_metric_batch(
-    batch: training_pb2.MetricBatch,
+    batch: metric_transport_pb2.MetricBatch,
     *,
     role: str,
     source: common_pb2.ServiceInstanceIdentity,
-    previous_cursor: training_pb2.MetricBatchCursor,
+    previous_cursor: metric_transport_pb2.MetricBatchCursor,
 ) -> None:
     if role not in SOURCE_ROLES:
         raise MetricEventContractError("metric source role is invalid")
@@ -131,14 +131,14 @@ def validate_metric_batch(
 
 
 def cursor_for_batch(
-    batch: training_pb2.MetricBatch,
-    previous_cursor: training_pb2.MetricBatchCursor,
-) -> training_pb2.MetricBatchCursor:
+    batch: metric_transport_pb2.MetricBatch,
+    previous_cursor: metric_transport_pb2.MetricBatchCursor,
+) -> metric_transport_pb2.MetricBatchCursor:
     if batch.events or batch.HasField("gap"):
         event_sequence = int(batch.last_event_sequence)
     else:
         event_sequence = int(previous_cursor.acknowledged_event_sequence)
-    return training_pb2.MetricBatchCursor(
+    return metric_transport_pb2.MetricBatchCursor(
         source=batch.source,
         acknowledged_batch_sequence=batch.batch_sequence,
         acknowledged_event_sequence=event_sequence,
@@ -246,19 +246,19 @@ class RawMetricBatchStore:
         row: sqlite3.Row,
         *,
         pending: bool,
-    ) -> training_pb2.MetricBatchCursor:
+    ) -> metric_transport_pb2.MetricBatchCursor:
         prefix = "pending" if pending else "committed"
         batch_sequence = row[f"{prefix}_batch_sequence"]
         event_sequence = row[f"{prefix}_event_sequence"]
-        return training_pb2.MetricBatchCursor(
+        return metric_transport_pb2.MetricBatchCursor(
             source=RawMetricBatchStore._row_source(row),
             acknowledged_batch_sequence=int(batch_sequence or 0),
             acknowledged_event_sequence=int(event_sequence or 0),
         )
 
     @staticmethod
-    def _decode_stored_batch(payload: bytes) -> training_pb2.MetricBatch:
-        batch = training_pb2.MetricBatch()
+    def _decode_stored_batch(payload: bytes) -> metric_transport_pb2.MetricBatch:
+        batch = metric_transport_pb2.MetricBatch()
         try:
             batch.ParseFromString(payload)
         except Exception as error:
@@ -345,13 +345,13 @@ class RawMetricBatchStore:
 
     def committed_cursor(
         self, source: common_pb2.ServiceInstanceIdentity
-    ) -> training_pb2.MetricBatchCursor:
+    ) -> metric_transport_pb2.MetricBatchCursor:
         with self._lock:
             return self._row_cursor(self._source_row(source), pending=False)
 
     def pending_cursor(
         self, source: common_pb2.ServiceInstanceIdentity
-    ) -> training_pb2.MetricBatchCursor | None:
+    ) -> metric_transport_pb2.MetricBatchCursor | None:
         with self._lock:
             row = self._source_row(source)
             if row["pending_batch_sequence"] is None:
@@ -360,7 +360,7 @@ class RawMetricBatchStore:
 
     def pending_batch(
         self, source: common_pb2.ServiceInstanceIdentity
-    ) -> training_pb2.MetricBatch | None:
+    ) -> metric_transport_pb2.MetricBatch | None:
         with self._lock:
             row = self._source_row(source)
             sequence = row["pending_batch_sequence"]
@@ -390,8 +390,8 @@ class RawMetricBatchStore:
     def persist_batch(
         self,
         role: str,
-        batch: training_pb2.MetricBatch,
-    ) -> training_pb2.MetricBatchCursor:
+        batch: metric_transport_pb2.MetricBatch,
+    ) -> metric_transport_pb2.MetricBatchCursor:
         self.activate_source(role, batch.source)
         key = _source_key(batch.source)
         now_ms = int(time.time() * 1000)
@@ -473,8 +473,8 @@ class RawMetricBatchStore:
 
     def mark_acknowledged(
         self,
-        batch: training_pb2.MetricBatch,
-        cursor: training_pb2.MetricBatchCursor,
+        batch: metric_transport_pb2.MetricBatch,
+        cursor: metric_transport_pb2.MetricBatchCursor,
     ) -> None:
         key = _source_key(batch.source)
         now_ms = int(time.time() * 1000)
@@ -624,7 +624,7 @@ class RawMetricBatchStore:
 
     def committed_batches_after(
         self, row_id: int
-    ) -> list[tuple[int, str, str, training_pb2.MetricBatch]]:
+    ) -> list[tuple[int, str, str, metric_transport_pb2.MetricBatch]]:
         """Return durable committed batches in local persistence order."""
         if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 0:
             raise ValueError("metric batch row_id must be non-negative")
@@ -704,7 +704,7 @@ class RawMetricBatchStore:
     def export_cursor(
         self,
         source: common_pb2.ServiceInstanceIdentity,
-    ) -> training_pb2.MetricBatchCursor:
+    ) -> metric_transport_pb2.MetricBatchCursor:
         with self._lock:
             row = self._connection.execute(
                 """
@@ -714,8 +714,8 @@ class RawMetricBatchStore:
                 (_source_key(source),),
             ).fetchone()
             if row is None:
-                return training_pb2.MetricBatchCursor(source=source)
-            return training_pb2.MetricBatchCursor(
+                return metric_transport_pb2.MetricBatchCursor(source=source)
+            return metric_transport_pb2.MetricBatchCursor(
                 source=source,
                 acknowledged_batch_sequence=int(
                     row["committed_batch_sequence"]
@@ -728,8 +728,8 @@ class RawMetricBatchStore:
     def next_export_batch(
         self,
         source: common_pb2.ServiceInstanceIdentity,
-        cursor: training_pb2.MetricBatchCursor,
-    ) -> training_pb2.MetricBatch | None:
+        cursor: metric_transport_pb2.MetricBatchCursor,
+    ) -> metric_transport_pb2.MetricBatch | None:
         if not _same_message(cursor.source, source):
             raise MetricEventContractError(
                 "metric export cursor source identity mismatch"
@@ -768,7 +768,7 @@ class RawMetricBatchStore:
     def acknowledge_export(
         self,
         source: common_pb2.ServiceInstanceIdentity,
-        cursor: training_pb2.MetricBatchCursor,
+        cursor: metric_transport_pb2.MetricBatchCursor,
     ) -> None:
         source_key = _source_key(source)
         with self._changed, self._connection:
@@ -839,7 +839,7 @@ class RawMetricBatchStore:
 
 
 class LearnerMetricEventService(
-    training_pb2_grpc.MetricEventServiceServicer
+    metric_transport_pb2_grpc.MetricEventServiceServicer
 ):
     """Expose the Learner-owned raw journal to one exact consumer lifecycle."""
 
@@ -869,25 +869,25 @@ class LearnerMetricEventService(
         response.latest_available_event_sequence = latest
 
     def GetMetricBatch(self, request, context):
-        response = training_pb2.GetMetricBatchRsp()
+        response = metric_transport_pb2.GetMetricBatchRsp()
         self._fill_availability(response)
         if not self._valid_consumer(request.consumer):
-            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+            response.result = metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
             response.message = "metric consumer lifecycle identity is invalid"
             return response
         if not _same_message(request.cursor.source, self.source):
-            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
+            response.result = metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
             response.message = "metric cursor source does not match producer"
             return response
         if not self.store.bind_export_consumer(
             self.source, request.consumer
         ):
-            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+            response.result = metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
             response.message = "learner metric journal is pinned to another consumer"
             return response
         committed = self.store.export_cursor(self.source)
         if not _same_message(request.cursor, committed):
-            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
+            response.result = metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_CURSOR
             response.message = "metric cursor does not match committed cursor"
             return response
         if (
@@ -898,7 +898,7 @@ class LearnerMetricEventService(
             or int(request.wait_timeout_ms) < 0
             or int(request.wait_timeout_ms) > 5000
         ):
-            response.result = training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+            response.result = metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
             response.message = "metric batch limits are invalid"
             return response
 
@@ -911,42 +911,42 @@ class LearnerMetricEventService(
                     or batch.ByteSize() > int(request.max_bytes)
                 ):
                     response.result = (
-                        training_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
+                        metric_transport_pb2.METRIC_BATCH_RESULT_REJECTED_INVALID
                     )
                     response.message = "requested limits are smaller than the next durable batch"
                     return response
-                response.result = training_pb2.METRIC_BATCH_RESULT_DELIVERED
+                response.result = metric_transport_pb2.METRIC_BATCH_RESULT_DELIVERED
                 response.message = "durable learner metric batch delivered"
                 response.batch.CopyFrom(batch)
                 self._fill_availability(response)
                 return response
             _, _, source_final = self.store.export_availability(self.source)
             if source_final:
-                response.result = training_pb2.METRIC_BATCH_RESULT_FINAL
+                response.result = metric_transport_pb2.METRIC_BATCH_RESULT_FINAL
                 response.message = "learner metric source final batch is acknowledged"
                 return response
             remaining = deadline - time.monotonic()
             if remaining <= 0.0 or not context.is_active():
-                response.result = training_pb2.METRIC_BATCH_RESULT_WAIT
+                response.result = metric_transport_pb2.METRIC_BATCH_RESULT_WAIT
                 response.message = "no learner metric batch is currently available"
                 return response
             self.store.wait_for_export_change(min(remaining, 0.25))
 
     def AckMetricBatch(self, request, context):
         del context
-        response = training_pb2.AckMetricBatchRsp()
+        response = metric_transport_pb2.AckMetricBatchRsp()
         self._fill_availability(response)
         if not self._valid_consumer(request.consumer) or not self.store.bind_export_consumer(
             self.source, request.consumer
         ):
-            response.result = training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_INVALID
+            response.result = metric_transport_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_INVALID
             response.message = "metric ACK consumer lifecycle is invalid"
             response.committed_cursor.CopyFrom(
                 self.store.export_cursor(self.source)
             )
             return response
         if not _same_message(request.cursor.source, self.source):
-            response.result = training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
+            response.result = metric_transport_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
             response.message = "metric ACK cursor source does not match producer"
             response.committed_cursor.CopyFrom(
                 self.store.export_cursor(self.source)
@@ -956,7 +956,7 @@ class LearnerMetricEventService(
         response.committed_cursor.CopyFrom(committed)
         if _same_message(request.cursor, committed):
             response.result = (
-                training_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED
+                metric_transport_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED
             )
             response.message = "learner metric batch was already acknowledged"
             return response
@@ -964,11 +964,11 @@ class LearnerMetricEventService(
             self.store.acknowledge_export(self.source, request.cursor)
         except MetricEventContractError as error:
             response.result = (
-                training_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
+                metric_transport_pb2.METRIC_BATCH_ACK_RESULT_REJECTED_CURSOR
             )
             response.message = str(error)
             return response
-        response.result = training_pb2.METRIC_BATCH_ACK_RESULT_APPLIED
+        response.result = metric_transport_pb2.METRIC_BATCH_ACK_RESULT_APPLIED
         response.message = "learner metric batch acknowledged"
         response.committed_cursor.CopyFrom(
             self.store.export_cursor(self.source)
@@ -982,19 +982,25 @@ def create_learner_metric_event_server(
     store: RawMetricBatchStore,
     source: common_pb2.ServiceInstanceIdentity,
     port: int,
+    writer,
+    status_snapshot,
 ):
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise MetricEventContractError(
             "learner metric event server port must be in [1, 65535]"
         )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    training_pb2_grpc.add_MetricEventServiceServicer_to_server(
+    metric_transport_pb2_grpc.add_MetricEventServiceServicer_to_server(
         LearnerMetricEventService(
             store=store,
             source=source,
         ),
         server,
     )
+    from .learner_status import LearnerStatusService, MetricCatalogService
+    status = LearnerStatusService(source, status_snapshot)
+    training_pb2_grpc.add_LearnerStatusServiceServicer_to_server(status, server)
+    metric_catalog_pb2_grpc.add_MetricCatalogServiceServicer_to_server(MetricCatalogService(writer, status), server)
     bound = server.add_insecure_port(f"0.0.0.0:{port}")
     if bound != port:
         server.stop(0)
@@ -1027,6 +1033,9 @@ class LocalTrainUpdateMetricWriter:
                 "initial train update sequence must be non-negative"
             )
 
+    def catalog(self):
+        return self._producer.registry.catalog(self.source)
+
     def _settle_pending(self) -> None:
         pending = self.store.pending_batch(self.source)
         cursor = self.store.pending_cursor(self.source)
@@ -1049,13 +1058,13 @@ class LocalTrainUpdateMetricWriter:
             raise MetricEventContractError(
                 "learner metric gap created_at must be positive"
             )
-        batch = training_pb2.MetricBatch(
+        batch = metric_transport_pb2.MetricBatch(
             source=self.source,
             batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
             created_at_unix_ms=created_at_unix_ms,
             first_event_sequence=first_event_sequence,
             last_event_sequence=last_event_sequence,
-            gap=training_pb2.MetricSequenceGap(
+            gap=metric_transport_pb2.MetricSequenceGap(
                 first_unavailable_event_sequence=first_event_sequence,
                 last_unavailable_event_sequence=last_event_sequence,
                 oldest_available_event_sequence=last_event_sequence + 1,
@@ -1103,13 +1112,13 @@ class LocalTrainUpdateMetricWriter:
             observed_at = int(observed_at_unix_ms)
             event_sequence = int(committed.acknowledged_event_sequence) + 1
             batch_sequence = int(committed.acknowledged_batch_sequence) + 1
-            event = training_pb2.MetricEvent(
+            event = metric_transport_pb2.MetricEvent(
                 event_sequence=event_sequence,
                 observed_at_unix_ms=observed_at,
                 fact_payload=self._producer.record(fact).SerializeToString(deterministic=True),
-                fact_kind=training_pb2.METRIC_FACT_KIND_REGISTERED_METRICS,
+                fact_kind=metric_transport_pb2.METRIC_FACT_KIND_REGISTERED_METRICS,
             )
-            batch = training_pb2.MetricBatch(
+            batch = metric_transport_pb2.MetricBatch(
                 source=self.source,
                 batch_sequence=batch_sequence,
                 created_at_unix_ms=int(time.time() * 1000),
@@ -1127,7 +1136,7 @@ class LocalTrainUpdateMetricWriter:
             self._settle_pending()
             committed = self.store.committed_cursor(self.source)
             finalized_at_unix_ms = int(time.time() * 1000)
-            batch = training_pb2.MetricBatch(
+            batch = metric_transport_pb2.MetricBatch(
                 source=self.source,
                 batch_sequence=int(committed.acknowledged_batch_sequence) + 1,
                 created_at_unix_ms=finalized_at_unix_ms,
@@ -1142,8 +1151,8 @@ class LocalTrainUpdateMetricWriter:
             self._finalized = True
 
 
-class AIServerMetricRelay:
-    """Pull AIServer batches and ACK only after durable local persistence."""
+class MetricEventCollector:
+    """Pull producer batches and ACK only after durable local persistence."""
 
     GET_WAIT_TIMEOUT_MS = 5_000
     GET_RPC_TIMEOUT_SEC = 6.5
@@ -1156,13 +1165,13 @@ class AIServerMetricRelay:
         *,
         store: RawMetricBatchStore,
         consumer: common_pb2.ServiceInstanceIdentity,
-        status_stub: training_pb2_grpc.AIServerTrainingStatusServiceStub,
-        event_stub: training_pb2_grpc.MetricEventServiceStub,
+        role: str,
+        event_stub: metric_transport_pb2_grpc.MetricEventServiceStub,
         logger,
     ):
         self.store = store
         self.consumer = _copy_message(consumer)
-        self.status_stub = status_stub
+        self.role = role
         self.event_stub = event_stub
         self.logger = logger
         self._stop = threading.Event()
@@ -1177,14 +1186,14 @@ class AIServerMetricRelay:
 
     def start(
         self, initial_source: common_pb2.ServiceInstanceIdentity
-    ) -> "AIServerMetricRelay":
+    ) -> "MetricEventCollector":
         if self._thread is not None:
             return self
         _source_key(initial_source)
         self._thread = threading.Thread(
             target=self._run,
             args=(_copy_message(initial_source),),
-            name="aiserver-metric-relay",
+            name=f"{self.role}-metric-collector",
             daemon=True,
         )
         self._thread.start()
@@ -1214,14 +1223,14 @@ class AIServerMetricRelay:
             if self._ever_connected:
                 self._transport_state = "unavailable"
                 self.logger.warning(
-                    "AIServer metric relay became unavailable; training "
+                    "Producer metric relay became unavailable; training "
                     "continues and reconnect runs in background: %s",
                     message,
                 )
             else:
                 self._transport_state = "waiting"
                 self.logger.info(
-                    "AIServer metric relay is waiting for AIServer metric "
+                    "Producer metric relay is waiting for Producer metric "
                     "service; training continues"
                 )
 
@@ -1240,20 +1249,20 @@ class AIServerMetricRelay:
             )
             if prior_state == "unavailable":
                 self.logger.info(
-                    "AIServer metric relay recovered after %.1fs and %d "
+                    "Producer metric relay recovered after %.1fs and %d "
                     "retry attempt(s)",
                     elapsed,
                     failure_count,
                 )
             elif prior_state == "waiting":
                 self.logger.info(
-                    "AIServer metric relay connected after waiting %.1fs "
+                    "Producer metric relay connected after waiting %.1fs "
                     "and %d retry attempt(s)",
                     elapsed,
                     failure_count,
                 )
             else:
-                self.logger.info("AIServer metric relay connected")
+                self.logger.info("Producer metric relay connected")
             self._transport_state = "connected"
             self._transport_failure_count = 0
             self._transport_unavailable_since = 0.0
@@ -1269,14 +1278,6 @@ class AIServerMetricRelay:
                 "last_error": self._transport_last_error,
             }
 
-    def _discover_source(self) -> common_pb2.ServiceInstanceIdentity:
-        status = self.status_stub.GetAIServerStatus(
-            training_pb2.AIServerStatusReq(), timeout=1.5
-        )
-        source = _copy_message(status.aiserver)
-        _source_key(source)
-        return source
-
     def _ack_pending(
         self,
         source: common_pb2.ServiceInstanceIdentity,
@@ -1286,25 +1287,25 @@ class AIServerMetricRelay:
         if batch is None or cursor is None:
             return False
         response = self.event_stub.AckMetricBatch(
-            training_pb2.AckMetricBatchReq(
+            metric_transport_pb2.AckMetricBatchReq(
                 consumer=self.consumer,
                 cursor=cursor,
             ),
             timeout=self.ACK_RPC_TIMEOUT_SEC,
         )
         positive = response.result in (
-            training_pb2.METRIC_BATCH_ACK_RESULT_APPLIED,
-            training_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED,
+            metric_transport_pb2.METRIC_BATCH_ACK_RESULT_APPLIED,
+            metric_transport_pb2.METRIC_BATCH_ACK_RESULT_ALREADY_APPLIED,
         )
         if not positive:
             raise MetricEventContractError(
-                response.message or "AIServer metric ACK rejected"
+                response.message or "Producer metric ACK rejected"
             )
         if not _same_message(response.producer, source):
-            raise MetricEventContractError("AIServer metric ACK producer changed")
+            raise MetricEventContractError("Producer metric ACK producer changed")
         if not _same_message(response.committed_cursor, cursor):
             raise MetricEventContractError(
-                "AIServer metric ACK committed another cursor"
+                "Producer metric ACK committed another cursor"
             )
         self.store.mark_acknowledged(batch, cursor)
         return True
@@ -1314,10 +1315,10 @@ class AIServerMetricRelay:
         source: common_pb2.ServiceInstanceIdentity,
     ) -> bool:
         if self._ack_pending(source):
-            return False
+            return self.store.is_final(source)
         cursor = self.store.committed_cursor(source)
         response = self.event_stub.GetMetricBatch(
-            training_pb2.GetMetricBatchReq(
+            metric_transport_pb2.GetMetricBatchReq(
                 consumer=self.consumer,
                 cursor=cursor,
                 max_events=512,
@@ -1327,36 +1328,37 @@ class AIServerMetricRelay:
             timeout=self.GET_RPC_TIMEOUT_SEC,
         )
         positive = response.result in (
-            training_pb2.METRIC_BATCH_RESULT_DELIVERED,
-            training_pb2.METRIC_BATCH_RESULT_WAIT,
-            training_pb2.METRIC_BATCH_RESULT_FINAL,
+            metric_transport_pb2.METRIC_BATCH_RESULT_DELIVERED,
+            metric_transport_pb2.METRIC_BATCH_RESULT_WAIT,
+            metric_transport_pb2.METRIC_BATCH_RESULT_FINAL,
         )
         if not positive:
             raise MetricEventContractError(
-                response.message or "AIServer metric Get rejected"
+                response.message or "Producer metric Get rejected"
             )
         if not _same_message(response.producer, source):
-            raise MetricEventContractError("AIServer metric producer changed")
-        if response.result == training_pb2.METRIC_BATCH_RESULT_DELIVERED:
+            raise MetricEventContractError("Producer metric producer changed")
+        if response.result == metric_transport_pb2.METRIC_BATCH_RESULT_DELIVERED:
             if not response.HasField("batch"):
                 raise MetricEventContractError(
-                    "AIServer delivered metric result without a batch"
+                    "Producer delivered metric result without a batch"
                 )
             batch = _copy_message(response.batch)
             if not _same_message(batch.source, source):
                 raise MetricEventContractError(
-                    "AIServer delivered a batch from another source"
+                    "Producer delivered a batch from another source"
                 )
-            self.store.persist_batch("aiserver", batch)
+            self.store.persist_batch(self.role, batch)
             self._ack_pending(source)
+            return self.store.is_final(source)
         elif response.HasField("batch"):
             raise MetricEventContractError(
-                "AIServer non-delivery metric result contains a batch"
+                "Producer non-delivery metric result contains a batch"
             )
-        elif response.result == training_pb2.METRIC_BATCH_RESULT_FINAL:
+        elif response.result == metric_transport_pb2.METRIC_BATCH_RESULT_FINAL:
             if not self.store.is_final(source):
                 raise MetricEventContractError(
-                    "AIServer returned FINAL before local final ACK"
+                    "Producer returned FINAL before local final ACK"
                 )
             return True
         return False
@@ -1365,27 +1367,16 @@ class AIServerMetricRelay:
         retry_delay = self.INITIAL_RETRY_DELAY_SEC
         while not self._stop.is_set():
             try:
-                source = (
-                    initial_source
-                    if self._active_source is None
-                    else self._discover_source()
-                )
-                if (
-                    self._active_source is not None
-                    and not _same_message(self._active_source, source)
-                    and not self.store.is_final(self._active_source)
-                ):
-                    self.store.mark_incomplete(
-                        self._active_source,
-                        "source_replaced_before_final",
-                    )
-                self.store.activate_source("aiserver", source)
+                source = initial_source
+                self.store.activate_source(self.role, source)
                 self._active_source = source
                 source_final = self._pull_once(source)
                 self._record_transport_connected()
                 retry_delay = self.INITIAL_RETRY_DELAY_SEC
                 if source_final:
-                    self._stop.wait(1.0)
+                    with self._state_lock:
+                        self._transport_state = "final"
+                    break
             except grpc.RpcError as error:
                 self._record_transport_unavailable(error)
                 self._stop.wait(retry_delay)
@@ -1408,14 +1399,14 @@ class AIServerMetricRelay:
         with self._state_lock:
             self._transport_state = state
             self._transport_last_error = str(error)
-        self.logger.error("AIServer metric relay %s: %s", state, error)
+        self.logger.error("Producer metric relay %s: %s", state, error)
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=self.GET_RPC_TIMEOUT_SEC + 1.0)
+            self._thread.join()
         with self._state_lock:
-            if self._transport_state not in {"rejected", "failed"}:
+            if self._transport_state not in {"rejected", "failed", "final"}:
                 self._transport_state = "stopped"
         if self._active_source is not None:
             try:
@@ -1426,6 +1417,6 @@ class AIServerMetricRelay:
                     )
             except Exception as error:
                 self.logger.error(
-                    "failed to record incomplete AIServer metric source: %s",
+                    "failed to record incomplete Producer metric source: %s",
                     error,
                 )

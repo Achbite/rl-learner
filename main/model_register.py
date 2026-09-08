@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 
 import grpc
-from proto import training_pb2, training_pb2_grpc
+from proto.training import training_pb2
+from proto.training import training_pb2_grpc
 from src.contracts.identity import (
     model_identity_document,
     read_manifest_file,
