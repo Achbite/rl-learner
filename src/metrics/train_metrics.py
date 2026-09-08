@@ -1,6 +1,6 @@
 """Metric definitions owned by the PPO/update producer, not by the reader."""
 
-from proto import training_pb2 as wire
+from proto.metrics import registry_pb2 as metric_registry_pb2
 from .registered_metrics import MetricRegistry
 
 
@@ -28,8 +28,9 @@ class TrainMetricProducer:
                 display_name="Approx. KL" if name == "approx_kl" else name.replace("_", " ").title(),
                 unit=unit,
                 scope="train_update", denominator=denominator,
-                value_type=wire.METRIC_VALUE_TYPE_SUM_COUNT,
-                aggregation=wire.METRIC_AGGREGATION_MEAN,
+                category=("loss" if unit == "loss" else "advantage" if name in ("raw_advantage", "normalized_advantage", "return_target", "value_prediction") else "ppo_stability"),
+                value_type=metric_registry_pb2.METRIC_VALUE_TYPE_SUM_COUNT,
+                aggregation=metric_registry_pb2.METRIC_AGGREGATION_MEAN,
             )
         self.counters = (
             "train_update_sequence", "cumulative_trained_samples", "actual_batch_size",
@@ -40,19 +41,19 @@ class TrainMetricProducer:
         for name in (*self.counters, "model_step"):
             self.registry.register(
                 "learner.update." + name, display_name=name.replace("_", " ").title(), unit="count",
-                scope="train_update", value_type=wire.METRIC_VALUE_TYPE_UNSIGNED,
-                aggregation=wire.METRIC_AGGREGATION_LATEST,
+                scope="train_update", category="training_depth", value_type=metric_registry_pb2.METRIC_VALUE_TYPE_UNSIGNED,
+                aggregation=metric_registry_pb2.METRIC_AGGREGATION_LATEST,
             )
 
     def record(self, fact):
-        points = [wire.MetricPoint(
+        points = [metric_registry_pb2.MetricPoint(
             metric_id="learner.ppo." + item.field_id,
-            sum_count=wire.MetricSumCount(sum=item.sum, count=item.count),
+            sum_count=metric_registry_pb2.MetricSumCount(sum=item.sum, count=item.count),
         ) for item in fact.ppo_statistics]
-        points.extend(wire.MetricPoint(
+        points.extend(metric_registry_pb2.MetricPoint(
             metric_id="learner.update." + name, unsigned_value=getattr(fact, name),
         ) for name in self.counters)
-        points.append(wire.MetricPoint(
+        points.append(metric_registry_pb2.MetricPoint(
             metric_id="learner.update.model_step",
             unsigned_value=fact.published_model.model_step,
         ))

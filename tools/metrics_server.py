@@ -9,6 +9,7 @@ import json
 import math
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -16,6 +17,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, quote, urlparse
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.metrics.window_query import current_statistic
 
 
 DASHBOARD_PATH = Path(__file__).with_name("metrics_dashboard.html")
@@ -39,9 +44,14 @@ _CATALOG_FIELD_KEYS = (
     "source_instance",
     "lifecycle_epoch",
     "source_label",
+    "source_role",
+    "status_method",
     "description",
+    "availability",
     "display_unit",
     "display_scale",
+    "input_fields",
+    "interval_path",
 )
 
 
@@ -56,20 +66,8 @@ def _metric_definition(
     value_kind,
     path,
     scale=1.0,
+    owner_component="local-preview",
 ):
-    if field_id.startswith("learner."):
-        owner_component = "rl-learner"
-    elif field_id.startswith("server.") or field_id.startswith(
-        "sample.flow.produced"
-    ) or field_id.startswith("sample.flow.outbound") or field_id.startswith(
-        "sample.flow.final_drop"
-    ):
-        owner_component = "rl-aiserver"
-    elif field_id.startswith("sample.flow."):
-        owner_component = "rl-sample-pool"
-    else:
-        owner_component = "learner-monitor"
-
     if value_kind == "counter":
         aggregation_kind = "sum"
         window_kind = "cumulative"
@@ -102,23 +100,7 @@ def _metric_definition(
     }
 
 
-_STATIC_METRIC_DEFINITIONS = (
-    _metric_definition(
-        "learner.model_step", "Model Step", "training_depth",
-        "model_step", "step", "learner", "latest", "gauge",
-        ("learner", "model_step"),
-    ),
-    _metric_definition(
-        "learner.train_update.total", "Train Update", "training_depth",
-        "train_update", "update", "learner", "total", "counter",
-        ("learner", "train_updates"),
-    ),
-    _metric_definition(
-        "learner.trained_samples.total", "Trained Samples",
-        "training_depth", "sample_count", "samples", "learner", "total",
-        "counter",
-        ("learner", "trained_samples"),
-    ),
+_DERIVED_METRIC_DEFINITIONS = (
     _metric_definition(
         "sample.throughput.produced_per_second", "Produced / sec",
         "sample_throughput", "sample_rate", "samples/s", "sample_chain",
@@ -139,92 +121,15 @@ _STATIC_METRIC_DEFINITIONS = (
         "sample_throughput", "sample_rate", "samples/s", "sample_chain",
         "rate", "gauge", ("rates", "trained_sps"),
     ),
-    _metric_definition(
-        "sample.flow.produced.total", "Produced Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "total", "counter",
-        ("actor", "produced"),
-    ),
-    _metric_definition(
-        "sample.flow.accepted.total", "Accepted Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "total", "counter",
-        ("sample_pool", "accepted"),
-    ),
-    _metric_definition(
-        "sample.flow.acknowledged.total", "Acknowledged Samples",
-        "sample_flow", "sample_count", "samples", "sample_chain", "total",
-        "counter", ("sample_pool", "acked"),
-    ),
-    _metric_definition(
-        "sample.flow.trained.total", "Trained Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "total", "counter",
-        ("sample_pool", "trained"),
-    ),
-    _metric_definition(
-        "sample.flow.invalid.total", "Invalid Samples", "sample_flow",
-        "sample_count", "samples", "sample_chain", "total", "counter",
-        ("sample_pool", "invalid"),
-    ),
-    _metric_definition(
-        "sample.flow.shutdown_untrained.total", "Shutdown Untrained",
-        "sample_flow", "sample_count", "samples", "sample_chain", "total",
-        "counter", ("sample_pool", "shutdown_untrained"),
-    ),
-    _metric_definition(
-        "sample.flow.ready.total", "Ready Transitions", "sample_flow",
-        "sample_count", "transitions", "sample_chain", "latest", "gauge",
-        ("sample_pool", "ready_transitions"),
-    ),
-    _metric_definition(
-        "sample.flow.leased.total", "Leased Transitions", "sample_flow",
-        "sample_count", "transitions", "sample_chain", "latest", "gauge",
-        ("sample_pool", "leased_transitions"),
-    ),
-    _metric_definition(
-        "sample.flow.outbound_pending.total", "Outbound Pending",
-        "sample_flow", "sample_count", "samples", "server", "latest",
-        "gauge", ("actor", "outbound_queue_transitions"),
-    ),
-    _metric_definition(
-        "sample.flow.final_drop.total", "Final Drop", "sample_flow",
-        "sample_count", "samples", "server", "total", "counter",
-        ("actor", "final_drop"),
-    ),
-    _metric_definition(
-        "server.latency.sample_send.mean_ms", "Sample Send Latency",
-        "latency", "duration", "ms", "server", "mean", "gauge",
-        ("actor", "push_rpc_mean_ms"),
-    ),
-    _metric_definition(
-        "server.latency.inference.mean_ms", "Inference Latency Mean",
-        "latency", "duration", "ms", "server", "mean", "gauge",
-        ("actor", "inference_mean_ms"),
-    ),
-    _metric_definition(
-        "server.latency.inference.max_ms", "Inference Latency Max",
-        "latency", "duration", "ms", "server", "max", "gauge",
-        ("actor", "inference_max_ms"),
-    ),
-    _metric_definition(
-        "server.latency.update_rpc.mean_ms", "Update RPC Latency Mean",
-        "latency", "duration", "ms", "server", "mean", "gauge",
-        ("actor", "update_rpc_mean_ms"),
-    ),
-    _metric_definition(
-        "server.latency.update_rpc.max_ms", "Update RPC Latency Max",
-        "latency", "duration", "ms", "server", "max", "gauge",
-        ("actor", "update_rpc_max_ms"),
-    ),
-    _metric_definition(
-        "learner.ppo.max_importance_ratio", "Max Importance Ratio",
-        "ppo_stability", "ratio", "1", "train_update", "max", "gauge",
-        ("learner", "max_importance_ratio"),
-    ),
-    _metric_definition(
-        "learner.value.explained_variance", "Explained Variance",
-        "ppo_stability", "ratio", "1", "train_update", "latest",
-        "gauge", ("learner", "explained_variance"),
-    ),
 )
+
+for _definition, _input, _counter in zip(_DERIVED_METRIC_DEFINITIONS, (
+    "sample.flow.produced.total", "sample.flow.accepted.total", "sample.flow.acknowledged.total", "sample.flow.trained.total",
+), ("produced", "accepted", "acked", "trained")):
+    _definition["descriptor"].update(
+        input_fields=[_input], interval_path=f"rates.source_intervals.{_counter}",
+        description="Counter difference divided by the elapsed producer observation time, within one source lifecycle.",
+    )
 
 
 def _nested(document, path):
@@ -243,7 +148,7 @@ def _finite_number(value):
     return value if math.isfinite(number) else None
 
 
-_EVENT_WINDOWS = {"25", "100", "5s", "1m", "1h", "24h", "all"}
+_EVENT_WINDOWS = {"current", "25", "100", "5s", "1m", "1h", "24h", "all"}
 
 # 粗粒度历史层支持的时间范围；秒级实时层仅保留 max_records 条，
 # 超出该窗口的 6h/24h/all 视图由按桶降采样的历史层提供。
@@ -258,7 +163,7 @@ _HISTORY_DEFAULT_MAX_POINTS = 1500
 _HISTORY_MAX_POINTS_LIMIT = 6000
 
 
-def _project_metric_value(record, definition, event_window="1m"):
+def _project_metric_statistic(record, definition, event_window="current", *, at_unix_ms=None):
     if event_window not in _EVENT_WINDOWS:
         raise ValueError("unsupported metric event window")
     path = definition["path"]
@@ -266,25 +171,52 @@ def _project_metric_value(record, definition, event_window="1m"):
     if (
         len(path) == 7
         and path[:2] == ("metric_event_views", "sources")
-        and path[3] == "windows" and path[4] == "100"
+        and path[3] == "windows" and path[4] == "current"
     ):
         selected_path = (*path[:4], event_window, *path[5:])
+    if (len(selected_path) == 7 and selected_path[:2] == ("metric_event_views", "sources")
+            and selected_path[4] == "current"):
+        source = record.get("metric_event_views", {}).get("sources", {}).get(selected_path[2])
+        if source is None:
+            return None
+        return current_statistic(source, selected_path[5],
+            source["query_time_unix_ms"] if at_unix_ms is None else at_unix_ms)
     value = _finite_number(_nested(record, selected_path))
-    return value if value is None or definition["scale"] == 1.0 else value * definition["scale"]
+    if value is None:
+        return None
+    if len(selected_path) == 7 and selected_path[:2] == ("metric_event_views", "sources"):
+        return dict(_nested(record, selected_path[:-1]))
+    statistic = {"value": value * definition["scale"]}
+    interval_path = definition["descriptor"].get("interval_path")
+    if interval_path:
+        interval = _nested(record, interval_path.split("."))
+        if interval is not None:
+            statistic.update(interval_start_unix_ms=int(interval["start"] * 1000),
+                             interval_end_unix_ms=int(interval["end"] * 1000))
+    return statistic
 
 
-def project_metric_values(record, definitions, event_window="1m"):
-    projected = copy.deepcopy(record)
-    projected["metric_values"] = {
-        definition["descriptor"]["series_id"]: _project_metric_value(
-            record, definition, event_window
-        )
+def _project_metric_value(record, definition, event_window="current", *, at_unix_ms=None):
+    statistic = _project_metric_statistic(record, definition, event_window, at_unix_ms=at_unix_ms)
+    return statistic["value"] if statistic is not None else None
+
+
+def _metric_projection(record, definitions, event_window="current", *, at_unix_ms=None):
+    statistics = {
+        definition["descriptor"]["series_id"]: _project_metric_statistic(
+            record, definition, event_window, at_unix_ms=at_unix_ms)
         for definition in definitions
     }
-    statistics = _nested(record, ("actor", "metric_statistics"))
-    projected["metric_statistics"] = (
-        copy.deepcopy(statistics) if isinstance(statistics, dict) else {}
-    )
+    return {
+        "metric_values": {key: value["value"] if value is not None else None
+                          for key, value in statistics.items()},
+        "metric_statistics": statistics,
+    }
+
+
+def project_metric_values(record, definitions, event_window="current", *, at_unix_ms=None):
+    projected = copy.deepcopy(record)
+    projected.update(_metric_projection(record, definitions, event_window, at_unix_ms=at_unix_ms))
     descriptors = _nested(record, ("actor", "metric_descriptors"))
     projected["metric_descriptors"] = (
         copy.deepcopy(descriptors) if isinstance(descriptors, dict) else {}
@@ -309,6 +241,7 @@ class MetricsFileReader:
         history_max_records: int = 6000,
         views_path=VIEWS_PATH,
         task_views_path=None,
+        clock=time.time,
     ):
         if max_records <= 0:
             raise ValueError("max_records must be positive")
@@ -326,6 +259,7 @@ class MetricsFileReader:
             or history_bucket_seconds <= 0
         ):
             raise ValueError("history bucket seconds must be positive and finite")
+        self._clock = clock
         self._metrics_dir = os.path.abspath(metrics_dir)
         self._metrics_source_id = metrics_source_id or (
             f"local-training-{uuid.uuid4().hex}"
@@ -551,7 +485,7 @@ class MetricsFileReader:
             "metrics_source_id": record.get("metrics_source_id"),
             "metric_values": {
                 definition["descriptor"]["series_id"]: _project_metric_value(
-                    record, definition, "1m"
+                    record, definition, "current"
                 )
                 for definition in self._definitions_for_history()
             },
@@ -637,7 +571,7 @@ class MetricsFileReader:
         with self._lock:
             return self._records[-1] if self._records else {}
 
-    def query_fields(self, fields, *, after_sequence=0, window="1m"):
+    def query_fields(self, fields, *, after_sequence=0, window="current"):
         """Read registered field IDs; preserve each source as a separate series."""
         if not fields or any(not field for field in fields):
             raise ValueError("at least one field is required")
@@ -654,18 +588,16 @@ class MetricsFileReader:
             "sequence", "timestamp", "metrics_source_id", "learner", "model", "chain", "metric_events"
         ) if key in latest}
         status_record["actor"] = {key: latest.get("actor", {})[key] for key in (
-            "instance_id", "client_session_recent", "model_identity", "staged_model_identity",
+            "instance_id", "lifecycle_epoch", "client_session_recent", "model_identity", "staged_model_identity",
             "state", "ready", "error", "model_feedback"
         ) if key in latest.get("actor", {})}
         status_record["metric_event_views"] = {
             "status": view.get("status"),
+            "catalog_errors": view.get("catalog_errors", {}),
             "sources": {key: {"instance_id": source["instance_id"], "last_error": source.get("last_error")}
                         for key, source in view.get("sources", {}).items()},
         }
-        status_record["metric_values"] = {
-            item["descriptor"]["series_id"]: _project_metric_value(latest, item, window)
-            for item in definitions
-        }
+        status_record.update(_metric_projection(latest, definitions, window, at_unix_ms=int(self._clock() * 1000)))
         return {
             "schema_version": 1,
             "stream": "current",
@@ -678,10 +610,7 @@ class MetricsFileReader:
                 "sequence": record.get("sequence"),
                 "timestamp": record.get("timestamp"),
                 "metrics_source_id": record.get("metrics_source_id"),
-                "metric_values": {
-                    item["descriptor"]["series_id"]: _project_metric_value(record, item, window)
-                    for item in definitions
-                },
+                **_metric_projection(record, definitions, window),
             } for record in records],
             # The topology/status strip consumes the latest observation once,
             # independently of the selected chart series.
@@ -690,7 +619,7 @@ class MetricsFileReader:
 
     def metric_definitions(self):
         definitions = {item["descriptor"]["field_id"]: {**item, "descriptor": dict(item["descriptor"])}
-                       for item in _STATIC_METRIC_DEFINITIONS}
+                       for item in _DERIVED_METRIC_DEFINITIONS}
         with self._lock:
             seen_sources = set()
             for record in reversed(self._records):
@@ -701,23 +630,31 @@ class MetricsFileReader:
                     seen_sources.add(source_key)
                     for name, metric in source["catalog"].items():
                         field_id = "registered/" + quote(source_key, safe="") + "/" + quote(name, safe="")
-                        window = "latest" if source["role"] == "learner" else "100"
+                        window = "latest" if source["role"] == "learner" or metric.get("status_method") else "current"
                         definition = _metric_definition(
                             field_id, metric["display_name"],
-                            "custom", metric["unit"], metric["unit"],
+                            metric["category"], metric["unit"], metric["unit"],
                             metric["scope"], metric["aggregation"], "gauge",
                             ("metric_event_views", "sources", source_key, "windows", window, name, "value"),
                         )
                         definition["descriptor"].update({
                             "field_id": name,
-                            "owner_component": source["role"],
+                            "owner_component": source["component"],
+                            "source_role": source["role"],
+                            "status_method": metric.get("status_method", ""),
+                            "description": metric.get("description", ""),
                             "aggregation_kind": metric["aggregation"],
-                            "window_kind": "latest_metric_event" if window == "latest" else "1m",
+                            "window_kind": ("status_snapshot" if metric.get("status_method") else "latest_metric_event") if window == "latest" else "current",
                             "denominator": metric["denominator"],
                             "metric_id": name,
                             "source_instance": source["instance_id"],
                             "lifecycle_epoch": source["lifecycle_epoch"],
                         })
+                        available = _project_metric_value(record, definition, at_unix_ms=int(self._clock() * 1000))
+                        definition["descriptor"]["availability"] = (
+                            "unreachable" if metric.get("status_method") and source.get("status_available") is False else
+                            "available" if available is not None else
+                            "no_measurement" if name not in source["windows"]["latest"] else "window_empty")
                         definitions[field_id] = definition
         # Presentation identity is separate from source/lifecycle identity. Keep
         # every source as a separate series, with full identity in field details.
@@ -731,7 +668,7 @@ class MetricsFileReader:
                 if source_key not in source_labels:
                     role = descriptor["owner_component"]
                     source_counts[role] = source_counts.get(role, 0) + 1
-                    title = "Learner" if role == "learner" else "ServerPod"
+                    title = {"learner": "Learner", "aiserver": "ServerPod", "sample_pool": "SamplePool", "distributor": "ModelDistributor"}[descriptor["source_role"]]
                     source_labels[source_key] = f"{title} {source_counts[role]}"
                 descriptor["source_label"] = source_labels[source_key]
             name = descriptor.get("metric_id", descriptor["field_id"])
@@ -745,11 +682,14 @@ class MetricsFileReader:
                 descriptor.update({key: view[key] for key in (
                     "display_unit", "display_scale"
                 ) if key in view})
-                descriptor["group"] = view["category"]
                 break
             if descriptor.get("display_unit") == "%":
                 descriptor["dimension"] = "percentage"
         return list(definitions.values())
+
+    def latest_metrics(self, window="current"):
+        return project_metric_values(self.latest(), self.metric_definitions(), window,
+                                     at_unix_ms=int(self._clock() * 1000))
 
     def catalog(self, category=None):
         definitions = self.metric_definitions()
@@ -757,7 +697,12 @@ class MetricsFileReader:
             "schema_version": 1,
             "catalog_version": 1,
             "layout_key": self._views["layout_key"],
-            "categories": self._views["categories"],
+            "categories": self._views["categories"] + [
+                {"id": category, "label": category.replace("_", " ").title()}
+                for category in sorted({item["descriptor"]["group"] for item in definitions}
+                                       - {item["id"] for item in self._views["categories"]})],
+            "mean_window_ms": next((source["mean_window_ms"] for source in
+                self.latest().get("metric_event_views", {}).get("sources", {}).values()), 60000),
             "panels": self._views["panels"],
             "fields": [
                 {
@@ -906,7 +851,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 result = metrics_reader.query_fields(
                     params.get("field", []),
                     after_sequence=int(params.get("after_sequence", ["0"])[0]),
-                    window=params.get("window", ["1m"])[0],
+                    window=params.get("window", ["current"])[0],
                 )
             except ValueError as error:
                 self._json_response({"schema_version": 1, "error": str(error)}, status=400)
@@ -922,7 +867,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 limit = int(params.get("limit", ["0"])[0])
                 if after_sequence < 0 or limit < 0:
                     raise ValueError
-                event_window = params.get("window", ["1m"])[0]
+                event_window = params.get("window", ["current"])[0]
                 if event_window not in _EVENT_WINDOWS:
                     raise ValueError
             except ValueError:
@@ -996,7 +941,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
         elif path == "/api/metrics/latest":
             latest = metrics_reader.latest()
             definitions = metrics_reader.metric_definitions()
-            event_window = params.get("window", ["1m"])[0]
+            event_window = params.get("window", ["current"])[0]
             if event_window not in _EVENT_WINDOWS:
                 self._json_response(
                     {"schema_version": 1, "error": "invalid event window"},
@@ -1009,9 +954,7 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                     "stream": "current",
                     "event_window": event_window,
                     "record": (
-                        project_metric_values(
-                            latest, definitions, event_window
-                        )
+                        metrics_reader.latest_metrics(event_window)
                         if latest
                         else {}
                     ),

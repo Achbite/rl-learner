@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from main.training_runtime import train_processed_delivery
-from proto import training_pb2
+from proto.training import training_pb2
 from src.config.effective_config import load_effective_config
 from src.contracts.identity import validate_config
 from src.training.ppo_trainer import PPOTrainer

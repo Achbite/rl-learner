@@ -41,16 +41,14 @@ if [ -n "${sample_pool_source}" ] || [ -n "${model_distributor_source}" ]; then
     channel="explicit"
     platform="external"
 else
-    sample_pool_version="$(tr -d '[:space:]' < "${workspace_root}/rl-sample-pool/VERSION")"
-    model_distributor_version="$(tr -d '[:space:]' < "${workspace_root}/rl-model-distributor/VERSION")"
     platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
     platform_dir="${platform//\//-}"
     if [ "${channel}" = "development" ]; then
-        sample_pool_source="${workspace_root}/.workspace/dev-artifacts/rl-sample-pool/${sample_pool_version}/${platform_dir}/current"
-        model_distributor_source="${workspace_root}/.workspace/dev-artifacts/rl-model-distributor/${model_distributor_version}/${platform_dir}/current"
+        sample_pool_source="${workspace_root}/.workspace/dev-artifacts/rl-sample-pool/${platform_dir}/current"
+        model_distributor_source="${workspace_root}/.workspace/dev-artifacts/rl-model-distributor/${platform_dir}/current"
     else
-        sample_pool_source="${workspace_root}/.workspace/artifacts/rl-sample-pool/${sample_pool_version}/${platform_dir}"
-        model_distributor_source="${workspace_root}/.workspace/artifacts/rl-model-distributor/${model_distributor_version}/${platform_dir}"
+        sample_pool_source="${workspace_root}/.workspace/artifacts/rl-sample-pool/${platform_dir}"
+        model_distributor_source="${workspace_root}/.workspace/artifacts/rl-model-distributor/${platform_dir}"
     fi
 fi
 sample_pool_target="${repo_dir}/sample-pool"

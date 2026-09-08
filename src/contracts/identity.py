@@ -9,7 +9,9 @@ import re
 from pathlib import Path
 from typing import Mapping
 
-from proto import common_pb2, training_pb2
+from proto.common import identity_pb2 as common_pb2
+from proto.training import training_pb2
+from proto.training import model_identity_pb2
 
 
 RUNTIME_LINEAGE_PLACEHOLDER = "__FRESH_INTERNAL_LINEAGE_REQUIRED__"
@@ -58,7 +60,7 @@ def bind_runtime_lineage(
     return result
 
 
-def model_identity_document(message: training_pb2.ModelIdentity) -> dict:
+def model_identity_document(message: model_identity_pb2.ModelIdentity) -> dict:
     has_step = message.HasField("model_step")
     has_any_identity = bool(message.model_lineage_id or has_step)
     if not has_any_identity:
@@ -176,7 +178,7 @@ def validate_config(config: dict) -> None:
         "metric_events": {
             "server_enabled", "server_port", "aiserver_relay_enabled",
         },
-        "dashboard": {"enabled", "server_port", "backend"},
+        "dashboard": {"enabled", "server_port", "backend", "mean_window_ms", "time_bucket_ms"},
         "log": {"console_level", "file_level", "log_dir"},
     }
     for section_name, keys in expected_keys.items():
@@ -306,6 +308,12 @@ def validate_config(config: dict) -> None:
     ):
         raise ValueError("metric_events configuration is invalid")
     dashboard = config["dashboard"]
+    for name, default in (("mean_window_ms", 60000), ("time_bucket_ms", 5000)):
+        value = dashboard.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"dashboard.{name} must be a positive integer")
+    if dashboard.get("enabled") and not metric_events.get("server_enabled"):
+        raise ValueError("local Preview requires the Learner metric service")
     dashboard_port = dashboard.get("server_port")
     if (
         not isinstance(dashboard.get("enabled"), bool)

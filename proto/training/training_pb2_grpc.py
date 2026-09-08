@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import training_pb2 as training__pb2
+from proto.training import training_pb2 as proto_dot_training_dot_training__pb2
 
 GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in training_pb2_grpc.py depends on'
+        + ' but the generated code in proto/training/training_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,8 +36,8 @@ class AIServerTrainingStatusServiceStub:
         """
         self.GetAIServerStatus = channel.unary_unary(
                 '/rl.training.v1.AIServerTrainingStatusService/GetAIServerStatus',
-                request_serializer=training__pb2.AIServerStatusReq.SerializeToString,
-                response_deserializer=training__pb2.AIServerStatusRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.AIServerStatusReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.AIServerStatusRsp.FromString,
                 _registered_method=True)
 
 
@@ -55,8 +55,8 @@ def add_AIServerTrainingStatusServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'GetAIServerStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetAIServerStatus,
-                    request_deserializer=training__pb2.AIServerStatusReq.FromString,
-                    response_serializer=training__pb2.AIServerStatusRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.AIServerStatusReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.AIServerStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -84,8 +84,8 @@ class AIServerTrainingStatusService:
             request,
             target,
             '/rl.training.v1.AIServerTrainingStatusService/GetAIServerStatus',
-            training__pb2.AIServerStatusReq.SerializeToString,
-            training__pb2.AIServerStatusRsp.FromString,
+            proto_dot_training_dot_training__pb2.AIServerStatusReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.AIServerStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -97,11 +97,8 @@ class AIServerTrainingStatusService:
             _registered_method=True)
 
 
-class MetricEventServiceStub:
-    """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity until
-    it is acknowledged or an explicit gap proves the requested event unavailable.
-    """
+class LearnerStatusServiceStub:
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -109,65 +106,43 @@ class MetricEventServiceStub:
         Args:
             channel: A grpc.Channel.
         """
-        self.GetMetricBatch = channel.unary_unary(
-                '/rl.training.v1.MetricEventService/GetMetricBatch',
-                request_serializer=training__pb2.GetMetricBatchReq.SerializeToString,
-                response_deserializer=training__pb2.GetMetricBatchRsp.FromString,
-                _registered_method=True)
-        self.AckMetricBatch = channel.unary_unary(
-                '/rl.training.v1.MetricEventService/AckMetricBatch',
-                request_serializer=training__pb2.AckMetricBatchReq.SerializeToString,
-                response_deserializer=training__pb2.AckMetricBatchRsp.FromString,
+        self.GetLearnerStatus = channel.unary_unary(
+                '/rl.training.v1.LearnerStatusService/GetLearnerStatus',
+                request_serializer=proto_dot_training_dot_training__pb2.LearnerStatusReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.LearnerStatusRsp.FromString,
                 _registered_method=True)
 
 
-class MetricEventServiceServicer:
-    """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity until
-    it is acknowledged or an explicit gap proves the requested event unavailable.
-    """
+class LearnerStatusServiceServicer:
+    """Missing associated documentation comment in .proto file."""
 
-    def GetMetricBatch(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def AckMetricBatch(self, request, context):
+    def GetLearnerStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_MetricEventServiceServicer_to_server(servicer, server):
+def add_LearnerStatusServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'GetMetricBatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetMetricBatch,
-                    request_deserializer=training__pb2.GetMetricBatchReq.FromString,
-                    response_serializer=training__pb2.GetMetricBatchRsp.SerializeToString,
-            ),
-            'AckMetricBatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.AckMetricBatch,
-                    request_deserializer=training__pb2.AckMetricBatchReq.FromString,
-                    response_serializer=training__pb2.AckMetricBatchRsp.SerializeToString,
+            'GetLearnerStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLearnerStatus,
+                    request_deserializer=proto_dot_training_dot_training__pb2.LearnerStatusReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.LearnerStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'rl.training.v1.MetricEventService', rpc_method_handlers)
+            'rl.training.v1.LearnerStatusService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('rl.training.v1.MetricEventService', rpc_method_handlers)
+    server.add_registered_method_handlers('rl.training.v1.LearnerStatusService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class MetricEventService:
-    """Implemented independently by each metric-event owner (AIServer and Learner).
-    A retry with the same cursor returns the same batch identity until
-    it is acknowledged or an explicit gap proves the requested event unavailable.
-    """
+class LearnerStatusService:
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def GetMetricBatch(request,
+    def GetLearnerStatus(request,
             target,
             options=(),
             channel_credentials=None,
@@ -180,36 +155,9 @@ class MetricEventService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/rl.training.v1.MetricEventService/GetMetricBatch',
-            training__pb2.GetMetricBatchReq.SerializeToString,
-            training__pb2.GetMetricBatchRsp.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def AckMetricBatch(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rl.training.v1.MetricEventService/AckMetricBatch',
-            training__pb2.AckMetricBatchReq.SerializeToString,
-            training__pb2.AckMetricBatchRsp.FromString,
+            '/rl.training.v1.LearnerStatusService/GetLearnerStatus',
+            proto_dot_training_dot_training__pb2.LearnerStatusReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.LearnerStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -232,13 +180,13 @@ class SamplePoolIngressServiceStub:
         """
         self.PushSamples = channel.unary_unary(
                 '/rl.training.v1.SamplePoolIngressService/PushSamples',
-                request_serializer=training__pb2.PushSamplesReq.SerializeToString,
-                response_deserializer=training__pb2.PushSamplesRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.PushSamplesReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.PushSamplesRsp.FromString,
                 _registered_method=True)
         self.GetStatus = channel.unary_unary(
                 '/rl.training.v1.SamplePoolIngressService/GetStatus',
-                request_serializer=training__pb2.SamplePoolStatusReq.SerializeToString,
-                response_deserializer=training__pb2.SamplePoolStatusRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.SamplePoolStatusReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.FromString,
                 _registered_method=True)
 
 
@@ -262,13 +210,13 @@ def add_SamplePoolIngressServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'PushSamples': grpc.unary_unary_rpc_method_handler(
                     servicer.PushSamples,
-                    request_deserializer=training__pb2.PushSamplesReq.FromString,
-                    response_serializer=training__pb2.PushSamplesRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.PushSamplesReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.PushSamplesRsp.SerializeToString,
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
-                    request_deserializer=training__pb2.SamplePoolStatusReq.FromString,
-                    response_serializer=training__pb2.SamplePoolStatusRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.SamplePoolStatusReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -296,8 +244,8 @@ class SamplePoolIngressService:
             request,
             target,
             '/rl.training.v1.SamplePoolIngressService/PushSamples',
-            training__pb2.PushSamplesReq.SerializeToString,
-            training__pb2.PushSamplesRsp.FromString,
+            proto_dot_training_dot_training__pb2.PushSamplesReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.PushSamplesRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -323,8 +271,8 @@ class SamplePoolIngressService:
             request,
             target,
             '/rl.training.v1.SamplePoolIngressService/GetStatus',
-            training__pb2.SamplePoolStatusReq.SerializeToString,
-            training__pb2.SamplePoolStatusRsp.FromString,
+            proto_dot_training_dot_training__pb2.SamplePoolStatusReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -347,33 +295,33 @@ class SamplePoolConsumerServiceStub:
         """
         self.GetBatch = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/GetBatch',
-                request_serializer=training__pb2.GetBatchReq.SerializeToString,
-                response_deserializer=training__pb2.GetBatchRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.GetBatchReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.GetBatchRsp.FromString,
                 _registered_method=True)
         self.AckBatch = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/AckBatch',
-                request_serializer=training__pb2.AckBatchReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.AckBatchReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
                 _registered_method=True)
         self.NackBatch = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/NackBatch',
-                request_serializer=training__pb2.NackBatchReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.NackBatchReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
                 _registered_method=True)
         self.RenewLease = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/RenewLease',
-                request_serializer=training__pb2.RenewLeaseReq.SerializeToString,
-                response_deserializer=training__pb2.DeliveryRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.RenewLeaseReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
                 _registered_method=True)
         self.FinalizeSamplePool = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/FinalizeSamplePool',
-                request_serializer=training__pb2.FinalizeSamplePoolReq.SerializeToString,
-                response_deserializer=training__pb2.FinalizeSamplePoolRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.FinalizeSamplePoolReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.FinalizeSamplePoolRsp.FromString,
                 _registered_method=True)
         self.GetStatus = channel.unary_unary(
                 '/rl.training.v1.SamplePoolConsumerService/GetStatus',
-                request_serializer=training__pb2.SamplePoolStatusReq.SerializeToString,
-                response_deserializer=training__pb2.SamplePoolStatusRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.SamplePoolStatusReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.FromString,
                 _registered_method=True)
 
 
@@ -421,33 +369,33 @@ def add_SamplePoolConsumerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'GetBatch': grpc.unary_unary_rpc_method_handler(
                     servicer.GetBatch,
-                    request_deserializer=training__pb2.GetBatchReq.FromString,
-                    response_serializer=training__pb2.GetBatchRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.GetBatchReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.GetBatchRsp.SerializeToString,
             ),
             'AckBatch': grpc.unary_unary_rpc_method_handler(
                     servicer.AckBatch,
-                    request_deserializer=training__pb2.AckBatchReq.FromString,
-                    response_serializer=training__pb2.DeliveryRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.AckBatchReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.DeliveryRsp.SerializeToString,
             ),
             'NackBatch': grpc.unary_unary_rpc_method_handler(
                     servicer.NackBatch,
-                    request_deserializer=training__pb2.NackBatchReq.FromString,
-                    response_serializer=training__pb2.DeliveryRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.NackBatchReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.DeliveryRsp.SerializeToString,
             ),
             'RenewLease': grpc.unary_unary_rpc_method_handler(
                     servicer.RenewLease,
-                    request_deserializer=training__pb2.RenewLeaseReq.FromString,
-                    response_serializer=training__pb2.DeliveryRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.RenewLeaseReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.DeliveryRsp.SerializeToString,
             ),
             'FinalizeSamplePool': grpc.unary_unary_rpc_method_handler(
                     servicer.FinalizeSamplePool,
-                    request_deserializer=training__pb2.FinalizeSamplePoolReq.FromString,
-                    response_serializer=training__pb2.FinalizeSamplePoolRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.FinalizeSamplePoolReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.FinalizeSamplePoolRsp.SerializeToString,
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
-                    request_deserializer=training__pb2.SamplePoolStatusReq.FromString,
-                    response_serializer=training__pb2.SamplePoolStatusRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.SamplePoolStatusReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -475,8 +423,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/GetBatch',
-            training__pb2.GetBatchReq.SerializeToString,
-            training__pb2.GetBatchRsp.FromString,
+            proto_dot_training_dot_training__pb2.GetBatchReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.GetBatchRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -502,8 +450,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/AckBatch',
-            training__pb2.AckBatchReq.SerializeToString,
-            training__pb2.DeliveryRsp.FromString,
+            proto_dot_training_dot_training__pb2.AckBatchReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -529,8 +477,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/NackBatch',
-            training__pb2.NackBatchReq.SerializeToString,
-            training__pb2.DeliveryRsp.FromString,
+            proto_dot_training_dot_training__pb2.NackBatchReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -556,8 +504,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/RenewLease',
-            training__pb2.RenewLeaseReq.SerializeToString,
-            training__pb2.DeliveryRsp.FromString,
+            proto_dot_training_dot_training__pb2.RenewLeaseReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.DeliveryRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -583,8 +531,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/FinalizeSamplePool',
-            training__pb2.FinalizeSamplePoolReq.SerializeToString,
-            training__pb2.FinalizeSamplePoolRsp.FromString,
+            proto_dot_training_dot_training__pb2.FinalizeSamplePoolReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.FinalizeSamplePoolRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -610,8 +558,8 @@ class SamplePoolConsumerService:
             request,
             target,
             '/rl.training.v1.SamplePoolConsumerService/GetStatus',
-            training__pb2.SamplePoolStatusReq.SerializeToString,
-            training__pb2.SamplePoolStatusRsp.FromString,
+            proto_dot_training_dot_training__pb2.SamplePoolStatusReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.SamplePoolStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -634,28 +582,28 @@ class ModelDistributorServiceStub:
         """
         self.RegisterModel = channel.unary_unary(
                 '/rl.training.v1.ModelDistributorService/RegisterModel',
-                request_serializer=training__pb2.RegisterModelReq.SerializeToString,
-                response_deserializer=training__pb2.RegisterModelRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.RegisterModelReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.RegisterModelRsp.FromString,
                 _registered_method=True)
         self.GetModelManifest = channel.unary_unary(
                 '/rl.training.v1.ModelDistributorService/GetModelManifest',
-                request_serializer=training__pb2.GetModelManifestReq.SerializeToString,
-                response_deserializer=training__pb2.GetModelManifestRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.GetModelManifestReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.GetModelManifestRsp.FromString,
                 _registered_method=True)
         self.DownloadModel = channel.unary_stream(
                 '/rl.training.v1.ModelDistributorService/DownloadModel',
-                request_serializer=training__pb2.DownloadModelReq.SerializeToString,
-                response_deserializer=training__pb2.ModelChunk.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.DownloadModelReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.ModelChunk.FromString,
                 _registered_method=True)
         self.AckModel = channel.unary_unary(
                 '/rl.training.v1.ModelDistributorService/AckModel',
-                request_serializer=training__pb2.AckModelReq.SerializeToString,
-                response_deserializer=training__pb2.AckModelRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.AckModelReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.AckModelRsp.FromString,
                 _registered_method=True)
         self.GetModelDistributorStatus = channel.unary_unary(
                 '/rl.training.v1.ModelDistributorService/GetModelDistributorStatus',
-                request_serializer=training__pb2.ModelDistributorStatusReq.SerializeToString,
-                response_deserializer=training__pb2.ModelDistributorStatusRsp.FromString,
+                request_serializer=proto_dot_training_dot_training__pb2.ModelDistributorStatusReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.ModelDistributorStatusRsp.FromString,
                 _registered_method=True)
 
 
@@ -697,28 +645,28 @@ def add_ModelDistributorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'RegisterModel': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterModel,
-                    request_deserializer=training__pb2.RegisterModelReq.FromString,
-                    response_serializer=training__pb2.RegisterModelRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.RegisterModelReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.RegisterModelRsp.SerializeToString,
             ),
             'GetModelManifest': grpc.unary_unary_rpc_method_handler(
                     servicer.GetModelManifest,
-                    request_deserializer=training__pb2.GetModelManifestReq.FromString,
-                    response_serializer=training__pb2.GetModelManifestRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.GetModelManifestReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.GetModelManifestRsp.SerializeToString,
             ),
             'DownloadModel': grpc.unary_stream_rpc_method_handler(
                     servicer.DownloadModel,
-                    request_deserializer=training__pb2.DownloadModelReq.FromString,
-                    response_serializer=training__pb2.ModelChunk.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.DownloadModelReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.ModelChunk.SerializeToString,
             ),
             'AckModel': grpc.unary_unary_rpc_method_handler(
                     servicer.AckModel,
-                    request_deserializer=training__pb2.AckModelReq.FromString,
-                    response_serializer=training__pb2.AckModelRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.AckModelReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.AckModelRsp.SerializeToString,
             ),
             'GetModelDistributorStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetModelDistributorStatus,
-                    request_deserializer=training__pb2.ModelDistributorStatusReq.FromString,
-                    response_serializer=training__pb2.ModelDistributorStatusRsp.SerializeToString,
+                    request_deserializer=proto_dot_training_dot_training__pb2.ModelDistributorStatusReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.ModelDistributorStatusRsp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -746,8 +694,8 @@ class ModelDistributorService:
             request,
             target,
             '/rl.training.v1.ModelDistributorService/RegisterModel',
-            training__pb2.RegisterModelReq.SerializeToString,
-            training__pb2.RegisterModelRsp.FromString,
+            proto_dot_training_dot_training__pb2.RegisterModelReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.RegisterModelRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -773,8 +721,8 @@ class ModelDistributorService:
             request,
             target,
             '/rl.training.v1.ModelDistributorService/GetModelManifest',
-            training__pb2.GetModelManifestReq.SerializeToString,
-            training__pb2.GetModelManifestRsp.FromString,
+            proto_dot_training_dot_training__pb2.GetModelManifestReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.GetModelManifestRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -800,8 +748,8 @@ class ModelDistributorService:
             request,
             target,
             '/rl.training.v1.ModelDistributorService/DownloadModel',
-            training__pb2.DownloadModelReq.SerializeToString,
-            training__pb2.ModelChunk.FromString,
+            proto_dot_training_dot_training__pb2.DownloadModelReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.ModelChunk.FromString,
             options,
             channel_credentials,
             insecure,
@@ -827,8 +775,8 @@ class ModelDistributorService:
             request,
             target,
             '/rl.training.v1.ModelDistributorService/AckModel',
-            training__pb2.AckModelReq.SerializeToString,
-            training__pb2.AckModelRsp.FromString,
+            proto_dot_training_dot_training__pb2.AckModelReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.AckModelRsp.FromString,
             options,
             channel_credentials,
             insecure,
@@ -854,8 +802,8 @@ class ModelDistributorService:
             request,
             target,
             '/rl.training.v1.ModelDistributorService/GetModelDistributorStatus',
-            training__pb2.ModelDistributorStatusReq.SerializeToString,
-            training__pb2.ModelDistributorStatusRsp.FromString,
+            proto_dot_training_dot_training__pb2.ModelDistributorStatusReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.ModelDistributorStatusRsp.FromString,
             options,
             channel_credentials,
             insecure,
