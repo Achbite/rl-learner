@@ -42,6 +42,8 @@ make dev-refresh
 bash ./test.sh
 ```
 
+组合测试还需显式提供本批构建的 `RL_AISERVER_TEST_BINARY`、`RL_MODEL_DISTRIBUTOR_TEST_BINARY`，以及当前 `RL_AISERVER_SOURCE_DIR`（读取配置与固定 ONNX fixture）。这些路径位于测试容器内，相应二进制依赖库须可加载；入口不会搜索旧制品或连接运行中的训练服务。组合用例只验证启动 FAILED 的跨组件传播，不执行训练循环。
+
 `make deps` 使用工作区已显式生成的 Training Proto 编译输入构建 Sample Pool/Model Distributor
 开发制品，并只把两个二进制与配置装配到 Learner；二进制始终更新，已存在的目标配置不会被覆盖。
 Learner 的 Proto 始终由本仓维护。
@@ -84,9 +86,10 @@ Runtime 复用同一解析器，shell 不保存第二套训练目录、端点或
 范围严格限制在这个目录的子项。需要保留或继承的模型必须在下一次启动前复制到该目录之外。
 
 没有 AIServer 时，Learner 默认无限等待 AIServer 对 bootstrap 模型的 exact ACK，并保持
-Sample Pool、Model Distributor 和监控存活；等待只会因 exact ACK、显式 `SIGINT/SIGTERM`
-或 config 中显式设置的正数 `aiserver_status.initial_model_ack_timeout_sec` 结束。Client 可以在
-AIServer ready 后再启动。
+Sample Pool、Model Distributor 和监控存活。匹配 bootstrap 的 LOADED ACK 使训练继续；
+匹配该模型的 FAILED ACK 会立即结束启动，并保留 AIServer 的失败阶段、来源和原始错误。
+显式 `SIGINT/SIGTERM` 或正数 `aiserver_status.initial_model_ack_timeout_sec` 也会结束等待。
+Client 可以在 AIServer ready 后再启动。
 
 `dashboard.enabled: true` 是本地默认值。严格布尔环境变量
 `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` 关闭预览，CLI `--monitor/--no-monitor` 优先于环境变量。
@@ -104,7 +107,10 @@ SSH tunnel 保持 `http://127.0.0.1:9005/monitor`。MetricsServer 使用独立�
 Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 从 READY 集合随机无放回
 抽取 `training.train_batch_size` 条 processed transition，对整批 advantage 做一次归一化，再按
 `mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。一个 batch 可以包含多个 behavior model step；
-每条 transition 的 lineage/step 仍作为真实 provenance 和 lag 指标保留。Action mask 由
+Pool 原样返回每条 transition 所属 Envelope 的完整 behavior_model 与 producer；Learner
+校验实际来源与当前训练的发布模型匹配，不根据 step 补造来源 lineage。训练回执保留这些来源。
+GetBatch 传输结果未知时，先等待该次 RPC 截止，再读取同 Pool 的租约状态；取消和超时后禁止
+创建新租约由 Pool 负责，不使用固定次数的零租约查询推断旧请求已经完成。Action mask 由
 `policy.action_mask_mode` 控制：`disabled` 时样本必须不带 mask，`required` 时 Learner 按
 `model.action_count` 校验并在 PPO logits 上应用；它不是所有任务的必选项。
 

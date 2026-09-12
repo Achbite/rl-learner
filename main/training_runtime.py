@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import grpc
 import torch
@@ -126,7 +126,6 @@ def read_json(path: Path) -> dict:
 class ModelPublisher:
     MODEL_FILE = "SaveModel.onnx"
     MANIFEST_FILE = "manifest.pb"
-    MIN_ROLLING_PUBLICATIONS = 101
     MAX_MODEL_STEP = (1 << 64) - 1
     PROVENANCE_KEYS = (
         "initial_model_path",
@@ -146,13 +145,8 @@ class ModelPublisher:
         self.publication_dir = self.local_train_root
         self.metrics_dir = self.local_train_root / "metrics"
         self.archive_interval_updates = int(model["archive_interval_updates"])
-        self.publication_retention_steps = int(
-            model["publication_retention_steps"]
-        )
         if self.archive_interval_updates <= 0:
             raise ValueError("archive_interval_updates must be positive")
-        if self.publication_retention_steps <= 0:
-            raise ValueError("publication_retention_steps must be positive")
         self.initial_model_provenance: dict = {}
         self._prepared = False
 
@@ -244,7 +238,6 @@ class ModelPublisher:
             return None
         for prefix in (
             ".publication-",
-            ".prune-",
             ".rollback-delete-",
         ):
             if not path.name.startswith(prefix):
@@ -652,14 +645,6 @@ class ModelPublisher:
             },
         }
 
-    def complete_manifests(self) -> list[dict]:
-        result: list[dict] = []
-        for step, _path in self._canonical_step_directories():
-            document = self.complete_manifest(step)
-            if document:
-                result.append(document)
-        return result
-
     def _canonical_step_directories(self) -> list[tuple[int, Path]]:
         candidates: list[tuple[int, Path]] = []
         for path in self.publication_dir.iterdir():
@@ -673,13 +658,6 @@ class ModelPublisher:
                 continue
             candidates.append((step, path))
         return sorted(candidates, key=lambda item: item[0])
-
-    def latest_complete_checkpoint(self) -> Path | None:
-        manifests = self.complete_manifests()
-        if not manifests:
-            return None
-        model_step = int(manifests[-1]["identity"]["model_step"])
-        return self.checkpoint_path(model_step)
 
     def should_mark_permanent(self, run_train_updates: int) -> bool:
         return (
@@ -712,60 +690,6 @@ class ModelPublisher:
         self._fsync_directory(self.publication_dir)
         shutil.rmtree(quarantine)
         self._fsync_directory(self.publication_dir)
-
-    def prune_publications(
-        self, current_step: int, protected_steps: Iterable[int] = ()
-    ) -> list[int]:
-        current = int(current_step)
-        self.step_name(current)
-        minimum = max(
-            0,
-            current - self.publication_retention_steps + 1,
-        )
-        protected = {int(step) for step in protected_steps}
-        protected.add(current)
-        removed: list[int] = []
-        for model_step, target in self._canonical_step_directories():
-            if model_step >= minimum or model_step in protected:
-                continue
-            verified = self.complete_manifest(model_step)
-            if verified is None:
-                raise RuntimeError(
-                    f"refusing to prune unverified publication: {target}"
-                )
-            if verified.get("retention", {}).get("class") == "permanent":
-                continue
-            if (
-                verified.get("retention", {}).get("class") != "rolling"
-                or not self._is_canonical_publication_path(target, model_step)
-            ):
-                raise RuntimeError(
-                    f"refusing to prune invalid publication: {target}"
-                )
-            quarantine = self.publication_dir / (
-                f".prune-{self.step_name(model_step)}-"
-                f"{os.getpid()}-{time.time_ns()}"
-            )
-            os.replace(target, quarantine)
-            self._fsync_directory(self.publication_dir)
-            if (
-                self._private_publication_directory_step(quarantine)
-                != model_step
-            ):
-                raise RuntimeError(
-                    f"prune quarantine identity mismatch: {quarantine}"
-                )
-            shutil.rmtree(quarantine)
-            self._fsync_directory(self.publication_dir)
-            checkpoint_path = self.checkpoint_path(model_step)
-            if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
-                raise RuntimeError(
-                    f"private checkpoint disappeared during pruning: {checkpoint_path}"
-                )
-            checkpoint_path.unlink()
-            self._fsync_directory(self.checkpoint_dir)
-            removed.append(model_step)
-        return removed
 
 
 class LeaseRenewer:
@@ -836,8 +760,6 @@ class TrainingRuntime:
     SAMPLE_RETRY_INITIAL_SEC = 0.05
     SAMPLE_RETRY_MAX_SEC = 1.0
     GET_BATCH_RECONCILE_POLL_SEC = 0.5
-    GET_BATCH_RECONCILE_STABLE_WINDOW_SEC = 0.5
-    GET_BATCH_RECONCILE_CONFIRMATIONS = 2
     SHUTDOWN_RECONCILE_MARGIN_SEC = 5.0
     MANAGED_METRIC_READY_PATH = Path(
         "/run/rl/learner-metric-ready.json"
@@ -1630,12 +1552,20 @@ class TrainingRuntime:
                     status_authority_valid = True
                 except (AttributeError, RuntimeError):
                     status_authority_valid = False
+                exact_ack = status_authority_valid and _same_message(
+                    status.latest_ack_model, expected
+                )
+                if exact_ack and status.latest_ack_status == training_pb2.MODEL_LOAD_STATUS_FAILED:
+                    raise RuntimeError(
+                        "AIServer failed to load bootstrap model "
+                        f"lineage={expected.model_lineage_id} "
+                        f"model_step={int(expected.model_step)} "
+                        f"aiserver={status.latest_ack_aiserver.instance_id}: "
+                        f"{status.last_error}"
+                    )
                 if (
-                    status.ready
-                    and status_authority_valid
-                    and status.latest_ack_status
-                    == training_pb2.MODEL_LOAD_STATUS_LOADED
-                    and _same_message(status.latest_ack_model, expected)
+                    status.ready and exact_ack
+                    and status.latest_ack_status == training_pb2.MODEL_LOAD_STATUS_LOADED
                 ):
                     self.logger.info(
                         "AIServer bootstrap ACK received: "
@@ -1648,7 +1578,8 @@ class TrainingRuntime:
                     return source
                 last = (
                     f"status={training_pb2.ModelLoadStatus.Name(status.latest_ack_status)} "
-                    f"ack={model_identity_document(status.latest_ack_model)}"
+                    f"ack={model_identity_document(status.latest_ack_model)} "
+                    f"error={status.last_error}"
                 )
             except grpc.RpcError as error:
                 last = error.details() or str(error)
@@ -1841,25 +1772,6 @@ class TrainingRuntime:
     ) -> None:
         self._sample_status_for_authority(expected, "the lease")
 
-    def _resolvable_model_identity(
-        self, step: int
-    ) -> model_identity_pb2.ModelIdentity | None:
-        document = self.model_manifests.get(int(step))
-        if not isinstance(document, dict):
-            return None
-        try:
-            manifest = document["manifest"]
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return None
-        if (
-            manifest.identity.model_lineage_id
-            != self.publisher.lineage_id
-            or not self._has_field(manifest.identity, "model_step")
-            or int(manifest.identity.model_step) != int(step)
-        ):
-            return None
-        return manifest.identity
-
     def _assert_sample_pool_ready(
         self,
     ) -> common_pb2.ServiceInstanceIdentity:
@@ -1932,22 +1844,30 @@ class TrainingRuntime:
         deadline: float | None = None,
         *,
         ignore_stop: bool = False,
+        request_deadline: float | None = None,
     ) -> bool:
         expected = self._sample_pool_authority(expected)
         attempt = 0
-        stable_started: float | None = None
-        stable_confirmations = 0
         while (ignore_stop or not _stop_requested.is_set()) and (
             deadline is None or time.monotonic() < deadline
         ):
+            # A transport failure can arrive before cancellation reaches Pool.
+            # Wait out this exact RPC's deadline before observing lease state;
+            # repeated zero-lease snapshots cannot prove the request has ended.
+            if request_deadline is not None and time.monotonic() < request_deadline:
+                wait_until = request_deadline if deadline is None else min(request_deadline, deadline)
+                delay = max(0.0, wait_until - time.monotonic())
+                if ignore_stop:
+                    time.sleep(delay)
+                elif _stop_requested.wait(delay):
+                    return False
+                continue
             attempt += 1
             try:
                 status = self._get_batch_recovery_status(expected)
             except grpc.RpcError as error:
                 if not self._is_retryable_sample_rpc(error):
                     raise
-                stable_started = None
-                stable_confirmations = 0
                 self._mark_sample_wait(
                     "GET_BATCH_OUTCOME_UNKNOWN",
                     "GetBatch reconciliation transport",
@@ -1961,8 +1881,6 @@ class TrainingRuntime:
                 continue
 
             if not status.ready or int(status.leased_transitions) > 0:
-                stable_started = None
-                stable_confirmations = 0
                 state = (
                     "hidden lease transitions="
                     f"{int(status.leased_transitions)}"
@@ -1976,34 +1894,13 @@ class TrainingRuntime:
                     attempt,
                 )
             else:
-                now = time.monotonic()
-                if stable_started is None:
-                    stable_started = now
-                stable_confirmations += 1
-                self._mark_sample_wait(
-                    "GET_BATCH_OUTCOME_UNKNOWN",
-                    "GetBatch reconciliation",
-                    "confirming stable zero-lease window",
-                    attempt,
+                # Pool checks cancellation/deadline before committing a lease;
+                # GetStatus observes the same lease state under the same lock.
+                self._clear_sample_wait()
+                self.logger.info(
+                    "GetBatch outcome reconciled without training: %s", reason
                 )
-                if (
-                    stable_confirmations
-                    >= self.GET_BATCH_RECONCILE_CONFIRMATIONS
-                    and now - stable_started
-                    >= self.GET_BATCH_RECONCILE_STABLE_WINDOW_SEC
-                ):
-                    # The server-side cancellation fence prevents the timed-out
-                    # handler from creating a later lease. Requiring repeated
-                    # zero-lease observations also keeps a retry out of a
-                    # transient status/lease projection boundary.
-                    self._clear_sample_wait()
-                    info = getattr(self.logger, "info", None)
-                    if callable(info):
-                        info(
-                            "GetBatch outcome reconciled without training: %s",
-                            reason,
-                        )
-                    return True
+                return True
             poll_delay = self.GET_BATCH_RECONCILE_POLL_SEC
             if deadline is not None:
                 poll_delay = min(
@@ -2020,7 +1917,13 @@ class TrainingRuntime:
     def _get_batch(
         self,
         ready_authority: common_pb2.ServiceInstanceIdentity | None = None,
+        *,
+        request_deadline: float | None = None,
     ):
+        if request_deadline is None:
+            request_deadline = time.monotonic() + max(
+                2.0, self.get_timeout_ms / 1000.0 + 1.0
+            )
         response = self.sample_stub.GetBatch(
             training_pb2.GetBatchReq(
                 requested_transitions=self.train_batch_size,
@@ -2028,7 +1931,7 @@ class TrainingRuntime:
                 consumer=self.learner_service,
                 lease_timeout_ms=self.lease_timeout_ms,
             ),
-            timeout=max(2.0, self.get_timeout_ms / 1000.0 + 1.0),
+            timeout=max(0.0, request_deadline - time.monotonic()),
         )
         if response.result == training_pb2.GET_BATCH_RESULT_BUSY:
             response_authority = self._sample_pool_authority(
@@ -2107,8 +2010,13 @@ class TrainingRuntime:
         ignore_stop: bool = False,
     ):
         expected = self._sample_pool_authority(ready_authority)
+        request_deadline = time.monotonic() + max(
+            2.0, self.get_timeout_ms / 1000.0 + 1.0
+        )
         try:
-            response = self._get_batch(ready_authority=expected)
+            response = self._get_batch(
+                ready_authority=expected, request_deadline=request_deadline
+            )
         except grpc.RpcError as error:
             if not self._is_retryable_sample_rpc(error):
                 raise
@@ -2124,6 +2032,7 @@ class TrainingRuntime:
                 reason,
                 deadline=deadline,
                 ignore_stop=ignore_stop,
+                request_deadline=request_deadline,
             )
             return None
         if response.result == training_pb2.GET_BATCH_RESULT_BUSY:
@@ -2191,6 +2100,7 @@ class TrainingRuntime:
         item_ids: set[str] = set()
         behavior_steps: set[int] = set()
         behavior_models: dict[int, dict] = {}
+        producers: dict[tuple[str, str, int], dict] = {}
         transition_created_at: list[int] = []
         inserted_at: list[int] = []
         draw_counts: list[int] = []
@@ -2198,8 +2108,7 @@ class TrainingRuntime:
             transition = item.transition
             self._validate_transition(transition)
             if (
-                not transition.item_id
-                or transition.item_id in item_ids
+                transition.item_id in item_ids
                 or int(item.insert_sequence) <= 0
                 or int(item.inserted_at_unix_ms) <= 0
                 or int(item.draw_count) <= 0
@@ -2208,17 +2117,35 @@ class TrainingRuntime:
             item_ids.add(transition.item_id)
             step = int(transition.behavior_model_step)
             behavior_steps.add(step)
-            resolved = self._resolvable_model_identity(step)
-            if resolved is None:
+            identity = model_identity_document(item.behavior_model)
+            if (
+                not identity
+                or identity["model_step"] != step
+                or identity["model_lineage_id"] != self.publisher.lineage_id
+            ):
                 raise ValueError(
-                    "processed transition behavior model is not locally resolvable"
+                    "processed transition source model does not match the "
+                    f"training lineage/step: item={transition.item_id} source={identity}"
                 )
-            identity = model_identity_document(resolved)
-            previous = behavior_models.setdefault(step, identity)
-            if previous != identity:
+            document = self.model_manifests.get(step)
+            if document is None or not _same_message(
+                item.behavior_model, document["manifest"].identity
+            ):
                 raise ValueError(
-                    "one behavior model step has conflicting artifact identity"
+                    "processed transition source model is not a published "
+                    f"training model: item={transition.item_id} source={identity}"
                 )
+            behavior_models[step] = identity
+            try:
+                producer = self._aiserver_authority(item.producer)
+            except RuntimeError as error:
+                raise ValueError(
+                    f"processed transition producer is invalid: item={transition.item_id}: {error}"
+                ) from error
+            producer_key = (
+                producer.component, producer.instance_id, int(producer.lifecycle_epoch)
+            )
+            producers[producer_key] = self._authority_document(producer)
             transition_created_at.append(int(transition.created_at_unix_ms))
             inserted_at.append(int(item.inserted_at_unix_ms))
             draw_counts.append(int(item.draw_count))
@@ -2228,10 +2155,11 @@ class TrainingRuntime:
         oldest_created_at = min(transition_created_at)
         newest_created_at = max(transition_created_at)
         return {
-            "model_lineage_id": self.publisher.lineage_id,
+            "model_lineage_id": behavior_models[minimum_step]["model_lineage_id"],
             "minimum_model_step": minimum_step,
             "maximum_model_step": maximum_step,
             "models": [behavior_models[step] for step in sorted(behavior_steps)],
+            "producers": [producers[key] for key in sorted(producers)],
             "oldest_transition_created_at_unix_ms": oldest_created_at,
             "newest_transition_created_at_unix_ms": newest_created_at,
             "oldest_inserted_at_unix_ms": min(inserted_at),
