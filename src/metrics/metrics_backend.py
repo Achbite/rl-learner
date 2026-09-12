@@ -43,29 +43,6 @@ class MetricsBackend(abc.ABC):
         ...
 
 
-class DisabledMetricsBackend(MetricsBackend):
-    """Fail-open sink used when the optional metrics store is unavailable."""
-
-    def __init__(self, reason: str):
-        self.reason = str(reason)
-
-    def write(self, record: dict):
-        del record
-
-    def query(self, since_step: int = 0, limit: int = 0) -> List[dict]:
-        del since_step, limit
-        return []
-
-    def latest(self) -> Optional[dict]:
-        return None
-
-    def summary(self) -> dict:
-        return {"enabled": False, "reason": self.reason}
-
-    def close(self):
-        return None
-
-
 class JsonlBackend(MetricsBackend):
     """
     JSON Lines 文件存储后端

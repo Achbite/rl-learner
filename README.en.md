@@ -48,6 +48,8 @@ make dev-refresh
 bash ./test.sh
 ```
 
+The combined test requires explicit `RL_AISERVER_TEST_BINARY`, `RL_MODEL_DISTRIBUTOR_TEST_BINARY` from the current production builds, and `RL_AISERVER_SOURCE_DIR` for the current config and fixed ONNX fixture. These are container paths with loadable runtime dependencies. The entrypoint does not search for older artifacts or use running training services. It verifies bootstrap FAILED propagation without starting a training loop.
+
 `make deps` uses the explicitly generated Training Proto build inputs already in
 the workspace to build Sample Pool and Model Distributor development artifacts,
 then stages only their binaries and configs into Learner. Binaries are always
@@ -96,10 +98,12 @@ Copy any model that must survive or seed the next invocation outside this
 directory before starting again.
 
 Without AIServer, Learner keeps Sample Pool, Model Distributor, and monitoring
-alive while waiting without a deadline for the exact bootstrap-model ACK. The
-wait ends only on that ACK, explicit `SIGINT/SIGTERM`, or a positive
-`aiserver_status.initial_model_ack_timeout_sec` configured for a bounded
-diagnostic. Client can start after AIServer is ready.
+alive while waiting without a deadline for the exact bootstrap-model ACK.
+Training starts on a matching LOADED ACK. A FAILED ACK for the exact
+bootstrap model ends startup immediately with the AIServer stage, source and
+original error. Explicit `SIGINT/SIGTERM` or a positive configured
+`aiserver_status.initial_model_ack_timeout_sec` also ends the wait.
+Client can start after AIServer is ready.
 
 `dashboard.enabled: true` is the local default. The strict boolean environment
 variable `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` can disable it; CLI
@@ -123,8 +127,13 @@ Learner does not consume raw trajectories or compute GAE. It
 asks SamplePool to draw `training.train_batch_size` READY processed transitions
 uniformly without replacement, normalizes advantages once over the full batch,
 then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
-batch may contain multiple behavior-model steps; each transition retains exact
-lineage and step provenance for lag observation. `policy.action_mask_mode`
+batch may contain multiple behavior-model steps. Pool returns the original
+Envelope behavior_model and producer with each item; Learner checks the actual
+source against its published training models instead of reconstructing lineage
+from a local step. Update receipts retain those source identities. An unknown
+GetBatch transport outcome waits for that RPC deadline before querying the same
+Pool's lease state. Pool owns the cancellation boundary; repeated zero-lease
+snapshots are not used to infer that an old request has completed. `policy.action_mask_mode`
 controls action masks: `disabled` requires no mask, while `required` validates
 `model.action_count` and applies the mask to PPO
 logits. Masks are not mandatory for every task.
