@@ -11,28 +11,8 @@ elif [ -n "${RL_INFRA_MANAGED:-}" ]; then
     echo "RL_INFRA_MANAGED must be exactly true when supplied" >&2
     exit 2
 fi
-repository_sample_pool_dir="${repo_dir}/sample-pool"
-runtime_sample_pool_dir="/opt/rl/learner/sample-pool"
-repository_distributor_dir="${repo_dir}/model-distributor"
-runtime_distributor_dir="/opt/rl/learner/model-distributor"
-if [ -x "${repository_sample_pool_dir}/bin/maze_sample_pool" ] &&
-   [ -f "${repository_sample_pool_dir}/config/pool_config.yaml" ]; then
-    default_sample_pool_dir="${repository_sample_pool_dir}"
-elif [ -x "${runtime_sample_pool_dir}/bin/maze_sample_pool" ] &&
-     [ -f "${runtime_sample_pool_dir}/config/pool_config.yaml" ]; then
-    default_sample_pool_dir="${runtime_sample_pool_dir}"
-else
-    default_sample_pool_dir="${repository_sample_pool_dir}"
-fi
-if [ -x "${repository_distributor_dir}/bin/maze_model_distributor" ] &&
-   [ -f "${repository_distributor_dir}/config/model_distributor_config.yaml" ]; then
-    default_distributor_dir="${repository_distributor_dir}"
-elif [ -x "${runtime_distributor_dir}/bin/maze_model_distributor" ] &&
-     [ -f "${runtime_distributor_dir}/config/model_distributor_config.yaml" ]; then
-    default_distributor_dir="${runtime_distributor_dir}"
-else
-    default_distributor_dir="${repository_distributor_dir}"
-fi
+default_sample_pool_dir="${repo_dir}/sample-pool"
+default_distributor_dir="${repo_dir}/model-distributor"
 sample_pool_bin="${SAMPLE_POOL_BIN:-${default_sample_pool_dir}/bin/maze_sample_pool}"
 sample_pool_config="${SAMPLE_POOL_CONFIG:-${default_sample_pool_dir}/config/pool_config.yaml}"
 model_distributor_bin="${MODEL_DISTRIBUTOR_BIN:-${default_distributor_dir}/bin/maze_model_distributor}"

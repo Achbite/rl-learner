@@ -24,16 +24,17 @@ workspace/
 ```
 
 The first three repositories add no runtime container. Sample Pool and Model
-Distributor are required Learner binaries and are built and synchronized by the
-explicit `make deps` command. That command never replaces Learner-local Proto.
+Distributor are required Learner binaries supplied explicitly by the caller.
+With Framework's layout, Framework invokes each repository's build and stages the artifacts;
+Learner builds only its own source and image.
 See [rl-framework](https://github.com/Achbite/rl-framework) for the
 startup order.
 
 ## 1. Component development environment
 
 ```bash
-# Host: explicitly build and stage the two service artifacts initially or after changes
-make deps
+# Host: organize dependencies when using Framework's sibling layout
+(cd ../rl-framework && bash ./sync_artifacts.sh --development)
 
 # Host: build/create when absent; otherwise reuse and enter directly
 make shell
@@ -50,14 +51,10 @@ bash ./test.sh
 
 The combined test requires explicit `RL_AISERVER_TEST_BINARY`, `RL_MODEL_DISTRIBUTOR_TEST_BINARY` from the current production builds, and `RL_AISERVER_SOURCE_DIR` for the current config and fixed ONNX fixture. These are container paths with loadable runtime dependencies. The entrypoint does not search for older artifacts or use running training services. It verifies bootstrap FAILED propagation without starting a training loop.
 
-`make deps` uses the explicitly generated Training Proto build inputs already in
-the workspace to build Sample Pool and Model Distributor development artifacts,
-then stages only their binaries and configs into Learner. Binaries are always
-updated; existing target configs are preserved. Learner Proto remains owned by
-this repository. Development artifacts stay under `.workspace/dev-artifacts`
-and cannot feed a formal image. `make shell` does not invoke `make deps`, does not
-require clean source, and runs only on the host. Only `make dev-refresh` replaces
-the resident container, and it refuses while a training chain is active.
+Framework stages the two service binaries and configs, preserving identical files and existing
+configurations. Learner Proto adoption uses a separate explicit entrypoint. `make shell` runs
+on the host without requiring clean source. Only `make dev-refresh` replaces the resident
+container; it refuses while a training chain is active.
 
 ## 2. Start Learner-side services
 
@@ -198,12 +195,14 @@ Synchronize initially or after dependency changes, then build with an explicit
 project tag from the host:
 
 ```bash
-bash scripts/sync_runtime_artifacts.sh
+bash scripts/sync_runtime_artifacts.sh \
+  --sample-pool-dir /path/to/pool-artifact \
+  --model-distributor-dir /path/to/distributor-artifact
 RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
-The formal scripts never consume `.workspace/dev-artifacts` or a mutable
-development-container build directory. Assembly checks only that the two required
+The staging script requires explicit input directories; image builds use only already staged
+files and never search the workspace or a development container. Assembly checks only that the two required
 binaries and configs exist and that the binaries are executable; they read no
 package version, platform, manifest, repository identity, or hash. The build derives
 no cross-repository stack identity.
@@ -235,3 +234,14 @@ or protocols.
 ## License
 
 [MIT License](LICENSE)
+
+## Build input and cache ownership
+
+`make build` compiles this repository's Python bytecode. `build_image.sh` verifies and packages
+its current source and explicitly staged dependencies, without building or synchronizing any
+other repository. In Framework's sibling layout, run Framework's `sync_artifacts.sh` first to
+update native dependencies. Standalone callers select both artifact directories explicitly.
+`.dockerignore` excludes workspace history, models, logs and build trees. Development-container
+reuse checks its source mount to avoid building another checkout. Tests run only via `test.sh`.
+
+The Python compilation check refreshes mounted input attributes and regenerates `checked-hash` bytecode, avoiding stale `.pyc` reuse after equal-size edits within one second. CPython validates runtime bytecode against source content, while unchanged image builds reuse BuildKit layers.

@@ -23,13 +23,10 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /opt/rl/learner
 COPY . /opt/rl/learner
-RUN cp -a _deps/sample-pool /opt/rl/learner/sample-pool && \
-    cp -a _deps/model-distributor /opt/rl/learner/model-distributor && \
-    rm -rf _deps && \
-    chmod +x run.sh scripts/entrypoint.sh && \
+RUN chmod +x run.sh scripts/entrypoint.sh && \
     chmod +x /opt/rl/learner/sample-pool/bin/maze_sample_pool && \
     chmod +x /opt/rl/learner/model-distributor/bin/maze_model_distributor && \
-    python3 -m compileall -q main proto src tools
+    python3 -m compileall -q -f --invalidation-mode checked-hash main proto src tools
 
 EXPOSE 9005 9100 9200
 HEALTHCHECK --interval=2s --timeout=2s --start-period=20s --retries=30 \

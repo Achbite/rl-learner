@@ -1,0 +1,14 @@
+.git
+.workspace
+.DS_Store
+build*
+logs
+models
+__pycache__
+*.pyc
+sample-pool/*
+!sample-pool/bin/
+!sample-pool/config/
+model-distributor/*
+!model-distributor/bin/
+!model-distributor/config/

@@ -20,14 +20,14 @@ workspace/
 ```
 
 前三个仓库不增加运行容器。Sample Pool 与 Model Distributor 是 Learner 必需的二进制依赖，
-使用显式 `make deps` 构建并同步；该命令不会覆盖 Learner 本地 Proto 或 schema。完整启动顺序参阅
+由调用者提供并显式装配。在上述布局下，Framework 调用各仓 build 后同步制品；Learner build 只处理本仓。完整启动顺序参阅
 [rl-framework](https://github.com/Achbite/rl-framework)。
 
 ## 1. 组件开发环境
 
 ```bash
-# 宿主机：首次使用或依赖变化后，显式构建并同步两个服务制品
-make deps
+# 宿主机：符合 Framework 布局时，显式组织依赖构建与装配
+(cd ../rl-framework && bash ./sync_artifacts.sh --development)
 
 # 宿主机：容器不存在时构建并创建；存在时直接复用并进入
 make shell
@@ -44,12 +44,9 @@ bash ./test.sh
 
 组合测试还需显式提供本批构建的 `RL_AISERVER_TEST_BINARY`、`RL_MODEL_DISTRIBUTOR_TEST_BINARY`，以及当前 `RL_AISERVER_SOURCE_DIR`（读取配置与固定 ONNX fixture）。这些路径位于测试容器内，相应二进制依赖库须可加载；入口不会搜索旧制品或连接运行中的训练服务。组合用例只验证启动 FAILED 的跨组件传播，不执行训练循环。
 
-`make deps` 使用工作区已显式生成的 Training Proto 编译输入构建 Sample Pool/Model Distributor
-开发制品，并只把两个二进制与配置装配到 Learner；二进制始终更新，已存在的目标配置不会被覆盖。
-Learner 的 Proto 始终由本仓维护。
-开发制品只写入 `.workspace/dev-artifacts`，不得用于正式镜像。`make shell` 不调用 `make deps`，
-也不要求源码 clean；它只能在宿主机执行。`make dev-refresh` 才会替换常驻容器，活动训练链存在时
-会明确失败。
+Framework 同步只装配两个服务的二进制与配置，保留内容相同的文件及已有目标配置。
+Learner Proto 的采纳由独立同步入口负责。`make shell` 只在宿主机执行，不要求源码 clean。
+`make dev-refresh` 才会替换常驻容器，活动训练链存在时会明确失败。
 
 ## 2. 启动 Learner 侧服务
 
@@ -165,11 +162,13 @@ Model Distributor 运行产物。正式同步脚本更新两个本地服务的�
 Contracts 覆盖 Learner 源码。首次构建或依赖版本变化后，在宿主机显式同步并使用项目 tag 构建：
 
 ```bash
-bash scripts/sync_runtime_artifacts.sh
+bash scripts/sync_runtime_artifacts.sh \
+  --sample-pool-dir /path/to/pool-artifact \
+  --model-distributor-dir /path/to/distributor-artifact
 RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh
 ```
 
-正式脚本不读取 `.workspace/dev-artifacts` 或开发容器的可变 build 目录。装配检查只确认两个必需
+装配入口要求显式输入路径，镜像入口只使用已装配的文件，不搜索工作区或开发容器。装配检查只确认两个必需
 二进制和配置存在、二进制可执行，不读取包版本、平台、manifest、仓库身份或哈希。构建不计算
 跨仓 stack source identity。未指定时使用
 `maze-tag-001`；同名 tag 允许由后续微调构建直接覆盖。
@@ -244,3 +243,13 @@ make dev-clean
 ## License
 
 [MIT License](LICENSE)
+
+## 构建与装配一致性
+
+`make build` 只编译本仓 Python 字节码；`build_image.sh` 校验并打包本仓源码及已装配依赖，不构建或同步其他仓。
+需要更新工作区所有依赖时，在 Framework 执行 `bash sync_artifacts.sh`，再调用本仓镜像入口。
+独立使用时，通过带两个显式目录参数的 `scripts/sync_runtime_artifacts.sh` 选择依赖。已有运行配置始终保留。
+
+`.dockerignore` 是镜像上下文的唯一排除清单，历史 `.workspace`、模型、日志与构建目录不入包。`make shell` 不同步协议；`make dev-refresh` 显式更新环境。容器复用/刷新前核对源码挂载，避免从另一 checkout 构建错误源码。
+
+Python 编译检查先刷新挂载输入属性，再显式生成 `checked-hash` 字节码，避免同秒、同大小修改命中旧 `.pyc`。这一步重新编译本仓 Python 文件；运行时字节码缓存由 CPython 根据源码内容校验，镜像的无修改重建仍复用 BuildKit 层。

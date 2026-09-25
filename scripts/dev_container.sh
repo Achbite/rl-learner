@@ -6,7 +6,7 @@ action="${1:-shell}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 container_name="learner-dev"
 network_name="rl-training-dev"
 monitor_host_port=9005
@@ -238,7 +238,7 @@ wait_monitor_identity() {
 }
 
 build_image() {
-    docker build \
+    docker build --provenance=false \
         --file "${repo_dir}/Dockerfile.dev" \
         --build-arg "PYTHON_DEV_BASE_IMAGE=${python_dev_base_image}" \
         --build-arg "TORCH_VERSION=${torch_version}" \
@@ -257,6 +257,15 @@ container_exists() {
     docker container inspect "${container_name}" >/dev/null 2>&1
 }
 
+require_checkout_mount() {
+    local mounted_source
+    mounted_source="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/workspace/rl-learner"}}{{.Source}}{{end}}{{end}}' "${container_name}")"
+    if [ "${mounted_source}" != "${repo_dir}" ]; then
+        echo "${container_name} is bound to ${mounted_source}, not ${repo_dir}; use its owning checkout to refresh or remove it" >&2
+        return 1
+    fi
+}
+
 container_running() {
     [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" = "true" ]
 }
@@ -267,32 +276,12 @@ container_uses_current_image() {
       "$(docker image inspect --format '{{.Id}}' "${dev_image}")" ]
 }
 
-container_has_legacy_artifact_mounts() {
-    local destinations
-    destinations="$(docker inspect \
-        --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
-        "${container_name}")"
-    case "${destinations}" in
-        *"/workspace/rl-learner/proto/common_pb2.py"*|\
-        *"/workspace/rl-learner/proto/training_pb2.py"*|\
-        *"/workspace/rl-learner/proto/training_pb2_grpc.py"*|\
-        *"/workspace/rl-learner/schemas"*|\
-        *"/workspace/rl-learner/sample-pool"*|\
-        *"/workspace/rl-learner/model-distributor"*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
 warn_container_drift() {
     if docker image inspect "${dev_image}" >/dev/null 2>&1 &&
        ! container_uses_current_image; then
         echo "learner-dev uses an older local image; run make dev-refresh when ready" >&2
     fi
-    if container_has_legacy_artifact_mounts; then
-        echo "learner-dev still has retired external artifact mounts; run make dev-refresh to use repository-owned inputs" >&2
-    fi
+
 }
 
 create_container() {
@@ -332,6 +321,7 @@ ensure_container_resources() {
 
 ensure_container() {
     if container_exists; then
+        require_checkout_mount
         if ! container_running; then
             docker start "${container_name}" >/dev/null
         fi
@@ -347,6 +337,9 @@ ensure_container() {
 
 refresh_container() {
     local process_state
+    if container_exists; then
+        require_checkout_mount
+    fi
     if container_exists && container_running; then
         process_state=0
         container_has_training_processes || process_state=$?
@@ -398,7 +391,7 @@ case "${action}" in
     build)
         ensure_container
         docker exec "${container_name}" sh -lc \
-            "cd /workspace/rl-learner && python3 -m compileall -q main proto src tools"
+            "cd /workspace/rl-learner && find main proto src tools -exec stat --cached=never --printf='' {} + && python3 -m compileall -q -f --invalidation-mode checked-hash main proto src tools"
         ;;
     monitor)
         ensure_container
@@ -415,8 +408,9 @@ case "${action}" in
         stop_monitor_transport
         ;;
     clean)
-        stop_monitor_transport
         if container_exists; then
+            require_checkout_mount
+            stop_monitor_transport
             if container_running; then
                 process_state=0
                 container_has_training_processes || process_state=$?

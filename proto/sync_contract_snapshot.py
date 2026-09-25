@@ -43,7 +43,9 @@ def sync_snapshot(artifact_root: Path, target_root: Path, profile: str) -> None:
         for local_name in files.values():
             target = target_root / local_name
             target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(stage / local_name, target)
+            staged = stage / local_name
+            if not target.is_file() or target.read_bytes() != staged.read_bytes():
+                os.replace(staged, target)
 
 
 def main() -> None:

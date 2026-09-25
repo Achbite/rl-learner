@@ -1,13 +1,10 @@
-.PHONY: shell build deps dev-clean dev-image dev-refresh
+.PHONY: shell build dev-clean dev-image dev-refresh
 
 shell:
 	@bash scripts/dev_container.sh shell
 
 build:
 	@bash scripts/dev_container.sh build
-
-deps:
-	@bash scripts/prepare_dev_artifacts.sh
 
 dev-clean:
 	@bash scripts/dev_container.sh clean
