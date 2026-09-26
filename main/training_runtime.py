@@ -2097,7 +2097,7 @@ class TrainingRuntime:
         ):
             raise ValueError("sample delivery violates exact transition batch size")
 
-        item_ids: set[str] = set()
+        item_snapshots: dict[str, training_pb2.SamplePoolItem] = {}
         behavior_steps: set[int] = set()
         behavior_models: dict[int, dict] = {}
         producers: dict[tuple[str, str, int], dict] = {}
@@ -2108,13 +2108,15 @@ class TrainingRuntime:
             transition = item.transition
             self._validate_transition(transition)
             if (
-                transition.item_id in item_ids
-                or int(item.insert_sequence) <= 0
+                int(item.insert_sequence) <= 0
                 or int(item.inserted_at_unix_ms) <= 0
                 or int(item.draw_count) <= 0
             ):
-                raise ValueError("sample pool item facts are invalid or duplicated")
-            item_ids.add(transition.item_id)
+                raise ValueError("sample pool item storage facts are invalid")
+            previous = item_snapshots.get(transition.item_id)
+            if previous is not None and previous != item:
+                raise ValueError("repeated sample item has conflicting snapshot facts")
+            item_snapshots[transition.item_id] = item
             step = int(transition.behavior_model_step)
             behavior_steps.add(step)
             identity = model_identity_document(item.behavior_model)
@@ -2923,7 +2925,9 @@ class TrainingRuntime:
             )
         counts = {
             "accepted": int(status.accepted_unique_transitions),
-            "acked": int(status.acked_unique_transitions),
+            "acked": int(status.acknowledged_transition_slot_count),
+            "released": int(status.released_transition_slot_count),
+            "drawn": int(status.drawn_transition_slot_count),
             "trained": int(status.trained_transition_count),
             "invalid": int(status.invalid_transition_count),
             "shutdown_untrained": int(
@@ -2951,22 +2955,18 @@ class TrainingRuntime:
             raise RuntimeError(
                 "sample pool retained live data after finalization"
             )
-        acknowledged_shutdown = (
-            counts["shutdown_untrained"] - counts["finalized"]
-        )
-        if acknowledged_shutdown < 0 or counts["acked"] != (
-            counts["trained"] + counts["invalid"] + acknowledged_shutdown
+        if counts["acked"] != (
+            counts["trained"] + counts["invalid"] + counts["shutdown_untrained"]
         ):
             raise RuntimeError(
                 "sample pool returned contradictory finalized disposition "
                 "accounting"
             )
-        if counts["accepted"] != (
-            counts["trained"]
-            + counts["invalid"]
-            + counts["shutdown_untrained"]
-            + counts["evicted"]
-        ):
+        if counts["drawn"] != counts["acked"] + counts["released"]:
+            raise RuntimeError(
+                "sample pool returned contradictory finalized draw-slot accounting"
+            )
+        if counts["accepted"] != counts["evicted"] + counts["finalized"]:
             raise RuntimeError(
                 "sample pool returned contradictory finalized transition "
                 "accounting"
@@ -3063,7 +3063,7 @@ class TrainingRuntime:
             )
             self._clear_sample_wait()
             self.logger.info(
-                "SamplePool finalized: id=%s settled_transitions=%d",
+                "SamplePool finalized: id=%s cleared_resident_transitions=%d",
                 finalization_id,
                 int(status.finalized_transition_count),
             )
@@ -3145,7 +3145,7 @@ class TrainingRuntime:
         status = self._sample_pool_status()
         authority = self._sample_pool_authority(status.sample_pool)
         with self._metrics_lock:
-            self._metrics_context["disposition"] = "FINALIZING_UNTRAINED_TAIL"
+            self._metrics_context["disposition"] = "FINALIZING_REPLAY_POOL"
         self._shutdown_finalize_sample_pool(authority)
         self.finalize_complete_path.parent.mkdir(parents=True, exist_ok=True)
         self.finalize_complete_path.write_text(

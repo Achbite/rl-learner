@@ -120,11 +120,17 @@ up. HTTP requests read the in-memory projection and do not control file-read
 progress. `/api/status` exposes the tail, backlog, and error facts. Port `9005`
 is optional observability; a monitor or port failure does not stop PPO.
 
-Learner does not consume raw trajectories or compute GAE. It
-asks SamplePool to draw `training.train_batch_size` READY processed transitions
-uniformly without replacement, normalizes advantages once over the full batch,
-then runs PPO/optimizer work according to `mini_batch_size` and `n_epochs`. A
-batch may contain multiple behavior-model steps. Pool returns the original
+Learner does not consume raw trajectories or compute GAE. It asks SamplePool for
+`training.train_batch_size` processed-transition slots, normalizes advantages once
+over the full batch, then runs PPO/optimizer work according to `mini_batch_size`
+and `n_epochs`. Pool's `sampling.strategy` defaults to `uniform_without_replacement`
+(unique within a batch), with `uniform_with_replacement` available. Both keep
+samples resident for cross-batch reuse; ACK/NACK/expiry do not drive eviction.
+Learner preserves repeated slots and requires identical snapshots for repeated
+item IDs within a batch. Cumulative trained samples count slots; unique items,
+duplicate slots and epoch evaluations are separate facts. Pool finalization does
+not classify resident replay items as untrained batches. A batch may contain
+multiple behavior-model steps. Pool returns the original
 Envelope behavior_model and producer with each item; Learner checks the actual
 source against its published training models instead of reconstructing lineage
 from a local step. Update receipts retain those source identities. An unknown

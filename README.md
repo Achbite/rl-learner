@@ -101,9 +101,13 @@ SSH tunnel 保持 `http://127.0.0.1:9005/monitor`。MetricsServer 使用独立�
 进度。`/api/status` 会报告 tail 运行、backlog 和错误事实。`9005` 只属于可选观测，端口或监控
 失败不会终止 PPO。
 
-Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 从 READY 集合随机无放回
-抽取 `training.train_batch_size` 条 processed transition，对整批 advantage 做一次归一化，再按
-`mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。一个 batch 可以包含多个 behavior model step；
+Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 随机读取
+`training.train_batch_size` 个 processed-transition 位置，对整批 advantage 做一次归一化，再按
+`mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。Pool 的 `sampling.strategy` 默认
+`uniform_without_replacement`（仅 batch 内不重复），可选 `uniform_with_replacement`。
+两者都保留池内样本并允许跨 batch 复用；ACK/NACK/到期不控制样本淘汰。Learner 不去重合法重复
+位置，同一 batch 中相同 item ID 的快照必须一致。训练累计样本数按位置计，唯一样本数和重复位置数
+分别记录，epoch 评估次数另计；池停止清理不计成未训练 batch。一个 batch 可以包含多个 behavior model step；
 Pool 原样返回每条 transition 所属 Envelope 的完整 behavior_model 与 producer；Learner
 校验实际来源与当前训练的发布模型匹配，不根据 step 补造来源 lineage。训练回执保留这些来源。
 GetBatch 传输结果未知时，先等待该次 RPC 截止，再读取同 Pool 的租约状态；取消和超时后禁止

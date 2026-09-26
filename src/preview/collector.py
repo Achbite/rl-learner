@@ -364,7 +364,7 @@ class PreviewCollector:
                 "rejected_transition_attempts": int(
                     status.rejected_transition_attempts
                 ),
-                "acked": int(status.acked_unique_transitions),
+                "acked": int(status.acknowledged_transition_slot_count),
                 "acked_deliveries": int(status.acked_unique_deliveries),
                 "trained": int(status.trained_transition_count),
                 "invalid": int(status.invalid_transition_count),
@@ -410,7 +410,7 @@ class PreviewCollector:
                 "target_hit_count": int(status.target_hit_count),
                 "partial_get_count": int(status.partial_get_count),
                 "empty_timeout_count": int(status.empty_timeout_count),
-                "redelivery_count": int(status.redelivery_count),
+                "released_transition_slot_count": int(status.released_transition_slot_count),
                 "nack_count": int(status.nack_count),
                 "expired_lease_count": int(status.expired_lease_count),
                 "lease_renew_count": int(status.lease_renew_count),

@@ -21,6 +21,8 @@ cd "${test_runtime_dir}"
 
 python3 -m unittest -v \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_processed_transition_data_reaches_real_trainer \
+    tests.test_delivery_contract.LearnerDevelopmentTest.test_replay_slots_reach_real_trainer_without_deduplication \
+    tests.test_delivery_contract.LearnerDevelopmentTest.test_replay_finalization_keeps_storage_and_draw_accounts_separate \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_local_effective_config_reaches_runtime_validation \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_get_batch_recovery_uses_request_deadline \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_busy_lease_and_stop_have_distinct_recovery \

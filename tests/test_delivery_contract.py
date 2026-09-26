@@ -159,6 +159,63 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     runtime._validate_delivery(invalid)
 
+    def test_replay_slots_reach_real_trainer_without_deduplication(self):
+        config = _trainer_config()
+        config["training"].update(train_batch_size=4, n_epochs=2)
+        runtime = self.runtime(config)
+        response = training_pb2.GetBatchRsp(
+            result=training_pb2.GET_BATCH_RESULT_LEASED, delivery_id="replay-batch")
+        for index in (0, 0, 1, 1):
+            response.items.add(
+                transition=self._transition(index, 5, 4),
+                insert_sequence=index + 1, inserted_at_unix_ms=1700000000100 + index,
+                draw_count=2, behavior_model=runtime.model_manifests[0]["manifest"].identity,
+                producer=identity_pb2.ServiceInstanceIdentity(
+                    component="aiserver", instance_id="producer-test", lifecycle_epoch=1))
+        runtime._validate_delivery(response)
+        batch, stats = train_processed_delivery(response.items, runtime.trainer)
+        self.assertEqual([item["item_id"] for item in batch], ["item-0", "item-0", "item-1", "item-1"])
+        self.assertEqual(stats["sample_evaluation_count"], 8)
+        self.assertEqual(stats["optimizer_step_count"], 4)
+        self.assertEqual(runtime.trainer.raw_metric_sum_counts()["raw_advantage"]["count"], 4)
+        # Reuse the unchanged snapshots in another update, not another Push.
+        runtime._validate_delivery(response)
+        _, repeated = train_processed_delivery(response.items, runtime.trainer)
+        self.assertEqual(repeated["model_step"], 2)
+        for changed in ("payload", "producer", "storage"):
+            with self.subTest(changed=changed):
+                conflict = training_pb2.GetBatchRsp()
+                conflict.CopyFrom(response)
+                if changed == "payload": conflict.items[1].transition.advantage += 1
+                elif changed == "producer": conflict.items[1].producer.instance_id = "other-source"
+                else: conflict.items[1].insert_sequence += 1
+                with self.assertRaisesRegex(ValueError, "conflicting snapshot"):
+                    runtime._validate_delivery(conflict)
+
+    def test_replay_finalization_keeps_storage_and_draw_accounts_separate(self):
+        runtime = self.runtime(_trainer_config())
+        authority = identity_pb2.ServiceInstanceIdentity(
+            component="sample-pool", instance_id="pool-test", lifecycle_epoch=1)
+        response = training_pb2.FinalizeSamplePoolRsp(
+            result=training_pb2.SAMPLE_POOL_FINALIZE_RESULT_FINALIZED,
+            finalization_id="replay-final", finalized_at_unix_ms=1700000000000,
+            sample_pool=authority)
+        status = training_pb2.SamplePoolStatusRsp(
+            sample_pool=authority, ready=True, finalized=True,
+            finalization_id=response.finalization_id, finalized_at_unix_ms=response.finalized_at_unix_ms,
+            accepted_unique_transitions=6, evicted_transition_count=2, finalized_transition_count=4,
+            drawn_transition_slot_count=28, acknowledged_transition_slot_count=24,
+            released_transition_slot_count=4, trained_transition_count=16,
+            invalid_transition_count=4, shutdown_untrained_transition_count=4)
+        runtime._validate_finalized_sample_pool_status(status, authority, response.finalization_id, response)
+        for field in ("accepted_unique_transitions", "drawn_transition_slot_count", "trained_transition_count"):
+            with self.subTest(field=field):
+                broken = training_pb2.SamplePoolStatusRsp()
+                broken.CopyFrom(status)
+                setattr(broken, field, getattr(broken, field) + 1)
+                with self.assertRaisesRegex(RuntimeError, "accounting"):
+                    runtime._validate_finalized_sample_pool_status(broken, authority, response.finalization_id, response)
+
     def test_local_effective_config_reaches_runtime_validation(self):
         repository = Path(__file__).resolve().parents[1]
         config = load_effective_config(
