@@ -94,13 +94,9 @@ in `/train` and must not be a symlink; cleanup is restricted to its children.
 Copy any model that must survive or seed the next invocation outside this
 directory before starting again.
 
-Without AIServer, Learner keeps Sample Pool, Model Distributor, and monitoring
-alive while waiting without a deadline for the exact bootstrap-model ACK.
-Training starts on a matching LOADED ACK. A FAILED ACK for the exact
-bootstrap model ends startup immediately with the AIServer stage, source and
-original error. Explicit `SIGINT/SIGTERM` or a positive configured
-`aiserver_status.initial_model_ack_timeout_sec` also ends the wait.
-Client can start after AIServer is ready.
+Once the initial model is published and registered, the Learner requests a full batch from the SamplePool. The pool waits for sufficient resident samples. A batch may contain samples from any participating ServerPod. A successful update proceeds through PPO, optimizer checkpoint, model publication and registration, then the `TRAINED` delivery acknowledgment. The pool consumer handles sampling, lease renewal and shutdown settlement. The update coordinator decides when training can be acknowledged.
+
+The local preview reads the candidate AIServer identity from its configured endpoint and calls `GetModelLoadReceipt` on this run's Distributor for that exact lifecycle and bootstrap model. A matching `LOADED` receipt binds the preview to that source. The optional `aiserver_status.initial_model_ack_timeout_sec` applies to preview binding. With the preview disabled, the entire `aiserver_status` section is optional.
 
 `dashboard.enabled: true` is the local default. The strict boolean environment
 variable `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` can disable it; CLI

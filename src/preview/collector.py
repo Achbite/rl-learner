@@ -10,10 +10,11 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 import grpc
 from proto.common import identity_pb2 as common_pb2
-from proto.training import training_pb2
+from proto.training import model_identity_pb2, training_pb2
 from proto.training import training_pb2_grpc
 from proto.metrics import catalog_pb2 as metric_catalog_pb2
 from proto.metrics import catalog_pb2_grpc as metric_catalog_pb2_grpc
@@ -25,14 +26,41 @@ from src.metrics.registered_metrics import LocalMetricProjector
 from src.metrics.metrics_backend import create_backend
 from .topology import training_chain_status
 
+@dataclass(frozen=True)
+class BootstrapTarget:
+    model: model_identity_pb2.ModelIdentity
+    distributor: common_pb2.ServiceInstanceIdentity
+    deadline: float | None
+
+
+def model_load_receipt(stub, distributor, model, actor):
+    """Read the retained load for this specific model and actor lifecycle."""
+    result = stub.GetModelLoadReceipt(
+        training_pb2.GetModelLoadReceiptReq(model=model, aiserver=actor), timeout=1.5
+    )
+    if result.distributor != distributor:
+        raise RuntimeError("model load receipt is from another Distributor lifecycle")
+    if result.outside_retention:
+        raise RuntimeError("model load receipt is outside the Distributor retention window")
+    if not result.HasField("receipt"):
+        return None
+    receipt = result.receipt
+    if receipt.aiserver != actor or receipt.model != model or not receipt.load_instance_id:
+        raise RuntimeError("model load receipt differs from the requested actor/model")
+    return receipt
+
+
 class PreviewCollector:
     def __init__(self, *, endpoints, learner_source, source_id, directory, backend, logger,
-                 collect_aiserver=True, mean_window_ms=60000, bucket_ms=5000):
+                 collect_aiserver=True, binding_timeout=None, mean_window_ms=60000, bucket_ms=5000):
         self.logger = logger
         self.source_id = source_id
         self.channels = {role: grpc.insecure_channel(address) for role, address in endpoints.items()}
         self.catalog_stubs = {role: metric_catalog_pb2_grpc.MetricCatalogServiceStub(channel)
                               for role, channel in self.channels.items()}
+        self.model_service = training_pb2_grpc.ModelDistributorServiceStub(self.channels["distributor"])
+        self.binding_timeout = binding_timeout
+        self._bootstrap = None
         self._status_readers = {
             "learner": (training_pb2_grpc.LearnerStatusServiceStub(self.channels["learner"]).GetLearnerStatus,
                         training_pb2.LearnerStatusReq, "learner"),
@@ -40,7 +68,7 @@ class PreviewCollector:
                          training_pb2.AIServerStatusReq, "aiserver"),
             "sample_pool": (training_pb2_grpc.SamplePoolConsumerServiceStub(self.channels["sample_pool"]).GetStatus,
                             training_pb2.SamplePoolStatusReq, "sample_pool"),
-            "distributor": (training_pb2_grpc.ModelDistributorServiceStub(self.channels["distributor"]).GetModelDistributorStatus,
+            "distributor": (self.model_service.GetModelDistributorStatus,
                             training_pb2.ModelDistributorStatusReq, "distributor"),
         }
         self._status = {}
@@ -65,16 +93,34 @@ class PreviewCollector:
         self.collectors = {role: MetricEventCollector(store=self.store, consumer=self.consumer, role=role,
             event_stub=metric_transport_pb2_grpc.MetricEventServiceStub(self.channels[role]), logger=logger) for role in roles}
 
-    def bind_aiserver(self, source):
-        # Only the business bootstrap ACK supplies this identity. Never discover a replacement by port.
-        _source_key(source)
+    def expect_bootstrap(self, model, distributor):
+        # Registration is complete. The preview polling thread owns source binding.
+        deadline = None if self.binding_timeout is None else time.monotonic() + self.binding_timeout
         with self._binding_lock:
-            current = self._sources.get("aiserver")
-            if current is not None and current != source:
-                raise ValueError("Preview AIServer source was already bound for this lifecycle")
-            self._sources["aiserver"] = copy.deepcopy(source)
+            self._bootstrap = BootstrapTarget(copy.deepcopy(model), copy.deepcopy(distributor), deadline)
+
+    def _pending_target(self):
+        with self._binding_lock:
+            target = self._bootstrap
+        if target is None or self._stop.is_set():
+            raise RuntimeError("waiting for the registered bootstrap model")
+        if target.deadline is not None and time.monotonic() >= target.deadline:
+            raise RuntimeError("Preview timed out waiting for the bootstrap load receipt")
+        return target
+
+    def _bind_bootstrap(self, candidate, target):
+        receipt = model_load_receipt(self.model_service, target.distributor, target.model, candidate)
+        if receipt is None:
+            raise RuntimeError("waiting for the bootstrap AIServer load receipt")
+        if receipt.load_status != training_pb2.MODEL_LOAD_STATUS_LOADED:
+            raise RuntimeError(
+                f"AIServer {candidate.instance_id} bootstrap model_step={target.model.model_step}: "
+                f"{training_pb2.ModelLoadStatus.Name(receipt.load_status)}: {receipt.message}"
+            )
+        with self._binding_lock:
+            self._sources["aiserver"] = copy.deepcopy(candidate)
             if "aiserver" in self.collectors:
-                self.collectors["aiserver"].start(source)
+                self.collectors["aiserver"].start(candidate)
 
     @staticmethod
     def _has_field(message, name):
@@ -85,11 +131,12 @@ class PreviewCollector:
         reader, request, identity_field = self._status_readers[role]
         with self._binding_lock:
             expected = self._sources.get(role)
-        if role == "aiserver" and expected is None:
-            raise RuntimeError("waiting for the bootstrap AIServer source")
+        target = self._pending_target() if role == "aiserver" and expected is None else None
         status = reader(request(), timeout=1.5)
         source = getattr(status, identity_field)
         key = _source_key(source)
+        if target is not None:
+            self._bind_bootstrap(source, target)
         if expected is not None and expected != source:
             raise RuntimeError(f"{role} status source differs from the configured lifecycle")
         catalog = self._catalogs.get(key)
@@ -233,6 +280,17 @@ class PreviewCollector:
             status = self._read_status("aiserver")
             inference_count = int(status.inference_count)
             push_rpc_count = int(status.push_rpc_count)
+            loaded_receipt = {}
+            if status.HasField("loaded_model"):
+                try:
+                    receipt = model_load_receipt(self.model_service, self._bootstrap.distributor,
+                                                 status.loaded_model, status.aiserver)
+                    if receipt is not None:
+                        loaded_receipt = {"model": model_identity_document(receipt.model),
+                                          "status": training_pb2.ModelLoadStatus.Name(receipt.load_status),
+                                          "message": receipt.message}
+                except (grpc.RpcError, RuntimeError) as error:
+                    loaded_receipt = {"error": str(error)}
             segment_close_counts = {
                 training_pb2.SegmentCloseReason.Name(item.reason): int(
                     item.count
@@ -249,6 +307,7 @@ class PreviewCollector:
                 ),
                 "active_segments": int(status.active_segment_count),
                 "model_identity": model_identity_document(status.loaded_model),
+                "model_load_receipt": loaded_receipt,
                 "model_feedback": {
                     "candidate_model": model_identity_document(status.model_feedback.candidate_model),
                     "stage": status.model_feedback.stage,

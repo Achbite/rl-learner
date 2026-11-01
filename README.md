@@ -82,11 +82,9 @@ Runtime 复用同一解析器，shell 不保存第二套训练目录、端点或
 新的内部 lineage 并发布随机 `0000000`。该目录必须以 `/train` 结尾且不能是符号链接；清理
 范围严格限制在这个目录的子项。需要保留或继承的模型必须在下一次启动前复制到该目录之外。
 
-没有 AIServer 时，Learner 默认无限等待 AIServer 对 bootstrap 模型的 exact ACK，并保持
-Sample Pool、Model Distributor 和监控存活。匹配 bootstrap 的 LOADED ACK 使训练继续；
-匹配该模型的 FAILED ACK 会立即结束启动，并保留 AIServer 的失败阶段、来源和原始错误。
-显式 `SIGINT/SIGTERM` 或正数 `aiserver_status.initial_model_ack_timeout_sec` 也会结束等待。
-Client 可以在 AIServer ready 后再启动。
+初始模型发布并注册后，Learner 就向 SamplePool 请求完整 batch。Pool 还没有足够样本时会等待，任一 ServerPod 的合法样本都可以组成首批。一次成功更新按 PPO、optimizer checkpoint、模型发布注册、样本交付 `TRAINED` 的顺序提交。Pool 消费模块负责取批、续租及停机结算，更新编排负责决定何时确认训练成功。
+
+本地 Preview 使用配置端点取得候选 AIServer 身份，再通过本轮 Distributor 的 `GetModelLoadReceipt` 按初始模型和服务生命周期查询。匹配的 `LOADED` 回执才允许绑定该来源。可选的 `aiserver_status.initial_model_ack_timeout_sec` 约束预览等待时间。模型加载失败由 AIServer 和 Distributor 记录。关闭 Preview 时可以省略整个 `aiserver_status` 段。
 
 `dashboard.enabled: true` 是本地默认值。严格布尔环境变量
 `RL_LEARNER_LOCAL_MONITOR_ENABLED=false` 关闭预览，CLI `--monitor/--no-monitor` 优先于环境变量。

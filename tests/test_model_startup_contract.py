@@ -1,6 +1,5 @@
 """Bootstrap result propagation; no training loop or training-effect oracle."""
-import concurrent.futures
-import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
@@ -15,7 +14,7 @@ import unittest
 import grpc
 import yaml
 
-from main.training_runtime import TrainingRuntime, _stop_requested
+from src.preview.collector import PreviewCollector
 from proto.common import identity_pb2 as common
 from proto.training import model_identity_pb2 as identity
 from proto.training import training_pb2 as wire
@@ -26,12 +25,16 @@ def service_identity(component, instance):
     return common.ServiceInstanceIdentity(component=component, instance_id=instance, lifecycle_epoch=1)
 
 
-def runtime_with(stub, timeout=None):
-    runtime = TrainingRuntime.__new__(TrainingRuntime)
-    runtime.model_stub = stub
-    runtime.initial_model_ack_timeout = timeout
-    runtime.logger = logging.getLogger("test.bootstrap")
-    return runtime
+def preview_with(stub, model, distributor):
+    preview = PreviewCollector.__new__(PreviewCollector)
+    preview.model_service = stub
+    preview._binding_lock = threading.Lock()
+    preview._stop = threading.Event()
+    preview._sources = {}
+    preview.collectors = {}
+    preview.binding_timeout = None
+    preview.expect_bootstrap(model, distributor)
+    return preview
 
 
 def available_port():
@@ -50,53 +53,48 @@ class ReadyPool(rpc.SamplePoolIngressServiceServicer):
 
 class ModelStartupContractTest(unittest.TestCase):
     def setUp(self):
-        _stop_requested.clear()
-        self.addCleanup(_stop_requested.clear)
         self.model = identity.ModelIdentity(model_lineage_id="bootstrap-test", model_step=0)
         self.manifest = wire.ModelArtifactManifest(identity=self.model)
         self.authority = service_identity("model-distributor", "distributor-test")
         self.producer = service_identity("aiserver", "aiserver-test")
 
-    def status(self, model=None, state=wire.MODEL_LOAD_STATUS_FAILED, message="ONNX prepare: shape mismatch"):
-        return wire.ModelDistributorStatusRsp(
-            ready=True, distributor=self.authority, latest_ack_model=model or self.model,
-            latest_ack_aiserver=self.producer, latest_ack_status=state, last_error=message)
+    def reply(self, state, *, model=None, actor=None):
+        return wire.GetModelLoadReceiptRsp(distributor=self.authority, receipt=wire.AckModelReq(
+            aiserver=actor or self.producer, model=model or self.model, load_instance_id="load-0",
+            load_status=state, message="ONNX prepare: shape mismatch" if state == wire.MODEL_LOAD_STATUS_FAILED else "loaded"))
 
     def test_exact_failed_ack_preserves_cause(self):
-        observed = self.status()
-        runtime = runtime_with(SimpleNamespace(GetModelDistributorStatus=lambda *a, **k: observed))
+        observed = self.reply(wire.MODEL_LOAD_STATUS_FAILED)
+        stub = SimpleNamespace(GetModelLoadReceipt=lambda *a, **k: observed)
+        preview = preview_with(stub, self.model, self.authority)
         with self.assertRaises(RuntimeError) as raised:
-            runtime._wait_initial_model_loaded({"manifest": self.manifest})
-        self.assertIn(observed.last_error, str(raised.exception))
-        self.assertIn("model_step=0", str(raised.exception))
-        self.assertIn(self.producer.instance_id, str(raised.exception))
+            preview._bind_bootstrap(self.producer, preview._pending_target())
+        for fact in (observed.receipt.message, "model_step=0", self.producer.instance_id):
+            self.assertIn(fact, str(raised.exception))
+        self.assertNotIn("aiserver", preview._sources)
 
-    def test_other_model_failed_ack_does_not_fail_target(self):
+    def test_only_the_requested_model_and_actor_can_bind(self):
         other = identity.ModelIdentity(model_lineage_id="other-target", model_step=0)
-        replies = iter([self.status(other), self.status(state=wire.MODEL_LOAD_STATUS_LOADED, message="loaded")])
-        runtime = runtime_with(SimpleNamespace(GetModelDistributorStatus=lambda *a, **k: next(replies)), timeout=2)
-        self.assertEqual(runtime._wait_initial_model_loaded({"manifest": self.manifest}), self.producer)
+        replies = iter([self.reply(wire.MODEL_LOAD_STATUS_LOADED, model=other),
+                        self.reply(wire.MODEL_LOAD_STATUS_LOADED, actor=service_identity("aiserver", "other")),
+                        self.reply(wire.MODEL_LOAD_STATUS_LOADED)])
+        stub = SimpleNamespace(GetModelLoadReceipt=lambda *a, **k: next(replies))
+        preview = preview_with(stub, self.model, self.authority)
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "requested actor/model"):
+                preview._bind_bootstrap(self.producer, preview._pending_target())
+            self.assertNotIn("aiserver", preview._sources)
+        preview._bind_bootstrap(self.producer, preview._pending_target())
+        self.assertEqual(preview._sources["aiserver"], self.producer)
 
-    def test_no_ack_waits_until_explicit_stop(self):
-        observed = wire.ModelDistributorStatusRsp(ready=True, distributor=self.authority)
-        queried = threading.Event()
+    def test_absent_receipt_leaves_preview_pending(self):
+        stub = SimpleNamespace(GetModelLoadReceipt=lambda *a, **k: wire.GetModelLoadReceiptRsp(distributor=self.authority))
+        preview = preview_with(stub, self.model, self.authority)
+        with self.assertRaisesRegex(RuntimeError, "waiting for the bootstrap AIServer"):
+            preview._bind_bootstrap(self.producer, preview._pending_target())
+        self.assertNotIn("aiserver", preview._sources)
 
-        def status(*args, **kwargs):
-            queried.set()
-            return observed
-
-        runtime = runtime_with(SimpleNamespace(GetModelDistributorStatus=status))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            pending = executor.submit(runtime._wait_initial_model_loaded, {"manifest": self.manifest})
-            try:
-                self.assertTrue(queried.wait(2))
-                self.assertFalse(pending.done(), "absence of ACK remains a legitimate wait")
-            finally:
-                _stop_requested.set()
-            self.assertIsNone(pending.result(timeout=2))
-        self.assertEqual(observed.latest_ack_status, wire.MODEL_LOAD_STATUS_UNSPECIFIED)
-
-    def test_real_aiserver_failed_ack_reaches_real_distributor_and_learner(self):
+    def test_real_aiserver_failed_ack_reaches_preview_through_distributor(self):
         # Test dependencies are explicit; no search for old binaries or running services.
         ai_binary = Path(os.environ["RL_AISERVER_TEST_BINARY"])
         distributor_binary = Path(os.environ["RL_MODEL_DISTRIBUTOR_TEST_BINARY"])
@@ -119,7 +117,7 @@ class ModelStartupContractTest(unittest.TestCase):
             }))
             processes = []
             logs = []
-            pool = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=2))
+            pool = grpc.server(ThreadPoolExecutor(max_workers=2))
             rpc.add_SamplePoolIngressServiceServicer_to_server(ReadyPool(), pool)
             pool_port = pool.add_insecure_port("127.0.0.1:0")
             pool.start()
@@ -148,19 +146,17 @@ class ModelStartupContractTest(unittest.TestCase):
                 ai_config = root / "aiserver.yaml"
                 ai_config.write_text(yaml.safe_dump(config))
                 ai = launch([str(ai_binary), "--config", str(ai_config)], "aiserver")
-                runtime = runtime_with(stub, timeout=6)
-                with self.assertRaises(RuntimeError) as raised:
-                    runtime._wait_initial_model_loaded({"manifest": manifest})
+                self.assertEqual(ai.wait(timeout=15), 1)
                 status = stub.GetModelDistributorStatus(wire.ModelDistributorStatusReq(), timeout=2)
+                preview = preview_with(stub, self.model, status.distributor)
+                with self.assertRaises(RuntimeError) as raised:
+                    preview._bind_bootstrap(status.latest_ack_aiserver, preview._pending_target())
                 self.assertEqual(status.latest_ack_model, self.model)
                 self.assertEqual(status.latest_ack_status, wire.MODEL_LOAD_STATUS_FAILED)
                 self.assertIn("ONNX", status.last_error)
                 self.assertIn("shape", status.last_error)
                 self.assertIn(status.last_error, str(raised.exception))
                 self.assertIn(status.latest_ack_aiserver.instance_id, str(raised.exception))
-                # Startup exits before serving task RPC. Its existing final-metric
-                # shutdown wait remains bounded; this test does not alter that policy.
-                self.assertEqual(ai.wait(timeout=15), 1)
                 self.assertIn(status.last_error, (root / "aiserver.log").read_text())
             except Exception:
                 for log in logs:

@@ -54,7 +54,7 @@ startup_output="$(
     python3 -m main.resolve_startup --format lines -- "$@"
 )"
 mapfile -t startup_values <<< "${startup_output}"
-if [ "${#startup_values[@]}" -ne 12 ]; then
+if [ "${#startup_values[@]}" -ne 10 ]; then
     echo "Learner effective startup handoff is invalid" >&2
     exit 1
 fi
@@ -65,18 +65,16 @@ sample_pool_host="${startup_values[3]}"
 sample_pool_port="${startup_values[4]}"
 model_distributor_host="${startup_values[5]}"
 model_distributor_port="${startup_values[6]}"
-aiserver_host="${startup_values[7]}"
-aiserver_port="${startup_values[8]}"
-metrics_port="${startup_values[9]}"
-metrics_enabled="${startup_values[10]}"
-metric_event_port="${startup_values[11]}"
+metrics_port="${startup_values[7]}"
+metrics_enabled="${startup_values[8]}"
+metric_event_port="${startup_values[9]}"
 if [ "${metrics_enabled}" = "1" ]; then
     local_monitor_state="enabled"
 else
     local_monitor_state="disabled"
 fi
 printf '%s\n' \
-    "Learner effective startup: config=${config} train=${local_train_root} initial_model=${initial_model:-<fresh>} sample=${sample_pool_host}:${sample_pool_port} model=${model_distributor_host}:${model_distributor_port} aiserver=${aiserver_host}:${aiserver_port} local_monitor=${local_monitor_state} metrics_port=${metrics_port} metric_event_port=${metric_event_port}"
+    "Learner effective startup: config=${config} train=${local_train_root} initial_model=${initial_model:-<fresh>} sample=${sample_pool_host}:${sample_pool_port} model=${model_distributor_host}:${model_distributor_port} local_monitor=${local_monitor_state} metrics_port=${metrics_port} metric_event_port=${metric_event_port}"
 
 # Host port ownership belongs to the development launcher. Only advertise its
 # URL when it explicitly identifies the container port mapped by that URL.

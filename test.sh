@@ -27,9 +27,9 @@ python3 -m unittest -v \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_get_batch_recovery_uses_request_deadline \
     tests.test_delivery_contract.LearnerDevelopmentTest.test_busy_lease_and_stop_have_distinct_recovery \
     tests.test_model_startup_contract.ModelStartupContractTest.test_exact_failed_ack_preserves_cause \
-    tests.test_model_startup_contract.ModelStartupContractTest.test_other_model_failed_ack_does_not_fail_target \
-    tests.test_model_startup_contract.ModelStartupContractTest.test_no_ack_waits_until_explicit_stop \
-    tests.test_model_startup_contract.ModelStartupContractTest.test_real_aiserver_failed_ack_reaches_real_distributor_and_learner \
+    tests.test_model_startup_contract.ModelStartupContractTest.test_only_the_requested_model_and_actor_can_bind \
+    tests.test_model_startup_contract.ModelStartupContractTest.test_absent_receipt_leaves_preview_pending \
+    tests.test_model_startup_contract.ModelStartupContractTest.test_real_aiserver_failed_ack_reaches_preview_through_distributor \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_preview_catalog_failure_preserves_status_and_throughput \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_preview_rates_keep_source_intervals_independent \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_catalog_is_readable_before_measurement_without_pinning_a_consumer \

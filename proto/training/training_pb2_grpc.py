@@ -600,6 +600,11 @@ class ModelDistributorServiceStub:
                 request_serializer=proto_dot_training_dot_training__pb2.AckModelReq.SerializeToString,
                 response_deserializer=proto_dot_training_dot_training__pb2.AckModelRsp.FromString,
                 _registered_method=True)
+        self.GetModelLoadReceipt = channel.unary_unary(
+                '/rl.training.v1.ModelDistributorService/GetModelLoadReceipt',
+                request_serializer=proto_dot_training_dot_training__pb2.GetModelLoadReceiptReq.SerializeToString,
+                response_deserializer=proto_dot_training_dot_training__pb2.GetModelLoadReceiptRsp.FromString,
+                _registered_method=True)
         self.GetModelDistributorStatus = channel.unary_unary(
                 '/rl.training.v1.ModelDistributorService/GetModelDistributorStatus',
                 request_serializer=proto_dot_training_dot_training__pb2.ModelDistributorStatusReq.SerializeToString,
@@ -634,6 +639,12 @@ class ModelDistributorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetModelLoadReceipt(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetModelDistributorStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -662,6 +673,11 @@ def add_ModelDistributorServiceServicer_to_server(servicer, server):
                     servicer.AckModel,
                     request_deserializer=proto_dot_training_dot_training__pb2.AckModelReq.FromString,
                     response_serializer=proto_dot_training_dot_training__pb2.AckModelRsp.SerializeToString,
+            ),
+            'GetModelLoadReceipt': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetModelLoadReceipt,
+                    request_deserializer=proto_dot_training_dot_training__pb2.GetModelLoadReceiptReq.FromString,
+                    response_serializer=proto_dot_training_dot_training__pb2.GetModelLoadReceiptRsp.SerializeToString,
             ),
             'GetModelDistributorStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetModelDistributorStatus,
@@ -777,6 +793,33 @@ class ModelDistributorService:
             '/rl.training.v1.ModelDistributorService/AckModel',
             proto_dot_training_dot_training__pb2.AckModelReq.SerializeToString,
             proto_dot_training_dot_training__pb2.AckModelRsp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelLoadReceipt(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rl.training.v1.ModelDistributorService/GetModelLoadReceipt',
+            proto_dot_training_dot_training__pb2.GetModelLoadReceiptReq.SerializeToString,
+            proto_dot_training_dot_training__pb2.GetModelLoadReceiptRsp.FromString,
             options,
             channel_credentials,
             insecure,

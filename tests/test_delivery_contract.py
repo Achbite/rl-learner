@@ -1,13 +1,16 @@
 import unittest
 import logging
 import threading
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import grpc
+import yaml
 
-from main.training_runtime import TrainingRuntime, train_processed_delivery, _stop_requested
+from main.training_runtime import TrainingRuntime, _stop_requested
+from src.training.sample_pool_consumer import SamplePoolConsumer, training_samples
 from proto.common import identity_pb2
 from proto.training import training_pb2
 from src.config.effective_config import load_effective_config
@@ -45,8 +48,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
         _stop_requested.clear()
         self.addCleanup(_stop_requested.clear)
 
-    @staticmethod
-    def runtime(config):
+    def runtime(self, config):
         # Configure the real consumer functions without launching child services.
         runtime = TrainingRuntime.__new__(TrainingRuntime)
         runtime.trainer = PPOTrainer(config)
@@ -60,10 +62,13 @@ class LearnerDevelopmentTest(unittest.TestCase):
         runtime.logger = logging.getLogger("delivery-contract")
         runtime._metrics_lock = threading.Lock()
         runtime._metrics_context = {"disposition": "READY"}
-        runtime.get_timeout_ms = 10
-        runtime.lease_timeout_ms = 1000
         runtime.learner_service = identity_pb2.ServiceInstanceIdentity(
             component="learner", instance_id="learner-test", lifecycle_epoch=1)
+        runtime.pool = SamplePoolConsumer(
+            "localhost:1", {"get_timeout_ms": 10, "lease_timeout_ms": 1000, "shutdown_drain_timeout_ms": 1000},
+            runtime.learner_service, runtime.train_batch_size, _stop_requested, runtime.logger, runtime._report_sample_wait,
+        )
+        self.addCleanup(runtime.pool.close)
         return runtime
 
     @staticmethod
@@ -109,11 +114,12 @@ class LearnerDevelopmentTest(unittest.TestCase):
                     component="aiserver", instance_id="producer-test", lifecycle_epoch=1),
             )
 
-        provenance = runtime._validate_delivery(response)
+        provenance = runtime.pool.delivery_provenance(response, runtime._validate_training_item)
         self.assertEqual(provenance["model_lineage_id"], "training-lineage")
         self.assertEqual(provenance["producers"][0]["instance_id"], "producer-test")
         trainer = runtime.trainer
-        batch, stats = train_processed_delivery(response.items, trainer)
+        batch = training_samples(response.items)
+        stats = trainer.train_on_batch(batch)
 
         self.assertEqual(len(batch), 2)
         self.assertEqual(stats["sample_evaluation_count"], 2)
@@ -157,7 +163,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 else:
                     invalid.items[0].ClearField("behavior_model" if corruption == "missing-model" else "producer")
                 with self.assertRaisesRegex(ValueError, error):
-                    runtime._validate_delivery(invalid)
+                    runtime.pool.delivery_provenance(invalid, runtime._validate_training_item)
 
     def test_replay_slots_reach_real_trainer_without_deduplication(self):
         config = _trainer_config()
@@ -172,15 +178,16 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 draw_count=2, behavior_model=runtime.model_manifests[0]["manifest"].identity,
                 producer=identity_pb2.ServiceInstanceIdentity(
                     component="aiserver", instance_id="producer-test", lifecycle_epoch=1))
-        runtime._validate_delivery(response)
-        batch, stats = train_processed_delivery(response.items, runtime.trainer)
+        runtime.pool.delivery_provenance(response, runtime._validate_training_item)
+        batch = training_samples(response.items)
+        stats = runtime.trainer.train_on_batch(batch)
         self.assertEqual([item["item_id"] for item in batch], ["item-0", "item-0", "item-1", "item-1"])
         self.assertEqual(stats["sample_evaluation_count"], 8)
         self.assertEqual(stats["optimizer_step_count"], 4)
         self.assertEqual(runtime.trainer.raw_metric_sum_counts()["raw_advantage"]["count"], 4)
         # Reuse the unchanged snapshots in another update, not another Push.
-        runtime._validate_delivery(response)
-        _, repeated = train_processed_delivery(response.items, runtime.trainer)
+        runtime.pool.delivery_provenance(response, runtime._validate_training_item)
+        repeated = runtime.trainer.train_on_batch(training_samples(response.items))
         self.assertEqual(repeated["model_step"], 2)
         for changed in ("payload", "producer", "storage"):
             with self.subTest(changed=changed):
@@ -190,7 +197,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 elif changed == "producer": conflict.items[1].producer.instance_id = "other-source"
                 else: conflict.items[1].insert_sequence += 1
                 with self.assertRaisesRegex(ValueError, "conflicting snapshot"):
-                    runtime._validate_delivery(conflict)
+                    runtime.pool.delivery_provenance(conflict, runtime._validate_training_item)
 
     def test_replay_finalization_keeps_storage_and_draw_accounts_separate(self):
         runtime = self.runtime(_trainer_config())
@@ -207,14 +214,14 @@ class LearnerDevelopmentTest(unittest.TestCase):
             drawn_transition_slot_count=28, acknowledged_transition_slot_count=24,
             released_transition_slot_count=4, trained_transition_count=16,
             invalid_transition_count=4, shutdown_untrained_transition_count=4)
-        runtime._validate_finalized_sample_pool_status(status, authority, response.finalization_id, response)
+        runtime.pool._validate_finalized_sample_pool_status(status, authority, response.finalization_id, response)
         for field in ("accepted_unique_transitions", "drawn_transition_slot_count", "trained_transition_count"):
             with self.subTest(field=field):
                 broken = training_pb2.SamplePoolStatusRsp()
                 broken.CopyFrom(status)
                 setattr(broken, field, getattr(broken, field) + 1)
                 with self.assertRaisesRegex(RuntimeError, "accounting"):
-                    runtime._validate_finalized_sample_pool_status(broken, authority, response.finalization_id, response)
+                    runtime.pool._validate_finalized_sample_pool_status(broken, authority, response.finalization_id, response)
 
     def test_local_effective_config_reaches_runtime_validation(self):
         repository = Path(__file__).resolve().parents[1]
@@ -232,6 +239,22 @@ class LearnerDevelopmentTest(unittest.TestCase):
         self.assertEqual(config["training"]["train_batch_size"], 32)
         self.assertEqual(config["training"]["mini_batch_size"], 16)
         self.assertEqual(config["training"]["n_epochs"], 1)
+
+        # The managed supervisor starts Learner before any actor endpoint exists.
+        template = yaml.safe_load((repository / "configs/learner_config.yaml").read_text())
+        del template["aiserver_status"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "managed.yaml"
+            path.write_text(yaml.safe_dump(template))
+            managed = load_effective_config(str(path), environment={
+                "RL_MODEL_LINEAGE_ID": "managed-lineage", "RL_INFRA_MANAGED": "true",
+                "RL_INFRA_DATA_ROOT": directory, "RL_INFRA_RUNTIME_ROOT": directory,
+                "RL_INFRA_ENDPOINT_SAMPLE_POOL_HOST": "pool", "RL_INFRA_ENDPOINT_SAMPLE_POOL_PORT": "9100",
+                "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_HOST": "models", "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT": "9200",
+                "RL_INFRA_ENDPOINT_LEARNER_METRICS_PORT": "9006",
+            })
+        self.assertFalse(managed["dashboard"]["enabled"])
+        self.assertNotIn("aiserver_status", managed)
 
     def test_get_batch_recovery_uses_request_deadline(self):
         runtime = self.runtime(_trainer_config())
@@ -253,8 +276,8 @@ class LearnerDevelopmentTest(unittest.TestCase):
             return training_pb2.SamplePoolStatusRsp(sample_pool=authority, ready=True,
                 max_concurrent_consumers=1, leased_transitions=0, active_consumer_count=0)
 
-        runtime.sample_stub = SimpleNamespace(GetBatch=get_batch, GetStatus=get_status)
-        result = runtime._get_batch_recovering(ready_authority=authority, deadline=time.monotonic() + 5)
+        runtime.pool.stub = SimpleNamespace(GetBatch=get_batch, GetStatus=get_status)
+        result = runtime.pool._get_batch_recovering(ready_authority=authority, deadline=time.monotonic() + 5)
         self.assertIsNone(result)
         self.assertTrue(queries)
         self.assertGreaterEqual(min(queries), rpc_deadlines[0] - 0.005)
@@ -275,10 +298,10 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 max_concurrent_consumers=1, leased_transitions=2 if leased else 0,
                 active_consumer_count=1 if leased else 0)
 
-        runtime.sample_stub = SimpleNamespace(
+        runtime.pool.stub = SimpleNamespace(
             GetBatch=lambda request, timeout: training_pb2.GetBatchRsp(
                 result=training_pb2.GET_BATCH_RESULT_BUSY, sample_pool=authority), GetStatus=status)
-        self.assertIsNone(runtime._get_batch_recovering(ready_authority=authority, deadline=time.monotonic() + 3))
+        self.assertIsNone(runtime.pool._get_batch_recovering(ready_authority=authority, deadline=time.monotonic() + 3))
         self.assertLess(query_times[0], lease_expires)
         self.assertGreaterEqual(query_times[-1], lease_expires)
         self.assertEqual(runtime._metrics_context["disposition"], "READY")
@@ -286,9 +309,9 @@ class LearnerDevelopmentTest(unittest.TestCase):
         for stop_first in (True, False):
             with self.subTest(stop=stop_first):
                 query_times.clear()
-                runtime._mark_sample_wait("GET_BATCH_OUTCOME_UNKNOWN", "GetBatch", "uncertain", 1)
+                runtime.pool._mark_sample_wait("GET_BATCH_OUTCOME_UNKNOWN", "GetBatch", "uncertain", 1)
                 if stop_first: _stop_requested.set()
-                self.assertFalse(runtime._reconcile_get_batch_outcome(authority, "uncertain",
+                self.assertFalse(runtime.pool._reconcile_get_batch_outcome(authority, "uncertain",
                     request_deadline=time.monotonic() + 2, deadline=time.monotonic() + 0.02))
                 self.assertEqual(query_times, [])
                 self.assertEqual(runtime._metrics_context["disposition"], "GET_BATCH_OUTCOME_UNKNOWN")

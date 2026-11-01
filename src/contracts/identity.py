@@ -139,11 +139,15 @@ def validate_config(config: dict) -> None:
         "identity",
         "sample_pool",
         "model_distributor",
-        "aiserver_status",
         "metric_events",
         "dashboard",
         "log",
     }
+    preview_endpoint = "aiserver_status" in config or (
+        isinstance(config.get("dashboard"), dict) and config["dashboard"].get("enabled") is True
+    )
+    if preview_endpoint:
+        required_sections.add("aiserver_status")
     root_keys = set(config)
     if root_keys not in (
         required_sections,
@@ -181,6 +185,8 @@ def validate_config(config: dict) -> None:
         "dashboard": {"enabled", "server_port", "backend", "mean_window_ms", "time_bucket_ms"},
         "log": {"console_level", "file_level", "log_dir"},
     }
+    if not preview_endpoint:
+        del expected_keys["aiserver_status"]
     for section_name, keys in expected_keys.items():
         section = config[section_name]
         if not isinstance(section, dict):
@@ -271,20 +277,17 @@ def validate_config(config: dict) -> None:
         == config["sample_pool"]["finalize_complete_path"]
     ):
         raise ValueError("integer training parameters are invalid")
-    for section_name in (
-        "sample_pool",
-        "model_distributor",
-        "aiserver_status",
-    ):
+    endpoints = ["sample_pool", "model_distributor"]
+    if preview_endpoint:
+        endpoints.append("aiserver_status")
+    for section_name in endpoints:
         section = config[section_name]
         if not isinstance(section.get("host"), str) or not section["host"]:
             raise ValueError(f"{section_name}.host must be configured")
         port = section.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError(f"{section_name}.port must be in [1, 65535]")
-    initial_ack_timeout = config["aiserver_status"][
-        "initial_model_ack_timeout_sec"
-    ]
+    initial_ack_timeout = config["aiserver_status"]["initial_model_ack_timeout_sec"] if preview_endpoint else None
     if initial_ack_timeout is not None and (
         isinstance(initial_ack_timeout, bool)
         or not isinstance(initial_ack_timeout, (int, float))
@@ -324,3 +327,21 @@ def validate_config(config: dict) -> None:
         or not dashboard["backend"]
     ):
         raise ValueError("dashboard configuration is invalid")
+
+
+def same_service_instance(
+    left: common_pb2.ServiceInstanceIdentity,
+    right: common_pb2.ServiceInstanceIdentity,
+) -> bool:
+    return (
+        left.component == right.component
+        and left.instance_id == right.instance_id
+        and int(left.lifecycle_epoch) == int(right.lifecycle_epoch)
+    )
+
+
+def has_field(message, name: str) -> bool:
+    try:
+        return bool(message.HasField(name))
+    except (AttributeError, ValueError):
+        return False

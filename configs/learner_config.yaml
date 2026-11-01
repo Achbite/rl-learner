@@ -46,11 +46,11 @@ model_distributor:
   host: 127.0.0.1
   port: 9200
 
+# Endpoint observed by the optional local preview.
 aiserver_status:
   host: aiserver-dev
   port: 9002
-  # null keeps Learner alive until the exact bootstrap model ACK or a signal.
-  # A positive value enables an explicit bounded diagnostic timeout.
+  # Optional deadline for Preview to bind this endpoint to its bootstrap receipt.
   initial_model_ack_timeout_sec: null
 
 # The raw MetricEvent service is independently owned by the Learner. The local

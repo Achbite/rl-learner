@@ -210,8 +210,6 @@ def _apply_platform_environment(
         "RL_INFRA_ENDPOINT_SAMPLE_POOL_PORT",
         "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_HOST",
         "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT",
-        "RL_INFRA_ENDPOINT_AISERVER_TASK_HOST",
-        "RL_INFRA_ENDPOINT_AISERVER_TASK_PORT",
         "RL_INFRA_ENDPOINT_LEARNER_METRICS_PORT",
     )
     missing = [name for name in required if not environment.get(name)]
@@ -254,14 +252,6 @@ def _apply_platform_environment(
         (("model_distributor", "port"), _integer(
             "RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT",
             environment["RL_INFRA_ENDPOINT_MODEL_DISTRIBUTOR_PORT"],
-        )),
-        (("aiserver_status", "host"), _nonempty(
-            "RL_INFRA_ENDPOINT_AISERVER_TASK_HOST",
-            environment["RL_INFRA_ENDPOINT_AISERVER_TASK_HOST"],
-        )),
-        (("aiserver_status", "port"), _integer(
-            "RL_INFRA_ENDPOINT_AISERVER_TASK_PORT",
-            environment["RL_INFRA_ENDPOINT_AISERVER_TASK_PORT"],
         )),
         (("metric_events", "server_enabled"), True),
         (("metric_events", "server_port"), _integer(
@@ -430,7 +420,7 @@ def effective_config_log(config: dict) -> dict:
             ],
         },
         "model_distributor": copy.deepcopy(config["model_distributor"]),
-        "aiserver_status": copy.deepcopy(config["aiserver_status"]),
+        **({"aiserver_status": copy.deepcopy(config["aiserver_status"])} if config["dashboard"]["enabled"] else {}),
         "metric_events": copy.deepcopy(config["metric_events"]),
         "dashboard": copy.deepcopy(config["dashboard"]),
     }

@@ -565,7 +565,8 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         feedback = {"candidate_model": {"model_lineage_id": "lineage", "model_step": 1},
                     "stage": "prepare", "last_error": "invalid model output"}
         actor = {"ready": True, "state": "AISERVER_STATE_READY", "instance_id": "server",
-                 "model_identity": identity, "model_feedback": feedback}
+                 "model_identity": identity, "model_feedback": feedback,
+                 "model_load_receipt": {"model": identity, "status": "MODEL_LOAD_STATUS_LOADED"}}
         pool = {"ready": True, "ingress_ready": True, "instance_id": "pool"}
         learner = {"model_identity": identity}
         model = {"ready": True, "instance_id": "model", "latest_model_identity": identity,
@@ -633,18 +634,23 @@ class LearnerMetricCalculationTest(unittest.TestCase):
         runtime._startup_mode = "fresh"
         runtime.train_updates = runtime.trained_samples = 0
         runtime.model_manifests = {}
-        runtime.initial_model_ack_timeout = 2.0
+        runtime.preview.binding_timeout = None
+        runtime.preview._stop = threading.Event()
         runtime.model_stub = Mock()
-        runtime.model_stub.GetModelDistributorStatus.return_value = wire.ModelDistributorStatusRsp(
-            ready=True, latest_ack_model=identity, latest_ack_status=wire.MODEL_LOAD_STATUS_LOADED,
-            latest_ack_aiserver=current_source)
-        runtime._model_distributor_authority = Mock()
-        runtime._pin_model_distributor_authority = Mock(return_value="distributor")
-        runtime._assert_initial_latest_not_newer = Mock(return_value="distributor")
-        runtime._initial_model_requires_registration = Mock(return_value=(False, "distributor"))
+        authority = common_pb2.ServiceInstanceIdentity(component="distributor", instance_id="this-run", lifecycle_epoch=1)
+        runtime._pin_model_distributor_authority = Mock(return_value=authority)
+        runtime.preview.model_service = Mock()
+        runtime._assert_initial_latest_not_newer = Mock(return_value=authority)
+        runtime._initial_model_requires_registration = Mock(return_value=(False, authority))
         runtime._commit_learner_metrics = Mock()
-        with patch("main.training_runtime._stop_requested", threading.Event()):
-            self.assertTrue(runtime._initialize_models())
+        runtime._initialize_models()
+        runtime._commit_learner_metrics.assert_called_once()
+        runtime.preview.model_service.GetModelLoadReceipt.assert_not_called()
+        event_stub.GetMetricBatch.assert_not_called()
+        runtime.preview.model_service.GetModelLoadReceipt.return_value = wire.GetModelLoadReceiptRsp(
+            distributor=authority, receipt=wire.AckModelReq(aiserver=current_source, model=identity,
+                load_status=wire.MODEL_LOAD_STATUS_LOADED, load_instance_id="load-0"))
+        runtime.preview._bind_bootstrap(current_source, runtime.preview._pending_target())
         relay._thread.join(timeout=2.0)
         self.assertFalse(relay._thread.is_alive())
         self.assertEqual(relay.snapshot()["state"], "connected")

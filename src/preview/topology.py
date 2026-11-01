@@ -42,12 +42,13 @@ def training_chain_status(
     learner_model = learner.get("model_identity", {})
     actor_model = actor.get("model_identity", {})
     published_model = model.get("latest_model_identity", {})
-    acknowledged_model = model.get("latest_ack_model_identity", {})
+    load_receipt = actor.get("model_load_receipt", {})
+    acknowledged_model = load_receipt.get("model", {})
     if not _identity_equal(learner_model, published_model):
         reasons.append("published_model_identity_mismatch")
     if not _identity_equal(actor_model, acknowledged_model):
         reasons.append("actor_model_ack_mismatch")
-    if model.get("latest_ack_status") != "MODEL_LOAD_STATUS_LOADED":
+    if load_receipt.get("status") != "MODEL_LOAD_STATUS_LOADED":
         reasons.append("actor_model_ack_not_loaded")
 
     learner_step = int(_identity_dict(learner_model).get("model_step", -1))

@@ -41,7 +41,7 @@ Learner 的生产者 journal 为 `metric-events.sqlite3`；Preview 的消费存�
 
 状态 RPC 与目录 RPC 的结果分别保留。目录读取失败不会抹掉已读取的状态，错误通过 `metric_event_views.catalog_errors` 暴露给查询接口与页面；未取得的目录不由 Preview 猜测生成。Produced 由 AIServer 的累计产出计算，Accepted / Acknowledged / Trained 分别由 Pool 的对应累计计数计算。每条速率独立维护基线；缺测、source lifecycle 变化、非正时间区间或计数回退只影响对应速率，原因在 `rates.unavailable_counters` 中保留。缺测后须重新取得两次有效观测，不能借用其他来源补值。
 
-Preview 只从业务 bootstrap ACK 得到本轮 AIServer source，随后严格读取该 source。它不会按端口找一个最新实例或抢占其他 consumer。页面只是 HTTP 查询者，关闭或刷新页面不创建 ACK consumer，也不控制指标生产。
+Preview 在 Learner 注册初始模型后独立查询配置端点，以该端点报告的 AIServer 实例和 lifecycle epoch 为候选，再向本轮 Distributor 查询该来源和初始模型的加载回执。`LOADED` 确认后才订阅指标。链路视图对当前模型同样读取该实例的回执。Distributor 全局最近回执仅在 Distributor 自身的状态中展示。
 
 配置：
 

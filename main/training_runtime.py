@@ -27,6 +27,8 @@ from proto.training import training_pb2_grpc
 from proto.metrics import registry_pb2 as metric_registry_pb2
 from proto.training import model_identity_pb2
 from src.contracts.identity import (
+    has_field,
+    same_service_instance,
     model_identity_document,
     read_manifest_file,
     service_identity,
@@ -44,50 +46,13 @@ from src.metrics.metric_events import (
 )
 from src.preview.collector import PreviewCollector
 from src.training.ppo_trainer import PPOTrainer
+from src.training.sample_pool_consumer import SamplePoolConsumer, training_samples
+from src.training.update_commit import (
+    MAX_ATTEMPTS, RETRY_DELAY_SEC, UpdateCommitNotApplied, UpdateCommitOutcomeUncertain,
+)
 
 
 _stop_requested = threading.Event()
-
-
-class _UpdateCommitError(RuntimeError):
-    def __init__(self, message: str, attempts: int = 0):
-        super().__init__(message)
-        self.attempts = int(attempts)
-
-
-class _UpdateCommitOutcomeUncertain(_UpdateCommitError):
-    """The remote side effect may have succeeded despite the RPC failure."""
-
-
-class _UpdateCommitNotApplied(_UpdateCommitError):
-    """The exact remote state proves that the side effect was not applied."""
-
-
-class _SamplePoolUnavailable(RuntimeError):
-    """The current Sample Pool authority is temporarily unable to serve."""
-
-
-def train_processed_delivery(items, trainer) -> tuple[list[dict], dict]:
-    """Translate leased wire items and pass the exact batch to PPOTrainer."""
-    training_samples = [
-        {
-            "observation": list(item.transition.observation),
-            "action": int(item.transition.action),
-            "old_log_probability": float(
-                item.transition.behavior_log_probability
-            ),
-            "old_value_prediction": float(item.transition.behavior_value),
-            "advantage": float(item.transition.advantage),
-            "value_target": float(item.transition.value_target),
-            "action_mask": list(item.transition.action_mask),
-            "behavior_model_step": int(
-                item.transition.behavior_model_step
-            ),
-            "item_id": item.transition.item_id,
-        }
-        for item in items
-    ]
-    return training_samples, trainer.train_on_batch(training_samples)
 
 
 def _handle_signal(_signal, _frame) -> None:
@@ -692,75 +657,7 @@ class ModelPublisher:
         self._fsync_directory(self.publication_dir)
 
 
-class LeaseRenewer:
-    def __init__(
-        self,
-        stub,
-        consumer: common_pb2.ServiceInstanceIdentity,
-        delivery_id: str,
-        lease_timeout_ms: int,
-        authority_check: Callable[[], None],
-    ):
-        self.stub = stub
-        self.request = training_pb2.RenewLeaseReq(
-            consumer=consumer,
-            delivery_id=delivery_id,
-            lease_timeout_ms=lease_timeout_ms,
-        )
-        self.authority_check = authority_check
-        self._renew_lock = threading.Lock()
-        self.interval = max(0.2, lease_timeout_ms / 3000.0)
-        self.failure_deadline = max(1.0, lease_timeout_ms / 1000.0 * 0.8)
-        self.error = ""
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self):
-        self.renew_now()
-        self._thread.start()
-        return self
-
-    def renew_now(self) -> None:
-        with self._renew_lock:
-            response = self.stub.RenewLease(self.request, timeout=2.0)
-            positive_result = response.result in (
-                training_pb2.DELIVERY_RESULT_APPLIED,
-                training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
-            )
-            if not positive_result:
-                raise RuntimeError(response.message or "lease renewal rejected")
-            if response.delivery_id != self.request.delivery_id:
-                raise RuntimeError("lease renewal returned another delivery")
-            if int(response.lease_deadline_unix_ms) <= int(time.time() * 1000):
-                raise RuntimeError("lease renewal returned a non-future deadline")
-            self.authority_check()
-
-    def _run(self) -> None:
-        last_success = time.monotonic()
-        while not self._stop.wait(self.interval):
-            try:
-                self.renew_now()
-                last_success = time.monotonic()
-            except grpc.RpcError as error:
-                if time.monotonic() - last_success >= self.failure_deadline:
-                    self.error = error.details() or str(error)
-                    return
-            except Exception as error:
-                self.error = str(error)
-                return
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=3.0)
-
-
 class TrainingRuntime:
-    UPDATE_COMMIT_MAX_ATTEMPTS = 3
-    UPDATE_COMMIT_RETRY_DELAY_SEC = 0.05
-    SAMPLE_RETRY_INITIAL_SEC = 0.05
-    SAMPLE_RETRY_MAX_SEC = 1.0
-    GET_BATCH_RECONCILE_POLL_SEC = 0.5
-    SHUTDOWN_RECONCILE_MARGIN_SEC = 5.0
     MANAGED_METRIC_READY_PATH = Path(
         "/run/rl/learner-metric-ready.json"
     )
@@ -833,20 +730,15 @@ class TrainingRuntime:
         sample_host = str(sample["host"])
         sample_port = int(sample["port"])
         self.train_batch_size = int(config["training"]["train_batch_size"])
-        self.get_timeout_ms = int(sample["get_timeout_ms"])
-        self.lease_timeout_ms = int(sample["lease_timeout_ms"])
         self.finalize_request_path = Path(sample["finalize_request_path"])
         self.finalize_complete_path = Path(sample["finalize_complete_path"])
         self.finalize_request_path.unlink(missing_ok=True)
         self.finalize_complete_path.unlink(missing_ok=True)
         self._finalized = False
-        self.shutdown_drain_timeout_ms = int(
-            sample["shutdown_drain_timeout_ms"]
-        )
         self.sample_address = f"{sample_host}:{sample_port}"
-        self.sample_channel = grpc.insecure_channel(self.sample_address)
-        self.sample_stub = training_pb2_grpc.SamplePoolConsumerServiceStub(
-            self.sample_channel
+        self.pool = SamplePoolConsumer(
+            self.sample_address, sample, self.learner_service, self.train_batch_size,
+            _stop_requested, self.logger, self._report_sample_wait,
         )
 
         model = config["model_distributor"]
@@ -856,23 +748,6 @@ class TrainingRuntime:
         self.model_channel = grpc.insecure_channel(self.model_address)
         self.model_stub = training_pb2_grpc.ModelDistributorServiceStub(
             self.model_channel
-        )
-
-        actor = config["aiserver_status"]
-        actor_host = str(actor["host"])
-        actor_port = int(actor["port"])
-        configured_initial_ack_timeout = actor.get(
-            "initial_model_ack_timeout_sec"
-        )
-        self.initial_model_ack_timeout = (
-            None
-            if configured_initial_ack_timeout is None
-            else float(configured_initial_ack_timeout)
-        )
-        self.actor_address = f"{actor_host}:{actor_port}"
-        self.actor_channel = grpc.insecure_channel(self.actor_address)
-        self.actor_stub = training_pb2_grpc.AIServerTrainingStatusServiceStub(
-            self.actor_channel
         )
 
         dashboard = config["dashboard"]
@@ -892,17 +767,18 @@ class TrainingRuntime:
         self._initialize_metric_events()
         self.preview = None
         if dashboard["enabled"]:
+            actor = config["aiserver_status"]
             self.preview = PreviewCollector(
                 endpoints={"learner": f"127.0.0.1:{self.metric_event_server_port}",
-                           "aiserver": self.actor_address, "sample_pool": self.sample_address,
+                           "aiserver": f"{actor['host']}:{actor['port']}", "sample_pool": self.sample_address,
                            "distributor": self.model_address},
                 learner_source=self.learner_service, source_id=self.metrics_source_id,
                 directory=self.publisher.metrics_dir, backend=dashboard["backend"], logger=self.logger,
                 collect_aiserver=self.metric_event_relay_enabled,
+                binding_timeout=actor["initial_model_ack_timeout_sec"],
                 mean_window_ms=dashboard.get("mean_window_ms", 60000),
                 bucket_ms=dashboard.get("time_bucket_ms", 5000),
             )
-
 
     def _initialize_metric_events(self) -> None:
         store: RawMetricBatchStore | None = None
@@ -1058,52 +934,6 @@ class TrainingRuntime:
         return result
 
     @staticmethod
-    def _sample_pool_authority(
-        authority: common_pb2.ServiceInstanceIdentity,
-    ) -> common_pb2.ServiceInstanceIdentity:
-        try:
-            valid = (
-                bool(authority.component)
-                and bool(authority.instance_id)
-                and int(authority.lifecycle_epoch) > 0
-            )
-        except (AttributeError, TypeError, ValueError):
-            valid = False
-        if not valid:
-            raise RuntimeError("sample pool authority is invalid")
-        result = common_pb2.ServiceInstanceIdentity()
-        try:
-            result.CopyFrom(authority)
-        except TypeError as error:
-            raise RuntimeError(
-                "sample pool authority has an invalid wire type"
-            ) from error
-        return result
-
-    @staticmethod
-    def _aiserver_authority(
-        authority: common_pb2.ServiceInstanceIdentity,
-    ) -> common_pb2.ServiceInstanceIdentity:
-        try:
-            valid = (
-                bool(authority.component)
-                and bool(authority.instance_id)
-                and int(authority.lifecycle_epoch) > 0
-            )
-        except (AttributeError, TypeError, ValueError):
-            valid = False
-        if not valid:
-            raise RuntimeError("AIServer authority is invalid")
-        result = common_pb2.ServiceInstanceIdentity()
-        try:
-            result.CopyFrom(authority)
-        except TypeError as error:
-            raise RuntimeError(
-                "AIServer authority has an invalid wire type"
-            ) from error
-        return result
-
-    @staticmethod
     def _authority_document(
         authority: common_pb2.ServiceInstanceIdentity,
     ) -> dict:
@@ -1112,17 +942,6 @@ class TrainingRuntime:
             "instance_id": authority.instance_id,
             "lifecycle_epoch": int(authority.lifecycle_epoch),
         }
-
-    @staticmethod
-    def _same_authority(
-        left: common_pb2.ServiceInstanceIdentity,
-        right: common_pb2.ServiceInstanceIdentity,
-    ) -> bool:
-        return (
-            left.component == right.component
-            and left.instance_id == right.instance_id
-            and int(left.lifecycle_epoch) == int(right.lifecycle_epoch)
-        )
 
     def _pin_model_distributor_authority(
         self,
@@ -1149,23 +968,15 @@ class TrainingRuntime:
             ) from error
 
     @staticmethod
-    def _has_field(message, name: str) -> bool:
-        try:
-            return bool(message.HasField(name))
-        except (AttributeError, ValueError):
-            return False
-
-    @classmethod
     def _validate_model_manifest_available_range(
-        cls,
         response,
         model_step: int,
         *,
         latest_selector: bool,
     ) -> tuple[int, int]:
-        if not cls._has_field(
+        if not has_field(
             response, "available_floor_model_step"
-        ) or not cls._has_field(response, "latest_available_model_step"):
+        ) or not has_field(response, "latest_available_model_step"):
             raise RuntimeError(
                 "model manifest response is missing the available range"
             )
@@ -1182,13 +993,13 @@ class TrainingRuntime:
             )
         return floor, latest
 
-    @classmethod
-    def _validate_model_status_available_range(cls, status) -> tuple[int, int] | None:
-        has_latest_model = cls._has_field(status, "latest_model")
-        has_floor = cls._has_field(
+    @staticmethod
+    def _validate_model_status_available_range(status) -> tuple[int, int] | None:
+        has_latest_model = has_field(status, "latest_model")
+        has_floor = has_field(
             status, "available_floor_model_step"
         )
-        has_latest = cls._has_field(
+        has_latest = has_field(
             status, "latest_available_model_step"
         )
         if not has_latest_model:
@@ -1207,7 +1018,7 @@ class TrainingRuntime:
             floor < 0
             or floor > latest
             or latest != int(status.latest_model.model_step)
-            or not cls._has_field(status.latest_model, "model_step")
+            or not has_field(status.latest_model, "model_step")
         ):
             raise RuntimeError(
                 "model status has an incoherent available range"
@@ -1262,7 +1073,7 @@ class TrainingRuntime:
                 raise RuntimeError(
                     "initial model preflight returned NOT_FOUND with a manifest"
                 )
-            if not self._same_authority(
+            if not same_service_instance(
                 response_authority, pinned_authority
             ):
                 raise RuntimeError(
@@ -1287,7 +1098,7 @@ class TrainingRuntime:
         )
         if (
             identity.model_lineage_id != self.publisher.lineage_id
-            or not self._has_field(identity, "model_step")
+            or not has_field(identity, "model_step")
             or (
                 model_step is not None
                 and int(identity.model_step) != model_step
@@ -1393,7 +1204,7 @@ class TrainingRuntime:
         try:
             return self._model_distributor_authority(response.distributor)
         except (AttributeError, RuntimeError) as error:
-            raise _UpdateCommitOutcomeUncertain(
+            raise UpdateCommitOutcomeUncertain(
                 "registered model response has invalid distributor authority"
             ) from error
 
@@ -1420,7 +1231,7 @@ class TrainingRuntime:
                 response.distributor
             )
         except (AttributeError, RuntimeError) as error:
-            raise _UpdateCommitOutcomeUncertain(
+            raise UpdateCommitOutcomeUncertain(
                 "exact model lookup has invalid distributor authority"
             ) from error
         if response.result == training_pb2.MODEL_LOOKUP_RESULT_NOT_FOUND:
@@ -1429,22 +1240,22 @@ class TrainingRuntime:
             except (AttributeError, ValueError):
                 manifest_present = getattr(response, "manifest", None) is not None
             if manifest_present:
-                raise _UpdateCommitOutcomeUncertain(
+                raise UpdateCommitOutcomeUncertain(
                     "exact model lookup returned NOT_FOUND with a manifest"
                 )
-            if not self._same_authority(
+            if not same_service_instance(
                 response_authority, pinned_authority
             ):
-                raise _UpdateCommitOutcomeUncertain(
+                raise UpdateCommitOutcomeUncertain(
                     "model distributor authority changed before exact absence"
                 )
             return False, response_authority
         if response.result != training_pb2.MODEL_LOOKUP_RESULT_FOUND:
-            raise _UpdateCommitOutcomeUncertain(
+            raise UpdateCommitOutcomeUncertain(
                 response.message or "exact model lookup was rejected"
             )
         if not _same_message(response.manifest, expected):
-            raise _UpdateCommitOutcomeUncertain(
+            raise UpdateCommitOutcomeUncertain(
                 "model distributor returned a conflicting exact identity"
             )
         try:
@@ -1454,7 +1265,7 @@ class TrainingRuntime:
                 latest_selector=False,
             )
         except RuntimeError as error:
-            raise _UpdateCommitOutcomeUncertain(
+            raise UpdateCommitOutcomeUncertain(
                 "exact model lookup returned an incoherent available range"
             ) from error
         return True, response_authority
@@ -1467,7 +1278,7 @@ class TrainingRuntime:
     ) -> tuple[int, common_pb2.ServiceInstanceIdentity]:
         last_error: Exception | None = None
         attempts = 0
-        for attempt in range(1, self.UPDATE_COMMIT_MAX_ATTEMPTS + 1):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             current_lease_error = str(lease_error())
             if current_lease_error:
                 last_error = RuntimeError(
@@ -1479,25 +1290,25 @@ class TrainingRuntime:
             try:
                 registered_authority = self._register(document)
                 return attempt, registered_authority
-            except _UpdateCommitOutcomeUncertain as error:
+            except UpdateCommitOutcomeUncertain as error:
                 last_error = error
                 break
             except Exception as error:
                 last_error = error
-                if attempt == self.UPDATE_COMMIT_MAX_ATTEMPTS:
+                if attempt == MAX_ATTEMPTS:
                     break
                 self.logger.warning(
                     "model register attempt %d failed; retrying exact manifest: %s",
                     attempt,
                     error,
                 )
-                time.sleep(self.UPDATE_COMMIT_RETRY_DELAY_SEC)
+                time.sleep(RETRY_DELAY_SEC)
 
         try:
             registered, resolved_authority = self._exact_model_registered(
                 document, pinned_authority
             )
-        except _UpdateCommitOutcomeUncertain as error:
+        except UpdateCommitOutcomeUncertain as error:
             error.attempts = attempts
             raise
         if registered:
@@ -1507,95 +1318,18 @@ class TrainingRuntime:
                 )
             return attempts, resolved_authority
         if registered is False:
-            raise _UpdateCommitNotApplied(
+            raise UpdateCommitNotApplied(
                 "model registration was not applied after "
                 f"{attempts} attempts: {last_error}",
                 attempts,
             ) from last_error
-        raise _UpdateCommitOutcomeUncertain(
+        raise UpdateCommitOutcomeUncertain(
             "model registration outcome is uncertain after "
             f"{attempts} attempts: {last_error}",
             attempts,
         ) from last_error
 
-    def _wait_initial_model_loaded(
-        self, document: dict
-    ) -> common_pb2.ServiceInstanceIdentity | None:
-        expected = document["manifest"].identity
-        deadline = (
-            None
-            if self.initial_model_ack_timeout is None
-            else time.monotonic() + self.initial_model_ack_timeout
-        )
-        self.logger.info(
-            "Waiting for AIServer bootstrap ACK: lineage=%s model_step=%d "
-            "timeout=%s",
-            expected.model_lineage_id,
-            int(expected.model_step),
-            (
-                "unbounded"
-                if self.initial_model_ack_timeout is None
-                else f"{self.initial_model_ack_timeout:g}s"
-            ),
-        )
-        last = ""
-        while (
-            not _stop_requested.is_set()
-            and (deadline is None or time.monotonic() < deadline)
-        ):
-            try:
-                status = self.model_stub.GetModelDistributorStatus(
-                    training_pb2.ModelDistributorStatusReq(), timeout=2.0
-                )
-                try:
-                    self._model_distributor_authority(status.distributor)
-                    status_authority_valid = True
-                except (AttributeError, RuntimeError):
-                    status_authority_valid = False
-                exact_ack = status_authority_valid and _same_message(
-                    status.latest_ack_model, expected
-                )
-                if exact_ack and status.latest_ack_status == training_pb2.MODEL_LOAD_STATUS_FAILED:
-                    raise RuntimeError(
-                        "AIServer failed to load bootstrap model "
-                        f"lineage={expected.model_lineage_id} "
-                        f"model_step={int(expected.model_step)} "
-                        f"aiserver={status.latest_ack_aiserver.instance_id}: "
-                        f"{status.last_error}"
-                    )
-                if (
-                    status.ready and exact_ack
-                    and status.latest_ack_status == training_pb2.MODEL_LOAD_STATUS_LOADED
-                ):
-                    self.logger.info(
-                        "AIServer bootstrap ACK received: "
-                        "lineage=%s model_step=%d",
-                        expected.model_lineage_id,
-                        int(expected.model_step),
-                    )
-                    source = common_pb2.ServiceInstanceIdentity()
-                    source.CopyFrom(status.latest_ack_aiserver)
-                    return source
-                last = (
-                    f"status={training_pb2.ModelLoadStatus.Name(status.latest_ack_status)} "
-                    f"ack={model_identity_document(status.latest_ack_model)} "
-                    f"error={status.last_error}"
-                )
-            except grpc.RpcError as error:
-                last = error.details() or str(error)
-            time.sleep(0.2)
-        if _stop_requested.is_set():
-            self.logger.info(
-                "Stop requested after bootstrap registration; skipping "
-                "AIServer ACK readiness"
-            )
-            return None
-        raise RuntimeError(
-            "AIServer did not ACK the bootstrap model identity before the "
-            f"configured timeout: {last}"
-        )
-
-    def _initialize_models(self) -> bool:
+    def _initialize_models(self) -> None:
         model_step = self.trainer.model_step
         self.initial_model_step = 0
         update_id = (
@@ -1627,17 +1361,8 @@ class TrainingRuntime:
                 pinned_authority,
             )
         self.model_manifests[model_step] = document
-        aiserver_source = self._wait_initial_model_loaded(document)
-        if aiserver_source is None:
-            self.logger.info(
-                "Learner bootstrap published and registered; stopping before "
-                "AIServer activation: lineage=%s model_step=%d",
-                document["identity"]["model_lineage_id"],
-                model_step,
-            )
-            return False
         if self.preview is not None:
-            self.preview.bind_aiserver(aiserver_source)
+            self.preview.expect_bootstrap(document["manifest"].identity, pinned_authority)
         self._commit_learner_metrics(
             document,
             behavior_model={},
@@ -1654,403 +1379,17 @@ class TrainingRuntime:
             model_step,
             self._startup_mode,
         )
-        return True
 
-    def _sample_pool_status(self):
-        return self.sample_stub.GetStatus(
-            training_pb2.SamplePoolStatusReq(), timeout=2.0
-        )
-
-    @staticmethod
-    def _is_retryable_sample_rpc(error: grpc.RpcError) -> bool:
-        try:
-            code = error.code()
-        except Exception:
-            return False
-        return code in (
-            grpc.StatusCode.ABORTED,
-            grpc.StatusCode.CANCELLED,
-            grpc.StatusCode.DEADLINE_EXCEEDED,
-            grpc.StatusCode.INTERNAL,
-            grpc.StatusCode.RESOURCE_EXHAUSTED,
-            grpc.StatusCode.UNKNOWN,
-            grpc.StatusCode.UNAVAILABLE,
-        )
-
-    @staticmethod
-    def _rpc_error_text(error: grpc.RpcError) -> str:
-        try:
-            details = error.details()
-        except Exception:
-            details = ""
-        return details or str(error)
-
-    def _mark_sample_wait(
-        self,
-        disposition: str,
-        operation: str,
-        error: object,
-        attempt: int,
-    ) -> None:
-        message = f"{operation}: {error}"
+    def _report_sample_wait(self, disposition: str, message: str) -> None:
+        wait_states = ("WAITING_FOR_SAMPLE_POOL", "GET_BATCH_OUTCOME_UNKNOWN")
         with self._metrics_lock:
-            current = str(self._metrics_context.get("disposition", ""))
-            if current not in (
-                "WAITING_FOR_SAMPLE_POOL",
-                "GET_BATCH_OUTCOME_UNKNOWN",
-            ):
-                self._sample_wait_resume_disposition = current or "READY"
-            self._metrics_context["disposition"] = disposition
-            self._metrics_context["error"] = message
-        should_log = attempt == 1 or (attempt & (attempt - 1)) == 0
-        warning = getattr(self.logger, "warning", None)
-        if should_log and callable(warning):
-            warning(
-                "%s; waiting for the same Sample Pool authority "
-                "(attempt=%d)",
-                message,
-                attempt,
-            )
-
-    def _clear_sample_wait(self) -> None:
-        with self._metrics_lock:
-            if self._metrics_context.get("disposition") in (
-                "WAITING_FOR_SAMPLE_POOL",
-                "GET_BATCH_OUTCOME_UNKNOWN",
-            ):
-                self._metrics_context["disposition"] = getattr(
-                    self, "_sample_wait_resume_disposition", "READY"
-                )
-                self._metrics_context["error"] = ""
-        self._sample_wait_resume_disposition = "READY"
-
-    def _wait_sample_retry(
-        self,
-        attempt: int,
-        deadline: float | None = None,
-        *,
-        ignore_stop: bool = False,
-    ) -> bool:
-        delay = min(
-            self.SAMPLE_RETRY_MAX_SEC,
-            self.SAMPLE_RETRY_INITIAL_SEC * (2 ** min(attempt - 1, 8)),
-        )
-        if deadline is not None:
-            delay = min(delay, max(0.0, deadline - time.monotonic()))
-            if delay <= 0:
-                return True
-        if ignore_stop:
-            time.sleep(delay)
-            return False
-        return _stop_requested.wait(delay)
-
-    def _ready_sample_pool_authority(
-        self, status
-    ) -> common_pb2.ServiceInstanceIdentity:
-        authority = self._sample_pool_authority(status.sample_pool)
-        if not status.ready or not status.ingress_ready or status.finalized:
-            raise _SamplePoolUnavailable(
-                "sample pool service is not accepting samples"
-            )
-        return authority
-
-    def _sample_status_for_authority(
-        self,
-        expected: common_pb2.ServiceInstanceIdentity,
-        operation: str,
-    ):
-        status = self._sample_pool_status()
-        actual = self._ready_sample_pool_authority(status)
-        if not self._same_authority(actual, expected):
-            raise RuntimeError(
-                f"sample pool authority changed during {operation}"
-            )
-        return status
-
-    def _assert_lease_authority(
-        self, expected: common_pb2.ServiceInstanceIdentity
-    ) -> None:
-        self._sample_status_for_authority(expected, "the lease")
-
-    def _assert_sample_pool_ready(
-        self,
-    ) -> common_pb2.ServiceInstanceIdentity:
-        return self._ready_sample_pool_authority(self._sample_pool_status())
-
-    def _wait_for_sample_pool(
-        self,
-    ) -> common_pb2.ServiceInstanceIdentity | None:
-        attempt = 0
-        while not _stop_requested.is_set():
-            try:
-                authority = self._assert_sample_pool_ready()
-                self._clear_sample_wait()
-                return authority
-            except _SamplePoolUnavailable as error:
-                attempt += 1
-                self._mark_sample_wait(
-                    "WAITING_FOR_SAMPLE_POOL",
-                    "sample pool readiness",
-                    error,
-                    attempt,
-                )
-            except grpc.RpcError as error:
-                if not self._is_retryable_sample_rpc(error):
-                    raise
-                attempt += 1
-                self._mark_sample_wait(
-                    "WAITING_FOR_SAMPLE_POOL",
-                    "sample pool transport",
-                    self._rpc_error_text(error),
-                    attempt,
-                )
-            if self._wait_sample_retry(attempt):
-                return None
-        return None
-
-    def _get_batch_recovery_status(
-        self, expected: common_pb2.ServiceInstanceIdentity
-    ):
-        status = self._sample_pool_status()
-        actual = self._sample_pool_authority(status.sample_pool)
-        if not self._same_authority(actual, expected):
-            raise RuntimeError(
-                "sample pool authority changed while GetBatch outcome "
-                "was unknown"
-            )
-        if int(status.max_concurrent_consumers) != 1:
-            raise RuntimeError(
-                "GetBatch recovery requires the declared single-consumer "
-                "delivery contract"
-            )
-        leased_transitions = int(status.leased_transitions)
-        active_consumers = int(status.active_consumer_count)
-        if (
-            leased_transitions < 0
-            or active_consumers < 0
-            or (leased_transitions == 0 and active_consumers != 0)
-            or (leased_transitions > 0 and active_consumers != 1)
-        ):
-            raise RuntimeError(
-                "sample pool returned contradictory lease status while "
-                "GetBatch outcome was unknown"
-            )
-        return status
-
-    def _reconcile_get_batch_outcome(
-        self,
-        expected: common_pb2.ServiceInstanceIdentity,
-        reason: str,
-        deadline: float | None = None,
-        *,
-        ignore_stop: bool = False,
-        request_deadline: float | None = None,
-    ) -> bool:
-        expected = self._sample_pool_authority(expected)
-        attempt = 0
-        while (ignore_stop or not _stop_requested.is_set()) and (
-            deadline is None or time.monotonic() < deadline
-        ):
-            # A transport failure can arrive before cancellation reaches Pool.
-            # Wait out this exact RPC's deadline before observing lease state;
-            # repeated zero-lease snapshots cannot prove the request has ended.
-            if request_deadline is not None and time.monotonic() < request_deadline:
-                wait_until = request_deadline if deadline is None else min(request_deadline, deadline)
-                delay = max(0.0, wait_until - time.monotonic())
-                if ignore_stop:
-                    time.sleep(delay)
-                elif _stop_requested.wait(delay):
-                    return False
-                continue
-            attempt += 1
-            try:
-                status = self._get_batch_recovery_status(expected)
-            except grpc.RpcError as error:
-                if not self._is_retryable_sample_rpc(error):
-                    raise
-                self._mark_sample_wait(
-                    "GET_BATCH_OUTCOME_UNKNOWN",
-                    "GetBatch reconciliation transport",
-                    self._rpc_error_text(error),
-                    attempt,
-                )
-                if self._wait_sample_retry(
-                    attempt, deadline, ignore_stop=ignore_stop
-                ):
-                    return False
-                continue
-
-            if not status.ready or int(status.leased_transitions) > 0:
-                state = (
-                    "hidden lease transitions="
-                    f"{int(status.leased_transitions)}"
-                    if int(status.leased_transitions) > 0
-                    else "sample pool service not ready"
-                )
-                self._mark_sample_wait(
-                    "GET_BATCH_OUTCOME_UNKNOWN",
-                    "GetBatch reconciliation",
-                    state,
-                    attempt,
-                )
-            else:
-                # Pool checks cancellation/deadline before committing a lease;
-                # GetStatus observes the same lease state under the same lock.
-                self._clear_sample_wait()
-                self.logger.info(
-                    "GetBatch outcome reconciled without training: %s", reason
-                )
-                return True
-            poll_delay = self.GET_BATCH_RECONCILE_POLL_SEC
-            if deadline is not None:
-                poll_delay = min(
-                    poll_delay, max(0.0, deadline - time.monotonic())
-                )
-                if poll_delay <= 0:
-                    return False
-            if ignore_stop:
-                time.sleep(poll_delay)
-            elif _stop_requested.wait(poll_delay):
-                return False
-        return False
-
-    def _get_batch(
-        self,
-        ready_authority: common_pb2.ServiceInstanceIdentity | None = None,
-        *,
-        request_deadline: float | None = None,
-    ):
-        if request_deadline is None:
-            request_deadline = time.monotonic() + max(
-                2.0, self.get_timeout_ms / 1000.0 + 1.0
-            )
-        response = self.sample_stub.GetBatch(
-            training_pb2.GetBatchReq(
-                requested_transitions=self.train_batch_size,
-                timeout_ms=self.get_timeout_ms,
-                consumer=self.learner_service,
-                lease_timeout_ms=self.lease_timeout_ms,
-            ),
-            timeout=max(0.0, request_deadline - time.monotonic()),
-        )
-        if response.result == training_pb2.GET_BATCH_RESULT_BUSY:
-            response_authority = self._sample_pool_authority(
-                response.sample_pool
-            )
-            if ready_authority is None:
-                ready_authority = self._ready_sample_pool_authority(
-                    self._sample_pool_status()
-                )
-            else:
-                ready_authority = self._sample_pool_authority(
-                    ready_authority
-                )
-            if (
-                not self._same_authority(
-                    response_authority, ready_authority
-                )
-                or bool(response.delivery_id)
-                or int(response.lease_deadline_unix_ms) != 0
-                or len(response.items) != 0
-            ):
-                raise RuntimeError(
-                    "sample pool returned an incoherent busy delivery"
-                )
-            return response
-        if response.result != training_pb2.GET_BATCH_RESULT_LEASED:
-            response_authority = self._sample_pool_authority(
-                response.sample_pool
-            )
-            if ready_authority is not None and not self._same_authority(
-                response_authority,
-                self._sample_pool_authority(ready_authority),
-            ):
-                raise RuntimeError(
-                    "sample pool authority changed during GetBatch"
-                )
-            if (
-                response.delivery_id
-                or int(response.lease_deadline_unix_ms) != 0
-                or response.items
-            ):
-                raise RuntimeError(
-                    "sample pool returned a non-leased result with lease payload"
-                )
-            return response
-        if ready_authority is None:
-            ready_authority = self._ready_sample_pool_authority(
-                self._sample_pool_status()
-            )
-        else:
-            ready_authority = self._sample_pool_authority(
-                ready_authority
-            )
-        response_authority = self._sample_pool_authority(
-            response.sample_pool
-        )
-        if (
-            not self._same_authority(
-                response_authority, ready_authority
-            )
-            or not response.delivery_id
-            or len(response.items) != self.train_batch_size
-            or int(response.lease_deadline_unix_ms)
-            <= int(time.time() * 1000)
-        ):
-            raise RuntimeError(
-                "sample pool returned an incoherent leased delivery"
-            )
-        return response
-
-    def _get_batch_recovering(
-        self,
-        *,
-        ready_authority: common_pb2.ServiceInstanceIdentity,
-        deadline: float | None = None,
-        ignore_stop: bool = False,
-    ):
-        expected = self._sample_pool_authority(ready_authority)
-        request_deadline = time.monotonic() + max(
-            2.0, self.get_timeout_ms / 1000.0 + 1.0
-        )
-        try:
-            response = self._get_batch(
-                ready_authority=expected, request_deadline=request_deadline
-            )
-        except grpc.RpcError as error:
-            if not self._is_retryable_sample_rpc(error):
-                raise
-            reason = self._rpc_error_text(error)
-            self._mark_sample_wait(
-                "GET_BATCH_OUTCOME_UNKNOWN",
-                "GetBatch transport outcome unknown",
-                reason,
-                1,
-            )
-            self._reconcile_get_batch_outcome(
-                expected,
-                reason,
-                deadline=deadline,
-                ignore_stop=ignore_stop,
-                request_deadline=request_deadline,
-            )
-            return None
-        if response.result == training_pb2.GET_BATCH_RESULT_BUSY:
-            reason = response.message or "Sample Pool reports an active lease"
-            self._mark_sample_wait(
-                "GET_BATCH_OUTCOME_UNKNOWN",
-                "GetBatch busy recovery",
-                reason,
-                1,
-            )
-            self._reconcile_get_batch_outcome(
-                expected,
-                reason,
-                deadline=deadline,
-                ignore_stop=ignore_stop,
-            )
-            return None
-        return response
+            current = self._metrics_context["disposition"]
+            if disposition:
+                if current not in wait_states:
+                    self._sample_wait_resume_disposition = current
+                self._metrics_context.update(disposition=disposition, error=message)
+            elif current in wait_states:
+                self._metrics_context.update(disposition=self._sample_wait_resume_disposition, error="")
 
     def _validate_transition(
         self, transition: training_pb2.ProcessedTransition
@@ -2066,7 +1405,7 @@ class TrainingRuntime:
             raise ValueError("processed transition contains non-finite values")
         if (
             not transition.item_id
-            or not self._has_field(transition, "behavior_model_step")
+            or not has_field(transition, "behavior_model_step")
             or int(transition.behavior_model_step) > int(self.trainer.model_step)
             or int(transition.action) < 0
             or int(transition.action) >= self.publisher.action_dim
@@ -2089,193 +1428,30 @@ class TrainingRuntime:
                 "processed transition action mask is disabled by the contract"
             )
 
-    def _validate_delivery(self, response) -> dict:
+    def _validate_training_item(self, item):
+        """Check this sample against the consuming policy and its published models."""
+        transition = item.transition
+        self._validate_transition(transition)
+        step = int(transition.behavior_model_step)
+        identity = model_identity_document(item.behavior_model)
         if (
-            response.result != training_pb2.GET_BATCH_RESULT_LEASED
-            or len(response.items) != self.train_batch_size
-            or not response.delivery_id
+            not identity
+            or identity["model_step"] != step
+            or identity["model_lineage_id"] != self.publisher.lineage_id
         ):
-            raise ValueError("sample delivery violates exact transition batch size")
-
-        item_snapshots: dict[str, training_pb2.SamplePoolItem] = {}
-        behavior_steps: set[int] = set()
-        behavior_models: dict[int, dict] = {}
-        producers: dict[tuple[str, str, int], dict] = {}
-        transition_created_at: list[int] = []
-        inserted_at: list[int] = []
-        draw_counts: list[int] = []
-        for item in response.items:
-            transition = item.transition
-            self._validate_transition(transition)
-            if (
-                int(item.insert_sequence) <= 0
-                or int(item.inserted_at_unix_ms) <= 0
-                or int(item.draw_count) <= 0
-            ):
-                raise ValueError("sample pool item storage facts are invalid")
-            previous = item_snapshots.get(transition.item_id)
-            if previous is not None and previous != item:
-                raise ValueError("repeated sample item has conflicting snapshot facts")
-            item_snapshots[transition.item_id] = item
-            step = int(transition.behavior_model_step)
-            behavior_steps.add(step)
-            identity = model_identity_document(item.behavior_model)
-            if (
-                not identity
-                or identity["model_step"] != step
-                or identity["model_lineage_id"] != self.publisher.lineage_id
-            ):
-                raise ValueError(
-                    "processed transition source model does not match the "
-                    f"training lineage/step: item={transition.item_id} source={identity}"
-                )
-            document = self.model_manifests.get(step)
-            if document is None or not _same_message(
-                item.behavior_model, document["manifest"].identity
-            ):
-                raise ValueError(
-                    "processed transition source model is not a published "
-                    f"training model: item={transition.item_id} source={identity}"
-                )
-            behavior_models[step] = identity
-            try:
-                producer = self._aiserver_authority(item.producer)
-            except RuntimeError as error:
-                raise ValueError(
-                    f"processed transition producer is invalid: item={transition.item_id}: {error}"
-                ) from error
-            producer_key = (
-                producer.component, producer.instance_id, int(producer.lifecycle_epoch)
+            raise ValueError(
+                "processed transition source model does not match the "
+                f"training lineage/step: item={transition.item_id} source={identity}"
             )
-            producers[producer_key] = self._authority_document(producer)
-            transition_created_at.append(int(transition.created_at_unix_ms))
-            inserted_at.append(int(item.inserted_at_unix_ms))
-            draw_counts.append(int(item.draw_count))
-
-        minimum_step = min(behavior_steps)
-        maximum_step = max(behavior_steps)
-        oldest_created_at = min(transition_created_at)
-        newest_created_at = max(transition_created_at)
-        return {
-            "model_lineage_id": behavior_models[minimum_step]["model_lineage_id"],
-            "minimum_model_step": minimum_step,
-            "maximum_model_step": maximum_step,
-            "models": [behavior_models[step] for step in sorted(behavior_steps)],
-            "producers": [producers[key] for key in sorted(producers)],
-            "oldest_transition_created_at_unix_ms": oldest_created_at,
-            "newest_transition_created_at_unix_ms": newest_created_at,
-            "oldest_inserted_at_unix_ms": min(inserted_at),
-            "newest_inserted_at_unix_ms": max(inserted_at),
-            "draw_count_sum": sum(draw_counts),
-            "draw_count_minimum": min(draw_counts),
-            "draw_count_maximum": max(draw_counts),
-        }
-
-    def _ack(
-        self,
-        delivery_id: str,
-        disposition: int,
-        train_update_id: str = "",
-        expected_authority: common_pb2.ServiceInstanceIdentity | None = None,
-    ) -> None:
-        response = self.sample_stub.AckBatch(
-            training_pb2.AckBatchReq(
-                consumer=self.learner_service,
-                delivery_id=delivery_id,
-                disposition=disposition,
-                train_update_id=train_update_id,
-            ),
-            timeout=3.0,
-        )
-        positive_result = response.result in (
-            training_pb2.DELIVERY_RESULT_APPLIED,
-            training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
-        )
-        if not positive_result:
-            if response.delivery_id != delivery_id:
-                raise _UpdateCommitOutcomeUncertain(
-                    "sample ACK negative response does not identify the "
-                    "requested delivery"
-                )
-            if expected_authority is None:
-                raise _UpdateCommitOutcomeUncertain(
-                    "sample ACK negative response has no pinned lease authority"
-                )
-            try:
-                self._assert_lease_authority(expected_authority)
-            except (grpc.RpcError, RuntimeError) as error:
-                raise _UpdateCommitOutcomeUncertain(
-                    "sample ACK negative response cannot be bound to the "
-                    "pinned lease authority"
-                ) from error
-            raise RuntimeError(f"sample ACK failed: {response.message}")
-        if (
-            response.delivery_id != delivery_id
-            or int(response.disposition) != int(disposition)
-            or response.train_update_id != train_update_id
+        document = self.model_manifests.get(step)
+        if document is None or not _same_message(
+            item.behavior_model, document["manifest"].identity
         ):
-            raise _UpdateCommitOutcomeUncertain(
-                "sample ACK positive response does not echo the exact request"
+            raise ValueError(
+                "processed transition source model is not a published "
+                f"training model: item={transition.item_id} source={identity}"
             )
-
-    def _ack_idempotently(
-        self,
-        delivery_id: str,
-        disposition: int,
-        train_update_id: str,
-        expected_authority: common_pb2.ServiceInstanceIdentity,
-    ) -> int:
-        last_error: Exception | None = None
-        saw_uncertain_outcome = False
-        for attempt in range(1, self.UPDATE_COMMIT_MAX_ATTEMPTS + 1):
-            try:
-                self._ack(
-                    delivery_id,
-                    disposition,
-                    train_update_id,
-                    expected_authority,
-                )
-                return attempt
-            except Exception as error:
-                last_error = error
-                saw_uncertain_outcome = saw_uncertain_outcome or isinstance(
-                    error, (grpc.RpcError, _UpdateCommitOutcomeUncertain)
-                )
-                if attempt == self.UPDATE_COMMIT_MAX_ATTEMPTS:
-                    break
-                self.logger.warning(
-                    "sample ACK attempt %d failed; retrying exact delivery/update: %s",
-                    attempt,
-                    error,
-                )
-                time.sleep(self.UPDATE_COMMIT_RETRY_DELAY_SEC)
-        if not saw_uncertain_outcome:
-            raise RuntimeError(
-                "sample ACK was not applied after "
-                f"{self.UPDATE_COMMIT_MAX_ATTEMPTS} attempts: {last_error}"
-            ) from last_error
-        raise _UpdateCommitOutcomeUncertain(
-            "sample ACK outcome is uncertain after "
-            f"{self.UPDATE_COMMIT_MAX_ATTEMPTS} attempts: {last_error}"
-        ) from last_error
-
-    def _nack(self, delivery_id: str, reason: str) -> None:
-        try:
-            response = self.sample_stub.NackBatch(
-                training_pb2.NackBatchReq(
-                    consumer=self.learner_service,
-                    delivery_id=delivery_id,
-                    reason=reason[:256],
-                ),
-                timeout=3.0,
-            )
-            if response.result not in (
-                training_pb2.DELIVERY_RESULT_APPLIED,
-                training_pb2.DELIVERY_RESULT_ALREADY_APPLIED,
-            ):
-                self.logger.error("sample NACK rejected: %s", response.message)
-        except grpc.RpcError as error:
-            self.logger.error("sample NACK failed: %s", error)
+        return identity
 
     def _write_receipt(self, update_id: str, document: dict) -> None:
         atomic_write_json(self.publisher.receipt_path(update_id), document)
@@ -2391,10 +1567,8 @@ class TrainingRuntime:
         self._discard_update_rollback(context)
 
     def _train_delivery(self, response) -> None:
-        behavior_identity = self._validate_delivery(response)
-        delivery_authority = self._sample_pool_authority(
-            response.sample_pool
-        )
+        behavior_identity = self.pool.delivery_provenance(response, self._validate_training_item)
+        delivery_authority = response.sample_pool
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
         item_ids = [item.transition.item_id for item in response.items]
@@ -2416,13 +1590,7 @@ class TrainingRuntime:
             ),
         }
         self._write_receipt(update_id, receipt)
-        renewer = LeaseRenewer(
-            self.sample_stub,
-            self.learner_service,
-            response.delivery_id,
-            self.lease_timeout_ms,
-            lambda: self._assert_lease_authority(delivery_authority),
-        ).start()
+        renewer = self.pool.renew_during_update(response)
         rollback: dict | None = None
         training_succeeded = False
         register_started = False
@@ -2433,7 +1601,7 @@ class TrainingRuntime:
         manifest: dict | None = None
         stats: dict = {}
         raw_metric_sum_counts: dict[str, dict[str, float | int]] = {}
-        training_samples: list[dict] = []
+        samples: list[dict] = []
         sample_evaluation_count: int | None = None
         optimizer_step_count: int | None = None
         target_updates = self.train_updates
@@ -2445,9 +1613,8 @@ class TrainingRuntime:
                 raise RuntimeError(
                     f"pre-update rollback capture failed: {error}"
                 ) from error
-            training_samples, stats = train_processed_delivery(
-                response.items, self.trainer
-            )
+            samples = training_samples(response.items)
+            stats = self.trainer.train_on_batch(samples)
             sample_evaluation_count = int(stats["sample_evaluation_count"])
             optimizer_step_count = int(stats["optimizer_step_count"])
             if sample_evaluation_count <= 0 or optimizer_step_count <= 0:
@@ -2463,14 +1630,14 @@ class TrainingRuntime:
             if renewer.error:
                 raise RuntimeError(f"sample lease lost: {renewer.error}")
             target_updates = self.train_updates + 1
-            target_samples = self.trained_samples + len(training_samples)
+            target_samples = self.trained_samples + len(samples)
             self.publisher.commit_optimizer_checkpoint(
                 self.trainer,
                 train_update_id=update_id,
                 behavior_model=behavior_identity,
                 item_ids=item_ids,
                 stats=stats,
-                sample_count=len(training_samples),
+                sample_count=len(samples),
                 train_updates=target_updates,
                 trained_samples=target_samples,
             )
@@ -2490,7 +1657,7 @@ class TrainingRuntime:
                 behavior_model=behavior_identity,
                 item_ids=item_ids,
                 stats=stats,
-                sample_count=len(training_samples),
+                sample_count=len(samples),
                 train_updates=target_updates,
                 trained_samples=target_samples,
                 checkpoint_precommitted=True,
@@ -2534,19 +1701,14 @@ class TrainingRuntime:
                 receipt["state"] = "REGISTERED"
                 self._write_receipt(update_id, receipt)
                 ack_started = True
-                receipt["ack_attempts"] = self._ack_idempotently(
-                    response.delivery_id,
-                    training_pb2.ACK_DISPOSITION_TRAINED,
-                    update_id,
-                    delivery_authority,
-                )
+                receipt["ack_attempts"] = self.pool.acknowledge_trained(response, update_id)
                 sample_acked = True
                 receipt["state"] = "ACKED"
                 self._write_receipt(update_id, receipt)
                 self._commit_learner_metrics(
                     manifest,
                     behavior_model=behavior_identity,
-                    actual_batch_size=len(training_samples),
+                    actual_batch_size=len(samples),
                     disposition="TRAINED",
                     train_update_id=update_id,
                     train_updates=target_updates,
@@ -2567,7 +1729,7 @@ class TrainingRuntime:
                 behavior_identity=behavior_identity,
                 train_updates=target_updates,
                 trained_samples=target_samples,
-                actual_batch_size=len(training_samples),
+                actual_batch_size=len(samples),
                 raw_metric_sum_counts=raw_metric_sum_counts,
                 requested_train_batch_size=self.train_batch_size,
                 pool_draw_slot_count=pool_draw_slot_count,
@@ -2584,7 +1746,7 @@ class TrainingRuntime:
                         "register_attempts",
                         int(getattr(error, "attempts", 0)),
                     )
-                if isinstance(error, _UpdateCommitOutcomeUncertain):
+                if isinstance(error, UpdateCommitOutcomeUncertain):
                     if rollback is not None:
                         rollback["retained"] = True
                     receipt.update(
@@ -2604,7 +1766,7 @@ class TrainingRuntime:
                         self._commit_learner_metrics(
                             manifest,
                             behavior_model=behavior_identity,
-                            actual_batch_size=len(training_samples),
+                            actual_batch_size=len(samples),
                             disposition="REGISTER_PENDING",
                             train_update_id=update_id,
                             train_updates=target_updates,
@@ -2651,17 +1813,17 @@ class TrainingRuntime:
                         }
                     )
                     self._write_receipt(update_id, receipt)
-                    self._nack(response.delivery_id, "learner update rolled back")
+                    self.pool.release(response.delivery_id, "learner update rolled back")
             elif model_registered and not transaction_complete:
                 if ack_started:
                     receipt.setdefault(
-                        "ack_attempts", self.UPDATE_COMMIT_MAX_ATTEMPTS
+                        "ack_attempts", MAX_ATTEMPTS
                     )
                 if sample_acked:
                     pending_state = "ACKED_COMMIT_PENDING"
                 elif not ack_started:
                     pending_state = "REGISTERED_COMMIT_PENDING"
-                elif isinstance(error, _UpdateCommitOutcomeUncertain):
+                elif isinstance(error, UpdateCommitOutcomeUncertain):
                     pending_state = "ACK_PENDING"
                 else:
                     pending_state = "ACK_REJECTED"
@@ -2677,7 +1839,7 @@ class TrainingRuntime:
                     self._commit_learner_metrics(
                         manifest,
                         behavior_model=behavior_identity,
-                        actual_batch_size=len(training_samples),
+                        actual_batch_size=len(samples),
                         disposition=pending_state,
                         train_update_id=update_id,
                         train_updates=target_updates,
@@ -2695,7 +1857,7 @@ class TrainingRuntime:
                 and not isinstance(error, ValueError)
                 and receipt.get("state") == "LEASED"
             ):
-                self._nack(response.delivery_id, "learner update failed")
+                self.pool.release(response.delivery_id, "learner update failed")
             if training_succeeded and isinstance(error, ValueError):
                 raise RuntimeError(
                     f"learner update commit failed: {error}"
@@ -2883,270 +2045,10 @@ class TrainingRuntime:
             "train_update_id": context.get("train_update_id", ""),
         }
 
-    def _shutdown_sample_authority(
-        self,
-        ready_authority: common_pb2.ServiceInstanceIdentity | None,
-    ) -> common_pb2.ServiceInstanceIdentity | None:
-        if ready_authority is None:
-            return None
-        return self._sample_pool_authority(ready_authority)
-
-    def _sample_pool_finalization_id(self) -> str:
-        identity = (
-            f"{self.learner_service.component}:"
-            f"{self.learner_service.instance_id}:"
-            f"{int(self.learner_service.lifecycle_epoch)}"
-        )
-        return f"learner-shutdown-{identity.encode('utf-8').hex()}"
-
-    def _validate_finalized_sample_pool_status(
-        self,
-        status,
-        expected_authority: common_pb2.ServiceInstanceIdentity,
-        finalization_id: str,
-        response,
-    ) -> None:
-        actual = self._sample_pool_authority(status.sample_pool)
-        if not self._same_authority(actual, expected_authority):
-            raise RuntimeError(
-                "sample pool authority changed after finalization"
-            )
-        if (
-            not status.finalized
-            or status.finalization_id != finalization_id
-            or not self._has_field(status, "finalized_at_unix_ms")
-            or not self._has_field(response, "finalized_at_unix_ms")
-            or int(status.finalized_at_unix_ms) <= 0
-            or int(status.finalized_at_unix_ms)
-            != int(response.finalized_at_unix_ms)
-        ):
-            raise RuntimeError(
-                "sample pool returned contradictory finalization identity"
-            )
-        counts = {
-            "accepted": int(status.accepted_unique_transitions),
-            "acked": int(status.acknowledged_transition_slot_count),
-            "released": int(status.released_transition_slot_count),
-            "drawn": int(status.drawn_transition_slot_count),
-            "trained": int(status.trained_transition_count),
-            "invalid": int(status.invalid_transition_count),
-            "shutdown_untrained": int(
-                status.shutdown_untrained_transition_count
-            ),
-            "ready": int(status.ready_transitions),
-            "leased": int(status.leased_transitions),
-            "resident": int(status.resident_transitions),
-            "resident_bytes": int(status.resident_estimated_bytes),
-            "evicted": int(status.evicted_transition_count),
-            "finalized": int(status.finalized_transition_count),
-        }
-        if min(counts.values()) < 0:
-            raise RuntimeError(
-                "sample pool returned negative finalized accounting"
-            )
-        if (
-            status.ingress_ready
-            or status.pool_ready
-            or counts["ready"] != 0
-            or counts["leased"] != 0
-            or counts["resident"] != 0
-            or counts["resident_bytes"] != 0
-        ):
-            raise RuntimeError(
-                "sample pool retained live data after finalization"
-            )
-        if counts["acked"] != (
-            counts["trained"] + counts["invalid"] + counts["shutdown_untrained"]
-        ):
-            raise RuntimeError(
-                "sample pool returned contradictory finalized disposition "
-                "accounting"
-            )
-        if counts["drawn"] != counts["acked"] + counts["released"]:
-            raise RuntimeError(
-                "sample pool returned contradictory finalized draw-slot accounting"
-            )
-        if counts["accepted"] != counts["evicted"] + counts["finalized"]:
-            raise RuntimeError(
-                "sample pool returned contradictory finalized transition "
-                "accounting"
-            )
-
-    def _finalize_sample_pool(
-        self,
-        expected_authority: common_pb2.ServiceInstanceIdentity,
-        deadline: float,
-    ) -> None:
-        expected = self._sample_pool_authority(expected_authority)
-        finalization_id = self._sample_pool_finalization_id()
-        request = training_pb2.FinalizeSamplePoolReq(
-            consumer=self.learner_service,
-            expected_sample_pool=expected,
-            finalization_id=finalization_id,
-        )
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            timeout = min(2.0, max(0.001, deadline - time.monotonic()))
-            try:
-                response = self.sample_stub.FinalizeSamplePool(
-                    request, timeout=timeout
-                )
-            except grpc.RpcError as error:
-                if not self._is_retryable_sample_rpc(error):
-                    raise
-                self._mark_sample_wait(
-                    "WAITING_FOR_SAMPLE_POOL",
-                    "shutdown SamplePool finalization",
-                    self._rpc_error_text(error),
-                    attempt,
-                )
-                self._wait_sample_retry(
-                    attempt, deadline, ignore_stop=True
-                )
-                continue
-
-            actual = self._sample_pool_authority(response.sample_pool)
-            if not self._same_authority(actual, expected):
-                raise RuntimeError(
-                    "sample pool authority changed during finalization"
-                )
-            if response.finalization_id != finalization_id:
-                raise RuntimeError(
-                    "sample pool returned another finalization identity"
-                )
-            if (
-                response.result
-                == training_pb2.SAMPLE_POOL_FINALIZE_RESULT_REJECTED_ACTIVE_LEASE
-            ):
-                if not self._reconcile_get_batch_outcome(
-                    expected,
-                    "SamplePool finalization observed an active delivery",
-                    deadline=deadline,
-                    ignore_stop=True,
-                ):
-                    break
-                continue
-
-            if response.result not in (
-                training_pb2.SAMPLE_POOL_FINALIZE_RESULT_FINALIZED,
-                training_pb2.SAMPLE_POOL_FINALIZE_RESULT_ALREADY_FINALIZED,
-            ):
-                raise RuntimeError(
-                    "shutdown SamplePool finalization failed: "
-                    f"{response.message}"
-                )
-            if (
-                not self._has_field(response, "finalized_at_unix_ms")
-                or int(response.finalized_at_unix_ms) <= 0
-            ):
-                raise RuntimeError(
-                    "sample pool returned a non-empty finalization result"
-                )
-            try:
-                status = self._sample_pool_status()
-            except grpc.RpcError as error:
-                if not self._is_retryable_sample_rpc(error):
-                    raise
-                self._mark_sample_wait(
-                    "WAITING_FOR_SAMPLE_POOL",
-                    "finalized SamplePool status",
-                    self._rpc_error_text(error),
-                    attempt,
-                )
-                self._wait_sample_retry(
-                    attempt, deadline, ignore_stop=True
-                )
-                continue
-            self._validate_finalized_sample_pool_status(
-                status, expected, finalization_id, response
-            )
-            self._clear_sample_wait()
-            self.logger.info(
-                "SamplePool finalized: id=%s cleared_resident_transitions=%d",
-                finalization_id,
-                int(status.finalized_transition_count),
-            )
-            return
-        raise RuntimeError(
-            "shutdown SamplePool finalization did not settle before timeout"
-        )
-
-    def _shutdown_finalize_sample_pool(
-        self,
-        expected_authority: common_pb2.ServiceInstanceIdentity | None,
-    ) -> None:
-        minimum_reconcile_sec = (
-            self.lease_timeout_ms / 1000.0
-            + self.SHUTDOWN_RECONCILE_MARGIN_SEC
-        )
-        budget_sec = max(
-            self.shutdown_drain_timeout_ms / 1000.0,
-            minimum_reconcile_sec,
-        )
-        deadline = time.monotonic() + budget_sec
-        pinned = (
-            self._sample_pool_authority(expected_authority)
-            if expected_authority is not None
-            else None
-        )
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            try:
-                status = self._sample_pool_status()
-                authority = self._sample_pool_authority(
-                    status.sample_pool
-                )
-                if pinned is None:
-                    pinned = authority
-                elif not self._same_authority(authority, pinned):
-                    raise RuntimeError(
-                        "sample pool authority changed during shutdown"
-                    )
-            except grpc.RpcError as error:
-                if not self._is_retryable_sample_rpc(error):
-                    raise
-                self._mark_sample_wait(
-                    "WAITING_FOR_SAMPLE_POOL",
-                    "shutdown sample status",
-                    self._rpc_error_text(error),
-                    attempt,
-                )
-                self._wait_sample_retry(
-                    attempt, deadline, ignore_stop=True
-                )
-                continue
-
-            ready_transitions = int(status.ready_transitions)
-            leased_transitions = int(status.leased_transitions)
-            if min(ready_transitions, leased_transitions) < 0:
-                raise RuntimeError(
-                    "sample pool returned contradictory shutdown counts"
-                )
-            if leased_transitions > 0:
-                reconciled = self._reconcile_get_batch_outcome(
-                    pinned,
-                    "shutdown observed an unresolved delivery",
-                    deadline=deadline,
-                    ignore_stop=True,
-                )
-                if not reconciled:
-                    break
-                continue
-            self._finalize_sample_pool(pinned, deadline)
-            return
-        raise RuntimeError(
-            "shutdown SamplePool lease reconciliation did not settle before "
-            "timeout"
-        )
-
     def _finalize_training(self) -> None:
-        status = self._sample_pool_status()
-        authority = self._sample_pool_authority(status.sample_pool)
         with self._metrics_lock:
             self._metrics_context["disposition"] = "FINALIZING_REPLAY_POOL"
-        self._shutdown_finalize_sample_pool(authority)
+        self.pool.finalize()
         self.finalize_complete_path.parent.mkdir(parents=True, exist_ok=True)
         self.finalize_complete_path.write_text(
             f"{self.train_updates} {self.trained_samples}\n",
@@ -3161,48 +2063,24 @@ class TrainingRuntime:
             self._start_metric_events()
             if self.preview is not None:
                 self.preview.start()
-            ready_authority = None
-            if self._initialize_models():
-                ready_authority = self._wait_for_sample_pool()
+            self._initialize_models()
             while not _stop_requested.is_set():
-                if ready_authority is None:
-                    break
                 if self.finalize_request_path.is_file():
                     self._finalize_training()
                     while not _stop_requested.wait(0.2):
                         pass
                     break
-                response = self._get_batch_recovering(
-                    ready_authority=ready_authority
-                )
+                response = self.pool.next_batch()
                 if response is None:
-                    ready_authority = self._wait_for_sample_pool()
                     continue
-                if response.result == training_pb2.GET_BATCH_RESULT_TIMEOUT:
-                    ready_authority = self._wait_for_sample_pool()
-                    continue
-                if response.result != training_pb2.GET_BATCH_RESULT_LEASED:
-                    raise RuntimeError(
-                        f"sample GetBatch failed: {response.message}"
-                    )
                 try:
                     self._train_delivery(response)
                 except ValueError as error:
-                    self._ack(
-                        response.delivery_id,
-                        training_pb2.ACK_DISPOSITION_INVALID,
-                        expected_authority=self._sample_pool_authority(
-                            response.sample_pool
-                        ),
-                    )
+                    self.pool.acknowledge_invalid(response)
                     raise RuntimeError(str(error)) from error
-                ready_authority = self._wait_for_sample_pool()
             with self._metrics_lock:
                 self._metrics_context["disposition"] = "STOPPING"
-            shutdown_authority = self._shutdown_sample_authority(
-                ready_authority
-            )
-            self._shutdown_finalize_sample_pool(shutdown_authority)
+            self.pool.finalize()
             if self.preview is not None:
                 self.preview.record_best_effort("graceful shutdown")
             return 0
@@ -3216,9 +2094,8 @@ class TrainingRuntime:
             return 1
         finally:
             self._stop_metric_events()
-            self.actor_channel.close()
             self.model_channel.close()
-            self.sample_channel.close()
+            self.pool.close()
 
 
 def main() -> int:
