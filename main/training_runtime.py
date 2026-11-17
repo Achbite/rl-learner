@@ -692,7 +692,9 @@ class TrainingRuntime:
         self._run_start_trained_samples = 0
         self.initial_model_step = 0
         self.last_stats: dict = {}
-        self.model_manifests: dict[int, dict] = {}
+        # Sample provenance needs the published manifest, not each update's
+        # item_ids and checkpoint metadata. Those remain in durable receipts.
+        self.model_manifests: dict[int, training_pb2.ModelArtifactManifest] = {}
         self._metrics_context = {
             "behavior_model": {},
             "actual_batch_size": None,
@@ -1360,7 +1362,7 @@ class TrainingRuntime:
                 lambda: "",
                 pinned_authority,
             )
-        self.model_manifests[model_step] = document
+        self.model_manifests[model_step] = document["manifest"]
         if self.preview is not None:
             self.preview.expect_bootstrap(document["manifest"].identity, pinned_authority)
         self._commit_learner_metrics(
@@ -1443,9 +1445,9 @@ class TrainingRuntime:
                 "processed transition source model does not match the "
                 f"training lineage/step: item={transition.item_id} source={identity}"
             )
-        document = self.model_manifests.get(step)
-        if document is None or not _same_message(
-            item.behavior_model, document["manifest"].identity
+        manifest = self.model_manifests.get(step)
+        if manifest is None or not _same_message(
+            item.behavior_model, manifest.identity
         ):
             raise ValueError(
                 "processed transition source model is not a published "
@@ -1568,6 +1570,11 @@ class TrainingRuntime:
 
     def _train_delivery(self, response) -> None:
         behavior_identity = self.pool.delivery_provenance(response, self._validate_training_item)
+        if response.reuse_mode == training_pb2.SAMPLE_REUSE_MODE_SYNCHRONOUS_ROUND and (
+            behavior_identity["minimum_model_step"] != int(self.trainer.model_step)
+            or behavior_identity["maximum_model_step"] != int(self.trainer.model_step)
+        ):
+            raise ValueError("synchronous collection requires the current pre-update policy")
         delivery_authority = response.sample_pool
         update_number = self.train_updates + 1
         update_id = f"train-update-{update_number:08d}"
@@ -1577,6 +1584,7 @@ class TrainingRuntime:
         duplicate_item_slot_count = len(item_ids) - unique_item_count
         receipt = {
             "train_update_id": update_id,
+            "sample_reuse_mode": training_pb2.SampleReuseMode.Name(response.reuse_mode),
             "delivery_id": response.delivery_id,
             "behavior_model": behavior_identity,
             "item_ids": item_ids,
@@ -1662,7 +1670,7 @@ class TrainingRuntime:
                 trained_samples=target_samples,
                 checkpoint_precommitted=True,
             )
-            self.model_manifests[self.trainer.model_step] = manifest
+            self.model_manifests[self.trainer.model_step] = manifest["manifest"]
             receipt.update(
                 {"state": "MODEL_COMMITTED", "model": manifest["identity"]}
             )

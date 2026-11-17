@@ -133,6 +133,12 @@ class SamplePoolConsumer:
         return response
 
     def delivery_provenance(self, response, validate_training_item) -> dict:
+        if response.reuse_mode not in (
+            training_pb2.SAMPLE_REUSE_MODE_REPLAY,
+            training_pb2.SAMPLE_REUSE_MODE_CONSUME_ONCE,
+            training_pb2.SAMPLE_REUSE_MODE_SYNCHRONOUS_ROUND,
+        ):
+            raise ValueError("sample delivery has no valid reuse mode")
         if (
             response.result != training_pb2.GET_BATCH_RESULT_LEASED
             or len(response.items) != self.train_batch_size
@@ -755,6 +761,8 @@ class SamplePoolConsumer:
             "resident": int(status.resident_transitions),
             "resident_bytes": int(status.resident_estimated_bytes),
             "evicted": int(status.evicted_transition_count),
+            "removed_on_ack": int(status.removed_on_ack_transition_count),
+            "unselected_round": int(status.unselected_round_transition_count),
             "finalized": int(status.finalized_transition_count),
         }
         if min(counts.values()) < 0:
@@ -783,7 +791,7 @@ class SamplePoolConsumer:
             raise RuntimeError(
                 "sample pool returned contradictory finalized draw-slot accounting"
             )
-        if counts["accepted"] != counts["evicted"] + counts["finalized"]:
+        if counts["accepted"] != counts["evicted"] + counts["removed_on_ack"] + counts["unselected_round"] + counts["finalized"]:
             raise RuntimeError(
                 "sample pool returned contradictory finalized transition "
                 "accounting"

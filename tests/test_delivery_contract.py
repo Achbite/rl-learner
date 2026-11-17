@@ -58,7 +58,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
         manifest = training_pb2.ModelArtifactManifest()
         manifest.identity.model_lineage_id = runtime.publisher.lineage_id
         manifest.identity.model_step = 0
-        runtime.model_manifests = {0: {"manifest": manifest}}
+        runtime.model_manifests = {0: manifest}
         runtime.logger = logging.getLogger("delivery-contract")
         runtime._metrics_lock = threading.Lock()
         runtime._metrics_context = {"disposition": "READY"}
@@ -98,6 +98,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
         response = training_pb2.GetBatchRsp(
             result=training_pb2.GET_BATCH_RESULT_LEASED,
             delivery_id="delivery-test",
+            reuse_mode=training_pb2.SAMPLE_REUSE_MODE_CONSUME_ONCE,
         )
         for index in range(2):
             response.items.add(
@@ -109,7 +110,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 insert_sequence=index + 1,
                 inserted_at_unix_ms=1700000000100 + index,
                 draw_count=1,
-                behavior_model=runtime.model_manifests[0]["manifest"].identity,
+                behavior_model=runtime.model_manifests[0].identity,
                 producer=identity_pb2.ServiceInstanceIdentity(
                     component="aiserver", instance_id="producer-test", lifecycle_epoch=1),
             )
@@ -123,6 +124,10 @@ class LearnerDevelopmentTest(unittest.TestCase):
 
         self.assertEqual(len(batch), 2)
         self.assertEqual(stats["sample_evaluation_count"], 2)
+        response.reuse_mode = training_pb2.SAMPLE_REUSE_MODE_SYNCHRONOUS_ROUND
+        with self.assertRaisesRegex(ValueError, "current pre-update policy"):
+            runtime._train_delivery(response)
+        self.assertEqual(runtime.trainer.model_step, 1)
         raw = trainer.raw_metric_sum_counts()
         self.assertEqual(raw["raw_advantage"]["count"], len(response.items))
         self.assertAlmostEqual(raw["raw_advantage"]["sum"],
@@ -170,12 +175,13 @@ class LearnerDevelopmentTest(unittest.TestCase):
         config["training"].update(train_batch_size=4, n_epochs=2)
         runtime = self.runtime(config)
         response = training_pb2.GetBatchRsp(
-            result=training_pb2.GET_BATCH_RESULT_LEASED, delivery_id="replay-batch")
+            result=training_pb2.GET_BATCH_RESULT_LEASED, delivery_id="replay-batch",
+            reuse_mode=training_pb2.SAMPLE_REUSE_MODE_REPLAY)
         for index in (0, 0, 1, 1):
             response.items.add(
                 transition=self._transition(index, 5, 4),
                 insert_sequence=index + 1, inserted_at_unix_ms=1700000000100 + index,
-                draw_count=2, behavior_model=runtime.model_manifests[0]["manifest"].identity,
+                draw_count=2, behavior_model=runtime.model_manifests[0].identity,
                 producer=identity_pb2.ServiceInstanceIdentity(
                     component="aiserver", instance_id="producer-test", lifecycle_epoch=1))
         runtime.pool.delivery_provenance(response, runtime._validate_training_item)
@@ -214,6 +220,10 @@ class LearnerDevelopmentTest(unittest.TestCase):
             drawn_transition_slot_count=28, acknowledged_transition_slot_count=24,
             released_transition_slot_count=4, trained_transition_count=16,
             invalid_transition_count=4, shutdown_untrained_transition_count=4)
+        runtime.pool._validate_finalized_sample_pool_status(status, authority, response.finalization_id, response)
+        status.accepted_unique_transitions += 3
+        status.removed_on_ack_transition_count = 2
+        status.unselected_round_transition_count = 1
         runtime.pool._validate_finalized_sample_pool_status(status, authority, response.finalization_id, response)
         for field in ("accepted_unique_transitions", "drawn_transition_slot_count", "trained_transition_count"):
             with self.subTest(field=field):
