@@ -41,4 +41,5 @@ python3 -m unittest -v \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_relay_contract_rejection_is_terminal_and_visible \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_collector_finishes_after_final_ack \
     tests.test_metric_calculations.LearnerMetricCalculationTest.test_model_feedback_failure_preserves_active_model_state \
-    tests.test_ppo_contract.PPOCalculationTest.test_clipped_ppo_loss_matches_reference_values
+    tests.test_ppo_contract.PPOCalculationTest.test_clipped_ppo_loss_matches_reference_values \
+    tests.test_ppo_contract.PPOCalculationTest.test_parallel_batch_matches_one_full_batch_update

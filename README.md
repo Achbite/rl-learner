@@ -5,6 +5,12 @@
 Learner 容器内运行 PPO、SamplePoolService、ModelDistributor 和可选监控。本地训练时先启动
 Learner，再启动 AIServer 和 Client。
 
+默认训练架构是在 CPU 上运行的异步 PPO：Actor 持续采样，Pool 使用
+`sampling.reuse: replay` 和 `sampling.strategy: uniform_without_replacement`。
+无放回仅约束单个 batch，已训练样本仍可跨 batch 复用；Learner 默认采用
+`sequential_minibatch`、4096/512、4 epochs，每个 Train Update 执行 32 次 Adam。
+同步轮次、一次消费及 `parallel_batch` 是用于对照研究的显式试验选项，不改变上述默认方案。
+
 本地训练只运行 Learner、AIServer 和 Client 三个容器。`make shell` 是宿主机命令：没有
 `learner-dev` 时构建开发镜像、创建并启动容器；容器存在时只在必要时启动它，然后直接进入。
 它不会构建或同步任何依赖。完整三容器工作区包含以下同级目录：
@@ -45,6 +51,9 @@ bash ./test.sh
 组合测试还需显式提供本批构建的 `RL_AISERVER_TEST_BINARY`、`RL_MODEL_DISTRIBUTOR_TEST_BINARY`，以及当前 `RL_AISERVER_SOURCE_DIR`（读取配置与固定 ONNX fixture）。这些路径位于测试容器内，相应二进制依赖库须可加载；入口不会搜索旧制品或连接运行中的训练服务。组合用例只验证启动 FAILED 的跨组件传播，不执行训练循环。
 
 Framework 同步只装配两个服务的二进制与配置，保留内容相同的文件及已有目标配置。
+已有 `sample-pool/config/pool_config.yaml` 也须显式包含 `sampling.reuse: replay`；
+装配脚本保留已有配置，采用本轮 Pool 合同时需核对该字段。通过 `SAMPLE_POOL_CONFIG`
+指定其他配置时，同样由该文件明确选择复用模式。
 Learner Proto 的采纳由独立同步入口负责。`make shell` 只在宿主机执行，不要求源码 clean。
 `make dev-refresh` 才会替换常驻容器，活动训练链存在时会明确失败。
 
@@ -103,7 +112,9 @@ Learner 不读取 raw trajectory 或计算 GAE。它请求 SamplePool 随机读�
 `training.train_batch_size` 个 processed-transition 位置，对整批 advantage 做一次归一化，再按
 `mini_batch_size` 与 `n_epochs` 执行 PPO/optimizer。Pool 的 `sampling.strategy` 默认
 `uniform_without_replacement`（仅 batch 内不重复），可选 `uniform_with_replacement`。
-两者都保留池内样本并允许跨 batch 复用；ACK/NACK/到期不控制样本淘汰。Learner 不去重合法重复
+跨 batch 生命周期由独立的 `sampling.reuse` 决定：`replay` 保留样本供再次采样，
+`consume_once` 在成功 ACK 后移除，`synchronous_round` 在同模型完整帧轮次中一次消费。
+Learner 不去重合法重复
 位置，同一 batch 中相同 item ID 的快照必须一致。训练累计样本数按位置计，唯一样本数和重复位置数
 分别记录，epoch 评估次数另计；池停止清理不计成未训练 batch。一个 batch 可以包含多个 behavior model step；
 Pool 原样返回每条 transition 所属 Envelope 的完整 behavior_model 与 producer；Learner
@@ -112,6 +123,16 @@ GetBatch 传输结果未知时，先等待该次 RPC 截止，再读取同 Pool 
 创建新租约由 Pool 负责，不使用固定次数的零租约查询推断旧请求已经完成。Action mask 由
 `policy.action_mask_mode` 控制：`disabled` 时样本必须不带 mask，`required` 时 Learner 按
 `model.action_count` 校验并在 PPO logits 上应用；它不是所有任务的必选项。
+
+`training.update_mode` 明确选择更新结构：`sequential_minibatch` 每个 minibatch
+执行一次 Adam；`parallel_batch` 在 CPU 上将完整批次切成等长分片，各线程通过
+`torch.autograd.grad` 计算同一参数快照的独立梯度，按样本数汇总后统一裁剪，并在
+每个 epoch 执行一次 Adam。后者要求 `train_batch_size` 能被 `mini_batch_size` 整除。
+例如 4096/512/epochs=1 对应 8 个线程、4096 次梯度样本使用和 1 次 optimizer step。
+实际 CPU 核数决定可执行的硬件并行度。环境变量 `RL_PPO_UPDATE_MODE` 可覆盖该字段。
+批次前的 ratio/KL 与更新后的 `post_update_approx_kl` 分别写入训练回执；更新后诊断
+仅前向计算，不增加梯度样本使用次数。完全禁止训练样本复用还要求 Pool 使用
+`consume_once` 或 `synchronous_round`、批内无放回，并设置 `n_epochs: 1`。
 
 ## 3. 从已有模型开始全新训练
 

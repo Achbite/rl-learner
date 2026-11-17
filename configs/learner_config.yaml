@@ -4,6 +4,8 @@
 identity:
   model_lineage_id: __FRESH_INTERNAL_LINEAGE_REQUIRED__
 
+# Default: CPU asynchronous replay PPO; per-minibatch updates and batch reuse.
+# parallel_batch and n_epochs=1 are explicit structural experiment choices.
 training:
   device: cpu
   seed: 0                         # integer RNG seed, >=0
@@ -15,7 +17,8 @@ training:
   max_grad_norm: 0.5              # L2 gradient clip, (0,100]
   n_epochs: 4                     # optimizer passes per leased batch, >0
   train_batch_size: 4096          # processed transitions per Train Update, >0
-  mini_batch_size: 512            # maximum transitions per optimizer step, >0
+  mini_batch_size: 512            # transitions per minibatch / parallel shard, >0
+  update_mode: sequential_minibatch # sequential_minibatch | parallel_batch (CPU)
   normalize_advantage: true
 
 model:

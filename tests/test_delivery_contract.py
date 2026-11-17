@@ -32,6 +32,7 @@ def _trainer_config() -> dict:
             "n_epochs": 1,
             "train_batch_size": 2,
             "mini_batch_size": 2,
+            "update_mode": "sequential_minibatch",
             "normalize_advantage": True,
         },
         "model": {
@@ -242,6 +243,7 @@ class LearnerDevelopmentTest(unittest.TestCase):
                 "RL_PPO_TRAIN_BATCH_SIZE": "32",
                 "RL_PPO_MINI_BATCH_SIZE": "16",
                 "RL_PPO_N_EPOCHS": "1",
+                "RL_PPO_UPDATE_MODE": "parallel_batch",
             },
         )
 
@@ -249,6 +251,11 @@ class LearnerDevelopmentTest(unittest.TestCase):
         self.assertEqual(config["training"]["train_batch_size"], 32)
         self.assertEqual(config["training"]["mini_batch_size"], 16)
         self.assertEqual(config["training"]["n_epochs"], 1)
+        self.assertEqual(config["training"]["update_mode"], "parallel_batch")
+        validate_config(config)
+        config["training"]["mini_batch_size"] = 15
+        with self.assertRaisesRegex(ValueError, "equal complete shards"):
+            validate_config(config)
 
         # The managed supervisor starts Learner before any actor endpoint exists.
         template = yaml.safe_load((repository / "configs/learner_config.yaml").read_text())

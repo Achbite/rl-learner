@@ -163,7 +163,7 @@ def validate_config(config: dict) -> None:
         "training": {
             "device", "seed", "learning_rate", "clip_epsilon", "value_clip_epsilon",
             "entropy_coef", "value_coef", "max_grad_norm", "n_epochs",
-            "train_batch_size", "mini_batch_size", "normalize_advantage",
+            "train_batch_size", "mini_batch_size", "normalize_advantage", "update_mode",
         },
         "model": {
             "observation_dimension", "action_count", "hidden_dimension",
@@ -277,6 +277,13 @@ def validate_config(config: dict) -> None:
         == config["sample_pool"]["finalize_complete_path"]
     ):
         raise ValueError("integer training parameters are invalid")
+    if training["update_mode"] not in {"sequential_minibatch", "parallel_batch"}:
+        raise ValueError("training.update_mode is invalid")
+    if training["update_mode"] == "parallel_batch" and (
+        training["device"] != "cpu"
+        or int(training["train_batch_size"]) % int(training["mini_batch_size"]) != 0
+    ):
+        raise ValueError("parallel_batch requires CPU and equal complete shards")
     endpoints = ["sample_pool", "model_distributor"]
     if preview_endpoint:
         endpoints.append("aiserver_status")

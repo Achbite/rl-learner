@@ -8,6 +8,8 @@ Learner 只做 batch 级 advantage 归一化、PPO/optimizer 和模型发布。
 
 import copy
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -158,6 +160,7 @@ class PPOTrainer:
         self._n_epochs = int(train_cfg["n_epochs"])
         self._train_batch_size = int(train_cfg["train_batch_size"])
         self._mini_batch_size = int(train_cfg["mini_batch_size"])
+        self._update_mode = train_cfg["update_mode"]
         self._normalize_advantage = bool(train_cfg["normalize_advantage"])
         self._seed = int(train_cfg["seed"])
         if self._value_clip_epsilon <= 0.0:
@@ -180,10 +183,10 @@ class PPOTrainer:
             self._obs_dim, self._action_dim, self._hidden_dim, self._device,
         )
         self._logger.info(
-            "优化器参数: lr=%.9g, clip=%.9g, entropy=%.9g, value=%.9g, epochs=%d, train_batch=%d, mini_batch=%d",
+            "优化器参数: lr=%.9g, clip=%.9g, entropy=%.9g, value=%.9g, epochs=%d, train_batch=%d, mini_batch=%d, update_mode=%s",
             self._lr, self._clip_epsilon,
             self._entropy_coef, self._value_coef, self._n_epochs,
-            self._train_batch_size, self._mini_batch_size,
+            self._train_batch_size, self._mini_batch_size, self._update_mode,
         )
 
     # ---- PPO 训练 ----
@@ -227,6 +230,45 @@ class PPOTrainer:
             (new_values - returns).pow(2),
             (clipped_values - returns).pow(2),
         ).mean()
+
+    def _minibatch_gradients(
+        self, indices, obs, actions, old_log_probs, old_values,
+        advantages, td_returns, action_masks,
+    ):
+        """Read one parameter snapshot; return private gradients, never write .grad."""
+        new_log_probs, new_values, entropy = self._model.evaluate_actions(
+            obs[indices], actions[indices],
+            None if action_masks is None else action_masks[indices],
+        )
+        policy_loss, ratio = self._clipped_policy_loss(
+            new_log_probs, old_log_probs[indices], advantages[indices], self._clip_epsilon,
+        )
+        value_loss = self._clipped_value_loss(
+            new_values, old_values[indices], td_returns[indices], self._value_clip_epsilon,
+        )
+        total_loss = policy_loss + self._value_coef * value_loss - self._entropy_coef * entropy.mean()
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError("PPO loss is non-finite")
+        gradients = torch.autograd.grad(total_loss, tuple(self._model.parameters()))
+        if any(not torch.isfinite(gradient).all() for gradient in gradients):
+            raise FloatingPointError("PPO gradient is non-finite")
+        with torch.no_grad():
+            if not torch.isfinite(ratio).all():
+                raise FloatingPointError("PPO importance ratio is non-finite")
+            count = int(indices.numel())
+            statistics = {
+                "count": count,
+                "policy_loss_sum": policy_loss.item() * count,
+                "value_loss_sum": value_loss.item() * count,
+                "entropy_sum": entropy.sum().item(),
+                "total_loss_sum": total_loss.item() * count,
+                "clip_fraction_sum": ((ratio - 1.0).abs() > self._clip_epsilon).float().sum().item(),
+                "approx_kl_sum": ((ratio - 1.0) - (new_log_probs - old_log_probs[indices])).sum().item(),
+                "ratio_sum": ratio.sum().item(),
+                "ratio_square_sum": ratio.square().sum().item(),
+                "ratio_max": ratio.max().item(),
+            }
+        return gradients, statistics
 
     def train_on_batch(
         self,
@@ -313,6 +355,8 @@ class PPOTrainer:
         # ---- 3. 多轮 mini-batch PPO 训练 ----
         n_samples = len(samples)
         total_gradient_norm = 0.0
+        gradient_compute_seconds = 0.0
+        optimizer_update_seconds = 0.0
         maximum_importance_ratio = 0.0
         importance_ratio_sum = 0.0
         importance_ratio_square_sum = 0.0
@@ -338,114 +382,60 @@ class PPOTrainer:
         )
         try:
             for epoch in range(self._n_epochs):
-                # 随机打乱索引
                 indices = torch.randperm(n_samples, device=self._device)
-
-                # 切分 mini-batch
-                for start in range(0, n_samples, self._mini_batch_size):
-                    end = min(start + self._mini_batch_size, n_samples)
-                    mb_indices = indices[start:end]
-
-                    mb_obs = obs[mb_indices]
-                    mb_actions = actions[mb_indices]
-                    mb_old_log_probs = old_log_probs[mb_indices]
-                    mb_old_values = old_values[mb_indices]
-                    mb_advantages = advantages[mb_indices]
-                    mb_td_returns = td_returns[mb_indices]
-                    mb_action_masks = (
-                        None
-                        if action_masks is None
-                        else action_masks[mb_indices]
-                    )
-
-                    # 前向传播：获取新策略下的 log_prob、value、entropy
-                    new_log_probs, new_values, entropy = self._model.evaluate_actions(
-                        mb_obs, mb_actions, mb_action_masks
-                    )
-
-                    # ---- Policy Loss（PPO-Clip）----
-                    policy_loss, ratio = self._clipped_policy_loss(
-                        new_log_probs,
-                        mb_old_log_probs,
-                        mb_advantages,
-                        self._clip_epsilon,
-                    )
-
-                    # ---- Value Loss（以行为策略 V(s) 为裁剪基准）----
-                    value_loss = self._clipped_value_loss(
-                        new_values,
-                        mb_old_values,
-                        mb_td_returns,
-                        self._value_clip_epsilon,
-                    )
-
-                    # ---- Entropy Loss ----
-                    entropy_loss = -entropy.mean()
-
-                    # ---- Total Loss ----
-                    total_loss = policy_loss + self._value_coef * value_loss + self._entropy_coef * entropy_loss
-                    if not torch.isfinite(total_loss):
-                        raise FloatingPointError("PPO loss is non-finite")
-
-                    # ---- 反向传播 + 梯度裁剪 + 优化器更新 ----
-                    self._optimizer.zero_grad()
-                    total_loss.backward()
-                    if any(
-                        parameter.grad is not None
-                        and not torch.isfinite(parameter.grad).all()
-                        for parameter in self._model.parameters()
-                    ):
-                        raise FloatingPointError("PPO gradient is non-finite")
-                    gradient_norm = nn.utils.clip_grad_norm_(
-                        self._model.parameters(), self._max_grad_norm
-                    )
+                shards = list(indices.split(self._mini_batch_size))
+                tensors = (obs, actions, old_log_probs, old_values, advantages, td_returns, action_masks)
+                compute_started = time.perf_counter()
+                if self._update_mode == "parallel_batch":
+                    # All workers read the same model. The context joins every worker
+                    # before optimizer mutation (or rollback on a worker failure).
+                    with ThreadPoolExecutor(max_workers=len(shards), thread_name_prefix="ppo-gradient") as executor:
+                        futures = [executor.submit(self._minibatch_gradients, shard, *tensors) for shard in shards]
+                        gradient_batches = [[future.result() for future in futures]]
+                else:
+                    # Lazy evaluation preserves one parameter update per minibatch.
+                    gradient_batches = ([self._minibatch_gradients(shard, *tensors)] for shard in shards)
+                for results in gradient_batches:
+                    gradient_compute_seconds += time.perf_counter() - compute_started
+                    update_started = time.perf_counter()
+                    count = sum(statistics["count"] for _, statistics in results)
+                    self._optimizer.zero_grad(set_to_none=True)
+                    for index, parameter in enumerate(self._model.parameters()):
+                        parameter.grad = sum(
+                            (gradients[index] * (statistics["count"] / count)
+                             for gradients, statistics in results),
+                            torch.zeros_like(parameter),
+                        )
+                    gradient_norm = nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
                     if not torch.isfinite(gradient_norm):
-                        raise FloatingPointError(
-                            "PPO gradient norm is non-finite"
-                        )
+                        raise FloatingPointError("PPO gradient norm is non-finite")
                     self._optimizer.step()
-                    if any(
-                        not torch.isfinite(parameter).all()
-                        for parameter in self._model.parameters()
-                    ):
-                        raise FloatingPointError(
-                            "PPO parameter update is non-finite"
-                        )
-
-                    # ---- 统计 ----
-                    with torch.no_grad():
-                        clip_fraction = ((ratio - 1.0).abs() > self._clip_epsilon).float().mean().item()
-                        log_ratio = new_log_probs - mb_old_log_probs
-                        approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
-                        if not torch.isfinite(ratio).all():
-                            raise FloatingPointError(
-                                "PPO importance ratio is non-finite"
-                            )
-                        maximum_importance_ratio = max(
-                            maximum_importance_ratio, ratio.max().item()
-                        )
-
-                    mini_batch_count = int(mb_indices.numel())
-                    raw_sample_evaluation_count += mini_batch_count
-                    raw_policy_loss_sum += policy_loss.item() * mini_batch_count
-                    raw_value_loss_sum += value_loss.item() * mini_batch_count
-                    raw_entropy_sum += entropy.mean().item() * mini_batch_count
-                    raw_clip_fraction_sum += clip_fraction * mini_batch_count
-                    raw_approx_kl_sum += approx_kl * mini_batch_count
-                    raw_total_loss_sum += total_loss.item() * mini_batch_count
-                    importance_ratio_sum += float(ratio.sum().item())
-                    importance_ratio_square_sum += float(
-                        ratio.square().sum().item()
-                    )
-
+                    if any(not torch.isfinite(parameter).all() for parameter in self._model.parameters()):
+                        raise FloatingPointError("PPO parameter update is non-finite")
+                    optimizer_update_seconds += time.perf_counter() - update_started
+                    for _, statistics in results:
+                        raw_sample_evaluation_count += statistics["count"]
+                        raw_policy_loss_sum += statistics["policy_loss_sum"]
+                        raw_value_loss_sum += statistics["value_loss_sum"]
+                        raw_entropy_sum += statistics["entropy_sum"]
+                        raw_clip_fraction_sum += statistics["clip_fraction_sum"]
+                        raw_approx_kl_sum += statistics["approx_kl_sum"]
+                        raw_total_loss_sum += statistics["total_loss_sum"]
+                        importance_ratio_sum += statistics["ratio_sum"]
+                        importance_ratio_square_sum += statistics["ratio_square_sum"]
+                        maximum_importance_ratio = max(maximum_importance_ratio, statistics["ratio_max"])
                     total_gradient_norm += float(gradient_norm)
                     total_updates += 1
+                    compute_started = time.perf_counter()
 
             # Use the committed model state for value diagnostics. These
             # metrics describe target fitting; the sign of V(s) alone does not.
             with torch.no_grad():
-                _, committed_values = self._model(obs)
-                committed_values = committed_values.squeeze(-1)
+                committed_log_probs, committed_values, _ = self._model.evaluate_actions(obs, actions, action_masks)
+                committed_log_ratio = committed_log_probs - old_log_probs
+                committed_ratio = committed_log_ratio.exp()
+                post_update_approx_kl = ((committed_ratio - 1.0) - committed_log_ratio).mean().item()
+                post_update_clip_fraction = ((committed_ratio - 1.0).abs() > self._clip_epsilon).float().mean().item()
                 if not torch.isfinite(committed_values).all():
                     raise FloatingPointError(
                         "PPO committed value prediction is non-finite"
@@ -465,6 +455,8 @@ class PPOTrainer:
                     for value in (
                         value_pred_mean,
                         return_target_mean,
+                        post_update_approx_kl,
+                        post_update_clip_fraction,
                     )
                 ) or (
                     explained_variance is not None
@@ -587,6 +579,11 @@ class PPOTrainer:
             "mean_policy_lag": float(np.mean(policy_lags)),
             "sample_evaluation_count": raw_sample_evaluation_count,
             "optimizer_step_count": total_updates,
+            "gradient_worker_count": len(shards) if self._update_mode == "parallel_batch" else 1,
+            "gradient_compute_seconds": gradient_compute_seconds,
+            "optimizer_update_seconds": optimizer_update_seconds,
+            "post_update_approx_kl": post_update_approx_kl,
+            "post_update_clip_fraction": post_update_clip_fraction,
             "model_step": self._model_step,
         }
 

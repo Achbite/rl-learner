@@ -6,6 +6,14 @@ The Learner container runs PPO, SamplePoolService, ModelDistributor, and the
 optional monitor. For local training, start Learner first, followed by AIServer
 and Client.
 
+The default training architecture is asynchronous PPO on CPU. Actors keep
+collecting while Pool uses `sampling.reuse: replay` and
+`sampling.strategy: uniform_without_replacement`. Without replacement applies
+within each batch; trained samples remain eligible across batches. Learner defaults
+to `sequential_minibatch`, 4096/512 and four epochs: 32 Adam steps per Train Update.
+Synchronous rounds, consume-once delivery and `parallel_batch` are explicit
+experimental options for controlled comparisons; they do not replace this default.
+
 Local training runs only three containers: Learner, AIServer, and Client.
 `make shell` is a host command. When `learner-dev` is absent it builds the
 development image and creates and starts the container. When the container
@@ -52,7 +60,11 @@ bash ./test.sh
 The combined test requires explicit `RL_AISERVER_TEST_BINARY`, `RL_MODEL_DISTRIBUTOR_TEST_BINARY` from the current production builds, and `RL_AISERVER_SOURCE_DIR` for the current config and fixed ONNX fixture. These are container paths with loadable runtime dependencies. The entrypoint does not search for older artifacts or use running training services. It verifies bootstrap FAILED propagation without starting a training loop.
 
 Framework stages the two service binaries and configs, preserving identical files and existing
-configurations. Learner Proto adoption uses a separate explicit entrypoint. `make shell` runs
+configurations. The existing `sample-pool/config/pool_config.yaml` must explicitly set
+`sampling.reuse: replay`; the staging script preserves that file, so check this field
+when adopting the current Pool contract. A file selected through `SAMPLE_POOL_CONFIG`
+must likewise specify the intended reuse mode.
+Learner Proto adoption uses a separate explicit entrypoint. `make shell` runs
 on the host without requiring clean source. Only `make dev-refresh` replaces the resident
 container; it refuses while a training chain is active.
 
@@ -120,8 +132,10 @@ Learner does not consume raw trajectories or compute GAE. It asks SamplePool for
 `training.train_batch_size` processed-transition slots, normalizes advantages once
 over the full batch, then runs PPO/optimizer work according to `mini_batch_size`
 and `n_epochs`. Pool's `sampling.strategy` defaults to `uniform_without_replacement`
-(unique within a batch), with `uniform_with_replacement` available. Both keep
-samples resident for cross-batch reuse; ACK/NACK/expiry do not drive eviction.
+(unique within a batch), with `uniform_with_replacement` available. Cross-batch
+lifecycle is selected separately by `sampling.reuse`: `replay` retains samples,
+`consume_once` removes them after successful ACK, and `synchronous_round`
+consumes one batch from a whole-frame round collected under the same model.
 Learner preserves repeated slots and requires identical snapshots for repeated
 item IDs within a batch. Cumulative trained samples count slots; unique items,
 duplicate slots and epoch evaluations are separate facts. Pool finalization does
@@ -136,6 +150,19 @@ snapshots are not used to infer that an old request has completed. `policy.actio
 controls action masks: `disabled` requires no mask, while `required` validates
 `model.action_count` and applies the mask to PPO
 logits. Masks are not mandatory for every task.
+
+`training.update_mode` selects the optimizer structure. `sequential_minibatch`
+performs one Adam step per minibatch. On CPU, `parallel_batch` partitions the
+full batch into equal shards, computes private gradients against the same
+parameters with `torch.autograd.grad` in parallel threads, averages by sample
+count, clips the combined gradient, and performs one Adam step per epoch.
+The batch size must be divisible by the minibatch size. With 4096/512/epochs=1,
+there are eight workers, 4096 gradient sample uses and one optimizer step.
+Available CPU cores determine hardware parallelism. `RL_PPO_UPDATE_MODE` overrides
+this field. Receipts distinguish pre-update ratio/KL from `post_update_approx_kl`;
+post-update diagnostics do not compute gradients. Fully preventing training
+sample reuse also requires `consume_once` or `synchronous_round`, sampling
+without replacement, and `n_epochs: 1`.
 
 ## 3. Start fresh training from an existing model
 

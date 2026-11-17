@@ -85,6 +85,7 @@ ENVIRONMENT_OVERRIDES: dict[str, _Override] = {
     "RL_PPO_VALUE_COEF": (("training", "value_coef"), _floating),
     "RL_PPO_MAX_GRAD_NORM": (("training", "max_grad_norm"), _floating),
     "RL_PPO_N_EPOCHS": (("training", "n_epochs"), _integer),
+    "RL_PPO_UPDATE_MODE": (("training", "update_mode"), _nonempty),
     "RL_PPO_MINI_BATCH_SIZE": (
         ("training", "mini_batch_size"),
         _integer,
@@ -399,6 +400,7 @@ def effective_config_log(config: dict) -> dict:
                 "n_epochs",
                 "train_batch_size",
                 "mini_batch_size",
+                "update_mode",
                 "normalize_advantage",
             )
         },
